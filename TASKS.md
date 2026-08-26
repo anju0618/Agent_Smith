@@ -26,15 +26,15 @@ smolagents / llama-index / langgraph / crewai / autogen 等の「エージェン
 ## タスクリスト
 
 ### 0. 環境準備
-- [ ] `uv` をインストールし、Python 3.10 プロジェクトを `uv init` で作成
-- [ ] `moulinette.zip` を展開し、`moulinette/` の中身(README.md, models_public.py, __main__.py, tests/)を読む
+- [x] `uv` をインストールし、Python 3.10 プロジェクトを `uv init` で作成
+- [x] `moulinette.zip` を展開し、`moulinette/` の中身(README.md, models_public.py, __main__.py, tests/)を読む
   - `moulinette_eval dump/validate` の使い方、`sanitized_tasks.json`(MBPPデータ)を確認
-- [ ] `.env` からAPIキーを読む設計にする(コードへのハードコード厳禁 = 即失格)
+- [x] `.env` からAPIキーを読む設計にする(コードへのハードコード厳禁 = 即失格)
 
 ### 1. コア: Agent/Orchestratorループ
-- [ ] Thought → Code → Observation ループの実装
-- [ ] システムプロンプト設計(利用可能ツールの説明、Thought/Code/Observationの例、有効な推論ループの例)
-- [ ] `stop_sequences`(`<end_code>` 等)をLLM API呼び出しに設定し、ツール出力を待たずに続きを幻覚生成しないようにする
+- [x] Thought → Code → Observation ループの実装(`orchestrator.py`。CodeExtractor/SandboxはProtocolのみで、section 2/3の実装待ち)
+- [x] システムプロンプト設計(利用可能ツールの説明、Thought/Code/Observationの例、有効な推論ループの例)
+- [x] `stop_sequences`(`<end_code>` 等)をLLM API呼び出しに設定し、ツール出力を待たずに続きを幻覚生成しないようにする(`llm_client.py`)
 
 ### 2. コード抽出レイヤー(複数フォーマット対応)
 - [ ] Pythonコードブロック(` ```python ... ``` <end_code>`)を主形式として対応
@@ -75,7 +75,7 @@ smolagents / llama-index / langgraph / crewai / autogen 等の「エージェン
 - [ ] `mcp_tools_mbpp.py` をリポジトリルートに配置
 - [ ] `run_tests(code, test_list)` ツール実装(JSON `{success, output}` を返す)
 - [ ] `MBPPTaskInput` Pydanticモデル
-- [ ] `max_iterations` 等を設定可能に(上限: 反復10 / 出力トークン6,000 / タイムアウト120秒)
+- [ ] `max_iterations` 等を設定可能に(上限: 反復10 / 入力トークン6,000 / 出力トークン1,500 / タイムアウト120秒 — subject 6.1.1で確認、旧記述は入出力を取り違えていたので修正)
 
 ### 6. SWE-benchエージェント
 - [ ] `agent_swebench` CLI (同様のインターフェース)
@@ -85,7 +85,7 @@ smolagents / llama-index / langgraph / crewai / autogen 等の「エージェン
 - [ ] `git -c core.fileMode=false diff` でパッチ生成
 - [ ] Dockerコンテナのクリーンアップ処理(タイムアウトでSIGKILLされても走るようシグナルハンドラ検討)
 - [ ] `SWEBenchTaskInput` Pydanticモデル
-- [ ] 上限: 反復30 / 出力トークン300,000 / タイムアウト900秒
+- [ ] 上限: 反復30 / 入力トークン300,000 / 出力トークン10,000 / タイムアウト900秒(subject 6.1.2で確認、旧記述は入出力を取り違えていたので修正)
 
 ### 7. 必須ツール(SWE-bench向け、MCPサーバーとして実装)
 - [ ] File System: `read_file(filepath,start_line,end_line)`(`cat -n`風出力)/ `edit_file(filepath,old_str,new_str)` / `list_files(directory,pattern)`

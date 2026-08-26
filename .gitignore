@@ -1,4 +1,6 @@
 *.pdf
+# ...except papers deliberately kept for reference (arXiv, freely redistributable).
+!/reference/*.pdf
 
 # secrets
 .env
