@@ -1,1 +1,11 @@
 *.pdf
+
+# secrets
+.env
+
+# reference copy of the eval harness — moulinette.zip is the tracked source of truth
+/moulinette/
+
+# python
+__pycache__/
+*.pyc

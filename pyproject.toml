@@ -1,0 +1,20 @@
+[project]
+name = "agent-smith"
+version = "0.1.0"
+description = "Add your description here"
+requires-python = ">=3.10"
+dependencies = [
+    "python-dotenv>=1.2.3",
+]
+
+[dependency-groups]
+dev = [
+    "flake8>=7.3.0",
+    "mypy>=2.3.1",
+    "pytest>=9.1.1",
+]
+
+[tool.pytest.ini_options]
+# moulinette/ is the extracted, gitignored reference copy of moulinette.zip — not our code,
+# and it pulls in deps (e.g. docker) we don't install ourselves.
+norecursedirs = ["moulinette", ".venv"]
