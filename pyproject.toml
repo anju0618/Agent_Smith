@@ -19,3 +19,6 @@ dev = [
 # moulinette/ is the extracted, gitignored reference copy of moulinette.zip — not our code,
 # and it pulls in deps (e.g. docker) we don't install ourselves.
 norecursedirs = ["moulinette", ".venv"]
+
+[project.scripts]
+sandbox = "sandbox:main"

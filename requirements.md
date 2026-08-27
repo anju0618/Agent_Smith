@@ -72,9 +72,9 @@ LLM API ⇄ Orchestrator ── Response containing code block ──▶ Code ex
                                                                     │
                                                           Extracted code
                                                                     ▼
-                                              ┌───────────── Sandbox ─────────────┐
+                                              ┌───────────── Sandbox ───────────────────────────┐
                                               │  Python Interpreter ── Tool Call ──▶ MCP Client │
-                                              └────────────────────────────────────┘
+                                              └─────────────────────────────────────────────────┘
                                                                     │ STDIO / HTTP
                                                                     ▼
                                                               MCP Server
