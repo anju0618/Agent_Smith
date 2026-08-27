@@ -83,9 +83,6 @@ make install
 - **Execution timeout**: A configured time limit after which running code is force-killed (SIGTERM then SIGKILL).
 - **Memory limits**: A configured RAM ceiling after which the sandboxed process is terminated.
 - **Restricted builtins**: Dangerous built-in functions (e.g., `open`, `eval`, `exec`, `__import__`) that are removed or overridden to prevent privilege escalation.
-- **SandboxConfig**: A Pydantic model defining the sandbox's configurable security limits (imports, directories, timeout, memory), loadable from a JSON file.
-- **RestrictedPython**: A third-party sandboxing library explicitly forbidden in this project; security must be implemented using only the Python standard library.
-
 #### MCP & Tooling
 - **MCP (Model Context Protocol)**: An open protocol (by Anthropic) connecting an LLM/agent to external tools and data sources, exposed via a separate MCP server.
 - **MCP Server**: A separate process exposing tools, resources, and prompts over stdio or streamable HTTP; only the student's own MCP server(s) are allowed.
@@ -95,18 +92,11 @@ make install
 - **File System Tools**: `read_file`, `edit_file`, `list_files` — reading, editing, and listing files in the sandboxed workspace.
 - **Code Search Tools**: `search_code`, `search_function_or_class_definition_in_code`, `find_references` — grep-like search, definition lookup, and usage lookup.
 - **Execution Tools**: `run_tests`, `get_patch`, `run_command` — running the evaluation script, retrieving a git diff, and running arbitrary shell commands.
-- **TESTBED_PATH**: An environment variable set by the moulinette, pointing MCP tools to the repository root for SWE-bench tasks.
 
 #### Benchmarks
 - **MBPP (Mostly Basic Python Problems)**: A benchmark of short, self-contained algorithmic Python problems used to evaluate the agent.
 - **SWE-bench**: A benchmark of real-world bug fixes in production repositories, evaluated inside Docker containers.
 - **SWE-bench Verified**: The specific SWE-bench dataset variant used for evaluation in this project.
-- **moulinette**: The project's official evaluation tool (`moulinette_eval dump/validate/...`) used to generate tasks and validate solutions.
-
-#### Data Models
-- **StepMetrics**: A Pydantic model recording per-iteration metrics (tokens, timing, raw LLM output, sandbox input/output, retries).
-- **SolutionOutput**: A Pydantic model describing the final required output (task_id, success, solution, iterations, totals, per-step metrics, system prompt, error).
-- **MBPPTaskInput / SWEBenchTaskInput**: Pydantic models describing the input given to each benchmark-specific agent.
 
 #### LLM & Providers
 - **LLM API Providers**: Third-party services offering LLM inference (e.g., OpenRouter, Together AI, Groq, Google AI Studio, Mistral AI, Cohere, Fireworks AI, Perplexity AI, Anyscale), used within their free tiers only.
@@ -118,9 +108,6 @@ make install
 - **Model Benchmark Report (BENCHMARK_REPORT.md)**: A required report comparing at least 5 models across at least 2 providers on the same ≥3 SWE-bench tasks (setup, results table, provider reliability, intermediary metrics, ablation study, conclusions).
 - **Ablation study**: A before/after comparison isolating the effect of one change (prompt, tools, or parameters) on the same tasks with the same model.
 - **Intermediary metrics**: Progress indicators beyond pass/fail, such as the iteration at which the final patch's file is first touched, or the gap between tests passing and calling `final_answer`.
-- **Hard limits**: The strict per-benchmark caps on iterations, input/output tokens, and timeout that a submission must respect (MBPP: 10 / 6,000 / 1,500 / 120s; SWE-bench: 30 / 300,000 / 10,000 / 900s).
-- **Pass criteria**: The exam thresholds — 4/5 for MBPP, 2/3 for SWE-bench — with no retries allowed during examination.
-- **AI Safety in Evaluation**: The requirement that the agent solve tasks through legitimate reasoning and exploration, not by fetching answers from PRs/issues/training data or bypassing the sandbox.
 
 ---
 
@@ -190,9 +177,6 @@ make install
 - **execution timeout（実行タイムアウト）**: 設定された時間を超えて実行されたコードを強制終了（SIGTERM→SIGKILL）する仕組み。
 - **memory limits（メモリ上限）**: 設定されたRAM使用量を超えたプロセスを終了させる仕組み。
 - **restricted builtins（組み込み関数の制限）**: 権限昇格を防ぐため、危険な組み込み関数（`open`, `eval`, `exec`, `__import__` など）を削除・上書きすること。
-- **SandboxConfig**: サンドボックスの設定可能なセキュリティ制限（imports・ディレクトリ・タイムアウト・メモリ）を定義するPydanticモデル。JSONファイルから読み込み可能。
-- **RestrictedPython**: 本課題では使用が明示的に禁止されているサードパーティ製サンドボックスライブラリ。セキュリティ機構は標準ライブラリのみで実装する必要がある。
-
 #### MCPとツール
 - **MCP (Model Context Protocol)**: Anthropicが策定した、LLM/エージェントと外部ツール・データソースを繋ぐオープンプロトコル。別プロセスのMCPサーバーとして公開される。
 - **MCP Server（MCPサーバー）**: stdioまたはstreamable HTTP経由でツール・リソース・プロンプトを公開する別プロセス。自作のMCPサーバーのみ使用可能。
@@ -202,18 +186,11 @@ make install
 - **File System Tools（ファイルシステム系ツール）**: `read_file` / `edit_file` / `list_files` — サンドボックス化された作業領域内のファイルの読み込み・編集・一覧取得。
 - **Code Search Tools（コード検索系ツール）**: `search_code` / `search_function_or_class_definition_in_code` / `find_references` — grep風検索、定義箇所の検索、参照箇所の検索。
 - **Execution Tools（実行系ツール）**: `run_tests` / `get_patch` / `run_command` — 評価スクリプトの実行、git diffの取得、任意のシェルコマンド実行。
-- **TESTBED_PATH**: moulinetteが設定する環境変数。SWE-benchタスクにおいて、MCPツールにリポジトリのルートパスを伝える。
 
 #### ベンチマーク
 - **MBPP (Mostly Basic Python Problems)**: エージェントを評価するための、短く自己完結したアルゴリズム系Python問題のベンチマーク。
 - **SWE-bench**: 実在のプロダクションリポジトリにおける実際のバグ修正を、Dockerコンテナ内で評価するベンチマーク。
 - **SWE-bench Verified**: 本課題の評価で使用される、SWE-benchの特定のデータセットバリアント。
-- **moulinette（ムーリネット）**: 課題公式の評価ツール（`moulinette_eval dump/validate/...`）。タスクの生成と解答の検証に使う。
-
-#### データモデル
-- **StepMetrics**: 各イテレーションのメトリクス（トークン数、所要時間、LLMの生応答、サンドボックスへの入出力、リトライ回数）を記録するPydanticモデル。
-- **SolutionOutput**: 最終的に必須となる出力（task_id、success、solution、iterations、各種合計値、ステップごとのメトリクス、system_prompt、error）を表すPydanticモデル。
-- **MBPPTaskInput / SWEBenchTaskInput**: 各ベンチマーク専用エージェントに渡す入力を表すPydanticモデル。
 
 #### LLMとプロバイダ
 - **LLM API Providers（LLM APIプロバイダ）**: LLM推論を提供するサードパーティサービス（OpenRouter, Together AI, Groq, Google AI Studio, Mistral AI, Cohere, Fireworks AI, Perplexity AI, Anyscale など）。無料枠のみで利用すること。
@@ -225,6 +202,3 @@ make install
 - **Model Benchmark Report (BENCHMARK_REPORT.md)**: 最低5モデル×最低2プロバイダを、同一の3タスク以上のSWE-benchタスクで比較する必須レポート（Setup・結果表・プロバイダ信頼性・中間指標・アブレーションスタディ・結論を含む）。
 - **Ablation study（アブレーションスタディ）**: 同一タスク・同一モデルで、プロンプト/ツール/パラメータなど1つの変更前後を比較する検証。
 - **Intermediary metrics（中間指標）**: Pass/Fail以外の進捗指標。例えば最終パッチに含まれるファイルに最初にアクセスしたステップ数、テスト通過から`final_answer`呼び出しまでの反復数など。
-- **Hard limits（厳格な上限）**: 提出物が守るべきベンチマークごとの反復数・入出力トークン数・タイムアウトの上限（MBPP: 10回 / 6,000 / 1,500 / 120秒、SWE-bench: 30回 / 300,000 / 10,000 / 900秒）。
-- **Pass criteria（合格基準）**: 試験時の合格ライン — MBPPは5問中4問、SWE-benchは3問中2問。試験中のリトライは不可。
-- **AI Safety in Evaluation（評価におけるAI安全性）**: エージェントがPR・issue・学習データからの答えの流用やサンドボックスの回避ではなく、正当な推論と探索によってタスクを解いていることを求める要件。
