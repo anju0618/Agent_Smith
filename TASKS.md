@@ -27,14 +27,14 @@ smolagents / llama-index / langgraph / crewai / autogen 等の「エージェン
 
 ### 0. 環境準備
 - [x] `uv` をインストールし、Python 3.10 プロジェクトを `uv init` で作成
-- [x] `moulinette.zip` を展開し、`moulinette/` の中身(README.md, models_public.py, __main__.py, tests/)を読む
+- [] `moulinette.zip` を展開し、`moulinette/` の中身(README.md, models_public.py, __main__.py, tests/)を読む
   - `moulinette_eval dump/validate` の使い方、`sanitized_tasks.json`(MBPPデータ)を確認
-- [x] `.env` からAPIキーを読む設計にする(コードへのハードコード厳禁 = 即失格)
+- [] `.env` からAPIキーを読む設計にする(コードへのハードコード厳禁 = 即失格)
 
 ### 1. コア: Agent/Orchestratorループ
-- [x] Thought → Code → Observation ループの実装(`orchestrator.py`。CodeExtractor/SandboxはProtocolのみで、section 2/3の実装待ち)
-- [x] システムプロンプト設計(利用可能ツールの説明、Thought/Code/Observationの例、有効な推論ループの例)
-- [x] `stop_sequences`(`<end_code>` 等)をLLM API呼び出しに設定し、ツール出力を待たずに続きを幻覚生成しないようにする(`llm_client.py`)
+- [] Thought → Code → Observation ループの実装(`orchestrator.py`。CodeExtractor/SandboxはProtocolのみで、section 2/3の実装待ち)
+- [] システムプロンプト設計(利用可能ツールの説明、Thought/Code/Observationの例、有効な推論ループの例)
+- [] `stop_sequences`(`<end_code>` 等)をLLM API呼び出しに設定し、ツール出力を待たずに続きを幻覚生成しないようにする(`llm_client.py`)
 
 ### 2. コード抽出レイヤー(複数フォーマット対応)
 - [ ] Pythonコードブロック(` ```python ... ``` <end_code>`)を主形式として対応

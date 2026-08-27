@@ -153,6 +153,7 @@ make install
 #### 課題PDF内の検索キーワード
 - [MCP (Model Context Protocol) の仕組みを知りたい！](https://qiita.com/megmogmog1965/items/79ec6a47d9c223e8cffc)
 - [What is agentic coding?](https://www.ibm.com/think/topics/agentic-coding)
+- [Loop Engineering入門：AIコーディングエージェントを動かすシステムを設計する](https://zenn.dev/suwash/articles/loop-engineering_20260610)
 
 ### 専門用語
 
