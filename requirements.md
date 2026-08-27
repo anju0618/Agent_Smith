@@ -1,8 +1,5 @@
 # requirements.md — Agent Smith 課題要件 詳細まとめ
 
-en.subject.pdf(v1.1, 32ページ)の全文を精読して作成した詳細版。TASKS.mdはタスクチェックリスト、memo.mdは実装知識メモという役割なので、こちらは**subjectの一次情報をそのまま構造化した参照資料**という位置づけ。実装中に「これって subject にどう書いてあったっけ」となったらまずここを見る。
-
----
 
 ## 目次
 1. [Foreword / AI Instructions(Ch. I-II)](#1-foreword--ai-instructions)
