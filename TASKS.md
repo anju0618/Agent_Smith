@@ -59,6 +59,11 @@ smolagents / llama-index / langgraph / crewai / autogen 等の「エージェン
 - [ ] MCPサーバー接続(stdio・streamable HTTP両対応)、ツールをPython関数として動的公開
 - [ ] 「サンドボックスマニュアル」をMCPツールのスキーマから動的生成し、システムプロンプトに含める
 - [ ] Pydanticモデル `SandboxConfig` をJSON設定ファイルから読み込めるようにする
+  - subject記載の `SandboxConfig` デフォルト値(`Agent_Smith.pdf` V.2, p.16):
+    - `authorized_imports`: `"math"`, `"math.*"`, `"collections"`, `"collections.*"`, `"itertools"`, `"re"`, `"json"`, `"typing"`, `"typing.*"`, `"functools"`, `"operator"`, `"heapq"`, `"bisect"`, `"copy"`, `"string"`, `"random"`, `"datetime"`, `"datetime.*"`, `"array"`, `"cmath"`
+    - `allowed_directories`: `"/testbed"`, `"/tmp/agent"`
+    - `max_execution_time_seconds`: `30` / `max_memory_mb`: `512`
+    - `models.py` の `SandboxConfig.authorized_imports` は `default_factory=list`(空)なので、上記の具体的なデフォルトリストは自分で埋める
 - [ ] サンドボックスは以下の状況でLLMに明示的なフィードバックを返す:
   - [ ] コードブロックが見つからない
   - [ ] コードブロックは壊れていたが解釈できた(その方法を説明)
