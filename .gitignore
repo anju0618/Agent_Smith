@@ -1,13 +1,56 @@
+# Python bytecode and caches
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Build and packaging artifacts
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# Test, type-checking, and coverage artifacts
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.dmypy.json
+dmypy.json
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
+
+# Secrets and local environment files
+.env
+.env.*
+!.env.example
+
+# Logs and temporary files
+*.log
+*~
+*.swp
+*.swo
+
+# IDE and OS files
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# Reference papers, except papers deliberately kept for reference.
 *.pdf
-# ...except papers deliberately kept for reference (arXiv, freely redistributable).
 !/reference/*.pdf
 
-# secrets
-.env
-
-# reference copy of the eval harness — moulinette.zip is the tracked source of truth
+# Reference copy of the eval harness — moulinette.zip is the tracked source of truth
 /moulinette/
+moulinette.zip
 
-# python
-__pycache__/
-*.pyc
+# Local agent session logs
+.session-logs/
