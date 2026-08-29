@@ -7,6 +7,19 @@ ast = Abstract Syntax Tree(抽象構文木)
 import ast
 import fnmatch
 
+from models import SandboxConfig
+
+DEFAULT_AUTHORIZED_IMPORTS = [
+    "math", "math.*",
+    "collections", "collections.*",
+    "itertools", "re", "json",
+    "typing", "typing.*",
+    "functools", "operator",
+    "heapq", "bisect", "copy",
+    "string", "random",
+    "datetime", "datetime.*",
+    "array", "cmath",
+]
 
 class SandboxViolation(Exception):
     """
@@ -49,7 +62,10 @@ def _is_authorized(module_name: str, authorized: list[str]) -> bool:
 class Sandbox:
 
     def __init__(self, config=None) -> None:
-        self.config = config
+        if config is None:
+            self.config = SandboxConfig(authorized_imports = DEFAULT_AUTHORIZED_IMPORTS)
+        else:
+            self.config = config
 
     def run(self, code:str) -> None:
 
