@@ -59,6 +59,9 @@ make install
 #### Search terms in Subject PDF
 - [MCP (Model Context Protocol) の仕組みを知りたい！](https://qiita.com/megmogmog1965/items/79ec6a47d9c223e8cffc)
 - [What is agentic coding?](https://www.ibm.com/think/topics/agentic-coding)
+- [Pythonのexecで詰まった話と、それに関する一考察](http://den3.net/activity_diary/2024/09/16/6890/) - execの勉強
+- [[python] 文を実行するexec, eval](https://qiita.com/Kodaira_/items/30c84806b61792b613f2)
+- [言語Sandbox環境の脆弱性とその真因の考察 - RestrictedPythonを題材に](https://laysakura.github.io/2024/12/17/RestrictedPython-CVE/) - RestrictedPythonの勉強
 
 ### Terms
 

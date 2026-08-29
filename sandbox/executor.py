@@ -41,7 +41,7 @@ class FinalAnswer(Exception):
 
 def check_imports(tree: ast.AST, authorized: list[str]) -> None:
     """
-    インポチェック
+    インポートチェック
     違反してたら
     raise SandboxViolation
     """
@@ -64,6 +64,7 @@ class Sandbox:
     def __init__(self, config=None) -> None:
         if config is None:
             self.config = SandboxConfig(authorized_imports = DEFAULT_AUTHORIZED_IMPORTS)
+            self.namespace = 
         else:
             self.config = config
 
@@ -81,3 +82,8 @@ class Sandbox:
             return f"[SyntaxError] {e}"
         except SandboxViolation as e:
             return f"[SandboxViolation] {e}"
+
+
+if __name__ == "__main__":
+    sandbox = Sandbox()
+    Sandbox.run("import numpy\ndef test():\n\treturn numpy.mean([1,2,3,4])\nret_val = test()\nprint(ret_val)")
