@@ -74,5 +74,10 @@ class Sandbox:
 
         try:
             tree = ast.parse(code)
+            check_imports(tree, self.config.authorized_imports)
+            compiled_code = compile(tree, "<agent>", "exec")
+            exec(compiled_code, namespace_dict)
         except SyntaxError as e:
             return f"[SyntaxError] {e}"
+        except SandboxViolation as e:
+            return f"[SandboxViolation] {e}"
