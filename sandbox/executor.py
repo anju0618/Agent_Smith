@@ -68,11 +68,10 @@ class Sandbox:
         else:
             self.config = config
 
-    def run(self, code:str) -> None:
+    def run(self, code: str) -> None:
 
         if not code.strip():
             return "[Error] empty code"
-
         try:
             tree = ast.parse(code)
             check_imports(tree, self.config.authorized_imports)
