@@ -41,7 +41,7 @@ class FinalAnswer(Exception):
 
 def check_imports(tree: ast.AST, authorized: list[str]) -> None:
     """
-    インポートチェック
+    インポチェック
     違反してたら
     raise SandboxViolation
     """
