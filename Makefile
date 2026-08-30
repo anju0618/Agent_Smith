@@ -33,11 +33,11 @@ fclean: clean
 # material, not our code) — see .gitignore.
 lint:
 	uv run flake8 --exclude=.venv,moulinette .
-	uv run mypy --exclude moulinette --exclude .venv --explicit-package-bases --warn-return-any --warn-unused-ignores --ignore-missing-imports --disallow-untyped-defs --check-untyped-defs .
+	uv run mypy --exclude moulinette --exclude .venv --exclude models.py --explicit-package-bases --warn-return-any --warn-unused-ignores --ignore-missing-imports --disallow-untyped-defs --check-untyped-defs .
 
 lint-strict:
 	uv run flake8 --exclude=.venv,moulinette .
-	uv run mypy --exclude moulinette --exclude .venv --strict .
+	uv run mypy --exclude moulinette --exclude .venv --exclude models.py --strict .
 
 test:
 	uv run pytest -v

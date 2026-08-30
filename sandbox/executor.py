@@ -9,6 +9,9 @@ import builtins
 import contextlib
 import fnmatch
 import io
+from collections.abc import Callable
+from types import ModuleType
+from typing import Any
 
 from models import SandboxConfig
 
@@ -24,6 +27,7 @@ DEFAULT_AUTHORIZED_IMPORTS = [
     "array", "cmath",
 ]
 
+
 class SandboxViolation(Exception):
     """
     AIが出してきたものが，何かに違反していた時
@@ -37,7 +41,7 @@ class FinalAnswer(Exception):
     投げる例外．answer 属性に渡された値を保持する．
     """
 
-    def __init__(self, answer):
+    def __init__(self, answer: Any) -> None:
         super().__init__(answer)
         self.answer = answer
 
@@ -62,14 +66,20 @@ def _is_authorized(module_name: str, authorized: list[str]) -> bool:
     return any(fnmatch.fnmatch(module_name, pattern) for pattern in authorized)
 
 
-def _make_restricted_import(authorized: list[str]):
+def _make_restricted_import(authorized: list[str]) -> Callable[..., ModuleType]:
     """
     __import__ 自体を差し替えて，`__import__("os")` のような
     ast の import 文チェックを迂回する呼び方も弾けるようにする．
     """
     real_import = builtins.__import__
 
-    def restricted_import(name, globals=None, locals=None, fromlist=(), level=0):
+    def restricted_import(
+        name: str,
+        globals: dict[str, Any] | None = None,
+        locals: dict[str, Any] | None = None,
+        fromlist: tuple[str, ...] = (),
+        level: int = 0,
+    ) -> ModuleType:
         if not _is_authorized(name, authorized):
             raise SandboxViolation(f"{name} is not permitted")
         return real_import(name, globals, locals, fromlist, level)
@@ -77,13 +87,13 @@ def _make_restricted_import(authorized: list[str]):
     return restricted_import
 
 
-def final_answer(answer):
+def final_answer(answer: Any) -> None:
     raise FinalAnswer(answer)
 
 
 class Sandbox:
 
-    def __init__(self, config=None) -> None:
+    def __init__(self, config: SandboxConfig | None = None) -> None:
         if config is None:
             config = SandboxConfig(authorized_imports=DEFAULT_AUTHORIZED_IMPORTS)
         self.config = config
@@ -118,4 +128,5 @@ class Sandbox:
 
 if __name__ == "__main__":
     sandbox = Sandbox()
-    print(sandbox.run("import math\ndef test():\n\treturn sum([1,2,3,4]) / 4\nret_val = test()\nprint(ret_val)"))
+    demo_code = "import math\ndef test():\n\treturn sum([1, 2, 3, 4]) / 4\nprint(test())"
+    print(sandbox.run(demo_code))
