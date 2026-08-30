@@ -1,0 +1,35 @@
+[project]
+name = "agent-smith-sample"
+version = "0.1.0"
+description = "Reference implementation of the Agent Smith agentic coding framework (MBPP + SWE-bench)"
+readme = "README.md"
+requires-python = ">=3.10"
+
+dependencies = [
+    "pydantic>=2.13.5",
+    "python-dotenv>=1.2.3",
+    "requests>=2.34.2",
+    "mcp>=1.2.0,<2",
+    "docker>=7.1.0",
+]
+
+[dependency-groups]
+dev = [
+    "flake8>=7.3.0",
+    "mypy>=2.3.1",
+    "pytest>=9.1.1",
+]
+
+[project.scripts]
+sandbox = "sandbox.cli:main"
+
+[build-system]
+requires = ["uv_build>=0.12.6,<0.13"]
+build-backend = "uv_build"
+
+[tool.uv.build-backend]
+module-name = "sandbox"
+module-root = ""
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

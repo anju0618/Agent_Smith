@@ -1,0 +1,108 @@
+"""Sandbox CLI (Section 4.2): interactive REPL, optionally wired to an MCP server.
+
+    uv run sandbox                                          # interactive, defaults
+    uv run sandbox sandbox_template.json                    # custom config
+    uv run sandbox --mcp-stdio "python mcp_tools_mbpp.py" sandbox_template.json
+    uv run sandbox --mcp-server http://localhost:8000/mcp
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+from pathlib import Path
+from typing import Optional
+
+from models import SandboxConfig
+from sandbox.executor import DEFAULT_ALLOWED_DIRECTORIES, DEFAULT_AUTHORIZED_IMPORTS, FinalAnswer, Sandbox
+from sandbox.mcp_client import MCPToolProxy
+
+
+def load_config(path: Optional[str]) -> SandboxConfig:
+    """Load a SandboxConfig from a JSON file, or fall back to the project defaults."""
+    if path is None:
+        return SandboxConfig(
+            authorized_imports=DEFAULT_AUTHORIZED_IMPORTS,
+            allowed_directories=DEFAULT_ALLOWED_DIRECTORIES,
+        )
+    config_path = Path(path)
+    with config_path.open("r", encoding="utf-8") as file:
+        data = json.load(file)
+    return SandboxConfig.model_validate(data)
+
+
+def _connect_mcp(mcp_stdio: Optional[str], mcp_server: Optional[str]) -> Optional[MCPToolProxy]:
+    if mcp_stdio:
+        print(f"Connecting to MCP server over stdio: {mcp_stdio}")
+        return MCPToolProxy(stdio_command=mcp_stdio)
+    if mcp_server:
+        print(f"Connecting to MCP server over streamable HTTP: {mcp_server}")
+        return MCPToolProxy(http_url=mcp_server)
+    return None
+
+
+def repl(sandbox: Sandbox) -> None:
+    """REPL-style CLI mode (Section 4.2): reads code, a blank line runs the
+    accumulated block, 'exit' or EOF (Ctrl+D) quits cleanly."""
+    print("Agent Smith interactive sandbox. Blank line runs the block, 'exit' or Ctrl+D quits.")
+    while True:
+        lines: list = []
+        try:
+            first_line = input(">>> ")
+        except EOFError:
+            print()
+            return
+        if first_line.strip() == "exit":
+            return
+        if first_line != "":
+            lines.append(first_line)
+            while True:
+                try:
+                    line = input("... ")
+                except EOFError:
+                    print()
+                    return
+                if line == "":
+                    break
+                lines.append(line)
+
+        code = "\n".join(lines)
+        if not code.strip():
+            continue
+        try:
+            result = sandbox.run(code)
+        except FinalAnswer as fa:
+            print(f"[final_answer submitted] {fa.answer!r}")
+            continue
+        print(result)
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Agent Smith sandbox")
+    parser.add_argument("config", nargs="?", default=None, help="Path to sandbox configuration JSON file")
+    parser.add_argument("--mcp-stdio", default=None, help="Command used to launch an MCP server over stdio")
+    parser.add_argument("--mcp-server", default=None, help="URL of a streamable HTTP MCP server")
+    args = parser.parse_args()
+
+    try:
+        config = load_config(args.config)
+    except (OSError, json.JSONDecodeError, ValueError) as exc:
+        print(f"Failed to load sandbox config: {exc}", file=sys.stderr)
+        sys.exit(1)
+
+    mcp_proxy = None
+    try:
+        mcp_proxy = _connect_mcp(args.mcp_stdio, args.mcp_server)
+        extra_namespace = mcp_proxy.build_namespace() if mcp_proxy else {}
+        if mcp_proxy:
+            print(f"Connected. {len(mcp_proxy.tools)} tool(s) available:\n{mcp_proxy.manual_text()}\n")
+
+        sandbox = Sandbox(config, extra_namespace=extra_namespace)
+        repl(sandbox)
+    finally:
+        if mcp_proxy:
+            mcp_proxy.close()
+
+
+if __name__ == "__main__":
+    main()
