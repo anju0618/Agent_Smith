@@ -63,6 +63,9 @@ def check_imports(tree: ast.AST, authorized: list[str]) -> None:
 
 
 def _is_authorized(module_name: str, authorized: list[str]) -> bool:
+    """
+    module_name が authorized のいずれかのパターンに一致するか判定する．
+    """
     return any(fnmatch.fnmatch(module_name, pattern) for pattern in authorized)
 
 
@@ -80,6 +83,9 @@ def _make_restricted_import(authorized: list[str]) -> Callable[..., ModuleType]:
         fromlist: tuple[str, ...] = (),
         level: int = 0,
     ) -> ModuleType:
+        """
+        本物の __import__ の前に authorized チェックを挟むラッパー．
+        """
         if not _is_authorized(name, authorized):
             raise SandboxViolation(f"{name} is not permitted")
         return real_import(name, globals, locals, fromlist, level)
@@ -88,23 +94,41 @@ def _make_restricted_import(authorized: list[str]) -> Callable[..., ModuleType]:
 
 
 def final_answer(answer: Any) -> None:
+    """
+    サンドボックス内のコードから呼ばれる関数．FinalAnswer(answer) を投げる．
+    """
     raise FinalAnswer(answer)
 
 
 class Sandbox:
+    """
+    許可された import だけを使えるコードを exec するサンドボックス．
+    """
 
     def __init__(self, config: SandboxConfig | None = None) -> None:
+        """
+        config が None の場合は DEFAULT_AUTHORIZED_IMPORTS で SandboxConfig を作る．
+        """
         if config is None:
             config = SandboxConfig(authorized_imports=DEFAULT_AUTHORIZED_IMPORTS)
         self.config = config
         self.namespace = self._build_namespace()
 
     def _build_namespace(self) -> dict:
+        """
+        exec() に渡す globals 辞書を組み立てる．
+        __import__ を制限付きのものに差し替え，final_answer を登録する．
+        """
         restricted_builtins = builtins.__dict__.copy()
         restricted_builtins["__import__"] = _make_restricted_import(self.config.authorized_imports)
         return {"__builtins__": restricted_builtins, "final_answer": final_answer}
 
     def run(self, code: str) -> str:
+        """
+        code を ast チェックしたうえで exec し，標準出力を文字列として返す．
+        エラー系は例外にせず [SyntaxError]/[SandboxViolation]/[Error] 付き文字列で返す．
+        FinalAnswer だけは呼び出し元まで re-raise する．
+        """
 
         if not code.strip():
             return "[Error] empty code"

@@ -6,6 +6,10 @@ from models import SandboxConfig
 
 
 def load_config(path: str | None) -> SandboxConfig:
+    """
+    path が None ならデフォルトの SandboxConfig を返す．
+    指定があれば JSON ファイルとして読み込み，SandboxConfig にパースして返す．
+    """
     if path is None:
         return SandboxConfig()
 
@@ -18,6 +22,9 @@ def load_config(path: str | None) -> SandboxConfig:
 
 
 def main() -> None:
+    """
+    コマンドライン引数から設定を読み込み，内容を標準出力に表示するエントリポイント．
+    """
     parser = argparse.ArgumentParser(
         description="Agent Smith sandbox"
     )
