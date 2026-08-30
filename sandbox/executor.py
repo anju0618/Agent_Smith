@@ -5,7 +5,10 @@ ast = Abstract Syntax Tree(抽象構文木)
 """
 
 import ast
+import builtins
+import contextlib
 import fnmatch
+import io
 
 from models import SandboxConfig
 
@@ -59,16 +62,39 @@ def _is_authorized(module_name: str, authorized: list[str]) -> bool:
     return any(fnmatch.fnmatch(module_name, pattern) for pattern in authorized)
 
 
+def _make_restricted_import(authorized: list[str]):
+    """
+    __import__ 自体を差し替えて，`__import__("os")` のような
+    ast の import 文チェックを迂回する呼び方も弾けるようにする．
+    """
+    real_import = builtins.__import__
+
+    def restricted_import(name, globals=None, locals=None, fromlist=(), level=0):
+        if not _is_authorized(name, authorized):
+            raise SandboxViolation(f"{name} is not permitted")
+        return real_import(name, globals, locals, fromlist, level)
+
+    return restricted_import
+
+
+def final_answer(answer):
+    raise FinalAnswer(answer)
+
+
 class Sandbox:
 
     def __init__(self, config=None) -> None:
         if config is None:
-            self.config = SandboxConfig(authorized_imports = DEFAULT_AUTHORIZED_IMPORTS)
-            self.namespace = 
-        else:
-            self.config = config
+            config = SandboxConfig(authorized_imports=DEFAULT_AUTHORIZED_IMPORTS)
+        self.config = config
+        self.namespace = self._build_namespace()
 
-    def run(self, code: str) -> None:
+    def _build_namespace(self) -> dict:
+        restricted_builtins = builtins.__dict__.copy()
+        restricted_builtins["__import__"] = _make_restricted_import(self.config.authorized_imports)
+        return {"__builtins__": restricted_builtins, "final_answer": final_answer}
+
+    def run(self, code: str) -> str:
 
         if not code.strip():
             return "[Error] empty code"
@@ -76,13 +102,20 @@ class Sandbox:
             tree = ast.parse(code)
             check_imports(tree, self.config.authorized_imports)
             compiled_code = compile(tree, "<agent>", "exec")
-            exec(compiled_code, namespace_dict)
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                exec(compiled_code, self.namespace)
+            return output.getvalue()
         except SyntaxError as e:
             return f"[SyntaxError] {e}"
         except SandboxViolation as e:
             return f"[SandboxViolation] {e}"
+        except FinalAnswer:
+            raise
+        except Exception as e:
+            return f"[Error] {type(e).__name__}: {e}"
 
 
 if __name__ == "__main__":
     sandbox = Sandbox()
-    Sandbox.run("import numpy\ndef test():\n\treturn numpy.mean([1,2,3,4])\nret_val = test()\nprint(ret_val)")
+    print(sandbox.run("import math\ndef test():\n\treturn sum([1,2,3,4]) / 4\nret_val = test()\nprint(ret_val)"))
