@@ -150,14 +150,14 @@ architectural choice with no single right answer:
 
 | Concern | This implementation | Trade-off |
 |---|---|---|
-| Import allowlist | AST walk (`ast.Import`/`ImportFrom`) **and** a runtime-patched `__import__`, so `__import__("os")` called as a plain function is caught too | — |
-| Filesystem allowlist | `open` is replaced with a wrapper that `os.path.realpath`-resolves the target and checks it's under `SandboxConfig.allowed_directories` | Only guards `open`; a module that reads files via its own C extension would bypass it — acceptable because nothing exposing raw file descriptors is in the default `authorized_imports` |
+| Import allowlist | AST walk (`ast.Import`/`ImportFrom`) **and** a runtime-patched `__import__`, so `__import__("os")` called as a plain function is caught too. Imported modules are exposed through restricted proxies which hide private attributes and unauthorized nested modules (`random._os`, `typing.sys`, etc.) | — |
+| Filesystem allowlist | `open` is replaced with a wrapper that `os.path.realpath`-resolves the target and checks it's under `SandboxConfig.allowed_directories` | Only guards `open`; the restricted module/private-attribute boundary must therefore remain strict so allowlisted modules cannot hand raw filesystem modules back to agent code |
 | Network access | Never explicitly blocked at the socket level — enforced by omission: `socket`, `urllib`, `requests`, `http`, etc. are simply never in `authorized_imports` | Defense relies entirely on the import allowlist staying strict |
 | Execution timeout | `signal.alarm()` (Unix): CPython checks for pending signals between bytecode instructions, so this reliably interrupts both Python loops and blocking stdlib calls | Cannot preempt a C extension that blocks without releasing the GIL. A separate-process design with `SIGTERM`→`SIGKILL` (the approach Section 6.1 describes — and which moulinette's own `run-agent` uses — for the *outer* agent-process timeout) would close this gap at the cost of needing an IPC bridge for MCP tool calls |
 | Memory limit | `resource.setrlimit(RLIMIT_AS, ...)` once per process; an over-limit allocation raises a normal, catchable `MemoryError` | Applies to the whole process for its lifetime (can only be lowered, never raised again) — fine for a single-purpose agent process, but this is why the test suite exercises it in a subprocess instead of the pytest process itself |
-| Restricted builtins | `eval`, `exec`, `compile`, `input`, `breakpoint`, `help`, `exit`, `quit`, `__import__`, `open` are removed/replaced in the sandboxed builtins | — |
-| Dunder attribute access | A default-deny allowlist: `check_dunder_attribute_access()` statically rejects any explicit `.__dunder__` access outside a small safe list (operator overloading, iteration, repr, ...); `getattr`/`setattr` are replaced with wrappers enforcing the same rule dynamically. Closes the classic `().__class__.__bases__[0].__subclasses__()` → a loaded class's `__init__.__globals__['__builtins__']` escape (found by independent review, reproduced, and fixed — see BENCHMARK_REPORT.md) | Does not (and cannot, short of disabling `str.format` entirely) block the same traversal reached through `str.format()`'s attribute mini-language, e.g. `"{0.__class__}".format(x)`, since that parses attribute names from a runtime string rather than as AST `Attribute` nodes |
-| `final_answer()` | A closure injected into every sandbox namespace, independent of whatever MCP server is connected; raises `FinalAnswer`, which is deliberately **not** caught by the generic exception handler, alongside `KeyboardInterrupt`/`SystemExit` | Matches Section 4.2's "exception propagation" requirement exactly |
+| Restricted builtins | `eval`, `exec`, `compile`, `input`, `breakpoint`, `help`, `exit`, `quit`, `vars`, `__import__`, `open` are removed/replaced in the sandboxed builtins | — |
+| Private attribute access | A default-deny allowlist: `check_dunder_attribute_access()` rejects private attributes outside a small safe dunder list (operator overloading, iteration, repr, ...); `getattr`/`setattr` enforce the same rule dynamically, and `operator.attrgetter`/`methodcaller` are unavailable. This closes both classic `__subclasses__` introspection and allowlisted-module escapes such as `random._os` | `str.format()` still parses attribute names internally and can stringify otherwise-hidden attributes, but it cannot return the referenced object for further calls |
+| `final_answer()` | A closure injected into every sandbox namespace, independent of whatever MCP server is connected; reserved-name collisions from MCP namespaces are rejected, and `FinalAnswer` is deliberately **not** caught by the generic exception handler | Matches Section 4.2's "exception propagation" requirement exactly |
 
 The upside of staying in-process: MCP tool wrappers (built once by
 `MCPToolProxy`, holding a live connection on a background asyncio thread) are
@@ -180,7 +180,9 @@ system prompt (the "sandbox manual" from Section 4.2), so connecting a
 different MCP server automatically changes both what the sandbox can call
 *and* what the LLM is told it can call — this is how the system stays
 compatible with the "unknown MCP server" the subject says it will be tested
-against.
+against. Connection establishment, each tool call, and shutdown are all
+bounded; one owner coroutine enters and exits the AnyIO transport contexts in
+the same task so timeout cleanup cannot leak the server subprocess.
 
 **MBPP tools** (`mcp_tools_mbpp.py`): `run_tests(code, test_list)` runs the
 candidate + assertions in a throwaway subprocess with a 10s timeout, so a

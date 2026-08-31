@@ -40,11 +40,26 @@ def test_json_tool_call_is_converted() -> None:
     assert "[FormatConverted]" in result.note
 
 
+def test_json_tool_call_preserves_string_argument_types() -> None:
+    text = (
+        '<tool_call>{"name": "search_code", '
+        '"arguments": {"pattern": "123", "file_pattern": "false"}}</tool_call>'
+    )
+    result = extract_code(text)
+    assert result.code == "result = search_code(pattern='123', file_pattern='false')\nprint(result)"
+
+
 def test_react_format_is_converted() -> None:
     text = 'Action: list_files\nAction Input: {"directory": "/testbed"}'
     result = extract_code(text)
     assert result.code == "result = list_files(directory='/testbed')\nprint(result)"
     assert "[FormatConverted]" in result.note
+
+
+def test_react_format_preserves_json_string_argument_types() -> None:
+    text = 'Action: search_code\nAction Input: {"pattern": "null"}'
+    result = extract_code(text)
+    assert result.code == "result = search_code(pattern='null')\nprint(result)"
 
 
 def test_no_code_block_found() -> None:

@@ -62,9 +62,32 @@ def test_list_files_recurses_with_double_star_pattern(fake_repo: Path) -> None:
     assert str(subdir / "nested.py") in output
 
 
+def test_list_files_rejects_parent_and_absolute_patterns(fake_repo: Path) -> None:
+    assert "[Error]" in tools.list_files(str(fake_repo), "../*.py")
+    assert "[Error]" in tools.list_files(str(fake_repo), "/tmp/*.py")
+
+
+def test_list_files_rejects_symlink_target_outside_testbed(
+    fake_repo: Path, tmp_path: Path
+) -> None:
+    outside = tmp_path / "outside.txt"
+    outside.write_text("secret")
+    (fake_repo / "outside-link.txt").symlink_to(outside)
+
+    output = tools.list_files(str(fake_repo), "*.txt")
+
+    assert "[Error]" in output
+    assert "outside" in output
+
+
 def test_search_code_finds_pattern(fake_repo: Path) -> None:
     output = tools.search_code("is_valid_email", "*.py")
     assert f"{fake_repo / 'mail.py'}:1" in output
+
+
+def test_search_code_rejects_parent_pattern(fake_repo: Path) -> None:
+    output = tools.search_code("anything", "../*.py")
+    assert "[Error]" in output
 
 
 def test_search_function_definition(fake_repo: Path) -> None:
