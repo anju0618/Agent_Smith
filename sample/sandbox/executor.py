@@ -64,6 +64,7 @@ _UNSAFE_BUILTINS = {
 }
 
 _RESERVED_GLOBAL_NAMES = {"__builtins__", "final_answer"}
+_FORBIDDEN_PUBLIC_ATTRIBUTES = {"format"}
 
 
 class SandboxViolation(Exception):
@@ -120,8 +121,10 @@ _SAFE_DUNDER_ATTRS = {
 def _is_forbidden_attribute(name: object) -> bool:
     return (
         isinstance(name, str)
-        and name.startswith("_")
-        and name not in _SAFE_DUNDER_ATTRS
+        and (
+            name in _FORBIDDEN_PUBLIC_ATTRIBUTES
+            or (name.startswith("_") and name not in _SAFE_DUNDER_ATTRS)
+        )
     )
 
 
@@ -142,14 +145,10 @@ def check_dunder_attribute_access(tree: ast.AST) -> None:
     private implementation details such as ``random._os``. Public module-valued
     attributes are checked separately by _RestrictedModule below.
 
-    Known residual gap, accepted for the same reason executor.py's other
-    trade-offs are: the same traversal is also reachable through
-    ``str.format()``'s attribute mini-language (e.g.
-    ``"{0.__class__}".format(x)``), which parses attribute names from a
-    string at runtime rather than as AST Attribute nodes, so neither this
-    static check nor _make_restricted_getattr sees it. Disabling
-    ``str.format`` entirely would break far more legitimate solution code
-    than it protects against for MBPP/SWE-bench style tasks.
+    ``str.format`` is also denied because its attribute mini-language parses
+    names from a string at runtime, bypassing AST Attribute checks (e.g.
+    ``"{0.__class__}".format(x)``). F-strings and ordinary string operations
+    remain available.
     """
     for node in ast.walk(tree):
         if isinstance(node, ast.Attribute) and _is_forbidden_attribute(node.attr):

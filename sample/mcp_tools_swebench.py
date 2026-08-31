@@ -16,6 +16,8 @@ from __future__ import annotations
 import argparse
 import os
 import re
+import shlex
+import signal
 import subprocess
 from pathlib import Path
 from typing import Optional
@@ -38,7 +40,7 @@ def _testbed_root() -> Path:
 def _eval_script_path() -> Path:
     override = os.environ.get("AGENT_SMITH_EVAL_SCRIPT")
     if override:
-        return Path(override)
+        return _resolve_within_testbed(override)
     return _testbed_root() / "eval.sh"
 
 
@@ -323,12 +325,31 @@ def run_command(command: str, workdir: str = "") -> str:
         return f"[Error] {exc}"
 
     try:
-        result = subprocess.run(command, shell=True, cwd=cwd, capture_output=True, text=True, timeout=120)
+        process = subprocess.Popen(
+            command,
+            shell=True,
+            cwd=cwd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            start_new_session=True,
+        )
+        try:
+            stdout, stderr = process.communicate(timeout=120)
+        except subprocess.TimeoutExpired:
+            os.killpg(process.pid, signal.SIGTERM)
+            try:
+                stdout, stderr = process.communicate(timeout=2)
+            except subprocess.TimeoutExpired:
+                os.killpg(process.pid, signal.SIGKILL)
+                stdout, stderr = process.communicate()
+            return "[Error] command timed out after 120s"
+        returncode = process.returncode
     except subprocess.TimeoutExpired:
         return "[Error] command timed out after 120s"
 
     return _cap_output(
-        f"exit_code: {result.returncode}\n--- stdout ---\n{result.stdout}\n--- stderr ---\n{result.stderr}"
+        f"exit_code: {returncode}\n--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}"
     )
 
 
@@ -340,13 +361,16 @@ def run_tests() -> str:
         The evaluation script's combined output, or an explanatory error if no
         evaluation script is available in this context.
     """
-    eval_script = _eval_script_path()
+    try:
+        eval_script = _eval_script_path()
+    except ValueError as exc:
+        return f"[Error] {exc}"
     if not eval_script.is_file():
         return (
             f"[Error] no evaluation script found at {eval_script}. "
             "Use run_command(...) to invoke the project's own test runner instead."
         )
-    return str(run_command(f"bash {eval_script}"))
+    return str(run_command(f"bash {shlex.quote(str(eval_script))}"))
 
 
 @mcp.tool()

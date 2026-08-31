@@ -109,6 +109,12 @@ def test_subclasses_escape_via_dot_attribute_is_blocked() -> None:
     assert "ESCAPED" not in output
 
 
+def test_format_attribute_escape_is_blocked() -> None:
+    sandbox = _sandbox(authorized_imports=["math"])
+    output = sandbox.run('print("{0.__class__}".format(1))')
+    assert "[SandboxViolation]" in output
+
+
 def test_subclasses_escape_via_getattr_is_blocked() -> None:
     sandbox = _sandbox(authorized_imports=["math"])
     output = sandbox.run("getattr(object, '__subclasses__')()")

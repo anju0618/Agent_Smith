@@ -87,14 +87,35 @@ class SweBenchContainer:
         rather than crashing (General Rules: "all errors must be handled
         gracefully")."""
         assert self._container is not None
-        check = self._container.exec_run("python3 -c 'import mcp'")
-        if check.exit_code == 0:
+        container_id = self._container.id
+        try:
+            check = subprocess.run(
+                ["docker", "exec", container_id, "python3", "-c", "import mcp"],
+                capture_output=True,
+                timeout=30,
+                check=False,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise RuntimeError("Timed out checking MCP dependencies in the container") from exc
+        if check.returncode == 0:
             return
-        install = self._container.exec_run("pip install --quiet 'mcp>=1.2.0,<2' 'pydantic>=2'")
-        if install.exit_code != 0:
+        try:
+            install = subprocess.run(
+                [
+                    "docker", "exec", container_id, "pip", "install", "--quiet",
+                    "mcp>=1.2.0,<2", "pydantic>=2",
+                ],
+                capture_output=True,
+                timeout=300,
+                check=False,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise RuntimeError("Timed out installing MCP dependencies in the container") from exc
+        if install.returncode != 0:
             raise RuntimeError(
                 "Could not install the MCP server's dependencies inside the container "
-                f"(likely no network access in this image): {install.output.decode(errors='replace')}"
+                f"(likely no network access in this image): "
+                f"{install.stderr.decode(errors='replace')}"
             )
 
     def mcp_stdio_command(self) -> str:
