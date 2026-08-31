@@ -1,10 +1,13 @@
 """Integration tests for MCPToolProxy (Section 4.2) against a real MCP server
 subprocess (mcp_tools_mbpp.py over stdio) - no network or API keys needed.
 """
+import asyncio
 import json
 import sys
+import threading
+from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Iterator
+from typing import AsyncIterator, Iterator, Tuple
 
 import pytest
 
@@ -62,3 +65,23 @@ def test_manual_text_lists_discovered_tools(proxy: MCPToolProxy) -> None:
     assert "run_tests" in manual
     assert "code" in manual
     assert "test_list" in manual
+
+
+def test_connection_timeout_stops_background_loop(monkeypatch: pytest.MonkeyPatch) -> None:
+    @asynccontextmanager
+    async def hanging_client(params: object) -> AsyncIterator[Tuple[object, object]]:
+        await asyncio.Event().wait()
+        yield object(), object()
+
+    monkeypatch.setattr("sandbox.mcp_client.stdio_client", hanging_client)
+    existing_threads = {thread.ident for thread in threading.enumerate()}
+
+    with pytest.raises(TimeoutError, match="MCP connection timed out"):
+        MCPToolProxy(stdio_command="unused", connect_timeout=0.05)
+
+    leaked_threads = [
+        thread
+        for thread in threading.enumerate()
+        if thread.ident not in existing_threads and thread.name == "agent-smith-mcp-loop"
+    ]
+    assert leaked_threads == []

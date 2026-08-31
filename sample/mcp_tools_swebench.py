@@ -76,9 +76,41 @@ def _resolve_within_testbed(filepath: str) -> Path:
     candidate = Path(filepath)
     resolved = candidate if candidate.is_absolute() else root / candidate
     resolved = resolved.resolve()
-    if resolved != root and root not in resolved.parents:
+    if not _is_within(root, resolved):
         raise ValueError(f"'{filepath}' resolves outside the repository root {root}")
     return resolved
+
+
+def _is_within(root: Path, candidate: Path) -> bool:
+    return candidate == root or root in candidate.parents
+
+
+def _validate_glob_pattern(pattern: str) -> None:
+    pattern_path = Path(pattern)
+    if not pattern or pattern_path.is_absolute() or ".." in pattern_path.parts:
+        raise ValueError("glob pattern must be relative and must not contain '..'")
+
+
+def _matching_files(directory: Path, pattern: str, recursive: bool) -> list:
+    """Return only regular files whose resolved targets remain in TESTBED_PATH."""
+    _validate_glob_pattern(pattern)
+    root = _testbed_root()
+    try:
+        candidates = list(directory.rglob(pattern) if recursive else directory.glob(pattern))
+    except (NotImplementedError, ValueError) as exc:
+        raise ValueError(f"invalid glob pattern '{pattern}': {exc}") from exc
+
+    matches = []
+    for candidate in candidates:
+        try:
+            resolved = candidate.resolve()
+        except OSError:
+            continue
+        if not _is_within(root, resolved):
+            raise ValueError(f"glob pattern '{pattern}' matched a path outside {root}")
+        if resolved.is_file() and ".git" not in resolved.parts:
+            matches.append(resolved)
+    return matches
 
 
 # ---------------------------------------------------------------------------
@@ -174,7 +206,10 @@ def list_files(directory: str, pattern: str = "*") -> str:
     if not path.is_dir():
         return f"[Error] directory not found: {directory}"
 
-    matches = sorted(str(p) for p in path.glob(pattern) if p.is_file() and ".git" not in p.parts)
+    try:
+        matches = sorted(str(p) for p in _matching_files(path, pattern, recursive=False))
+    except ValueError as exc:
+        return f"[Error] {exc}"
     return _cap_output("\n".join(matches)) if matches else "(no files matched)"
 
 
@@ -184,7 +219,7 @@ def list_files(directory: str, pattern: str = "*") -> str:
 
 
 def _iter_matching_files(root: Path, file_pattern: str) -> list:
-    return [p for p in root.rglob(file_pattern) if p.is_file() and ".git" not in p.parts]
+    return _matching_files(root, file_pattern, recursive=True)
 
 
 @mcp.tool()
@@ -204,8 +239,13 @@ def search_code(pattern: str, file_pattern: str = "*.py") -> str:
     except re.error as exc:
         return f"[Error] invalid regex: {exc}"
 
+    try:
+        matching_files = _iter_matching_files(root, file_pattern)
+    except ValueError as exc:
+        return f"[Error] {exc}"
+
     results = []
-    for file in _iter_matching_files(root, file_pattern):
+    for file in matching_files:
         try:
             for lineno, line in enumerate(file.read_text(errors="replace").splitlines(), start=1):
                 if regex.search(line):

@@ -72,6 +72,7 @@ def test_generate_retries_then_succeeds(monkeypatch: pytest.MonkeyPatch) -> None
 
     assert fake.calls == 2
     assert result.retries == 1
+    assert llm.usage.total_requests == 2
     assert llm.usage.total_retries == 1
 
 
@@ -115,6 +116,8 @@ def test_all_providers_exhausted_reports_attempted_requests(monkeypatch: pytest.
         llm.generate([{"role": "user", "content": "hi"}])
 
     assert exc_info.value.attempted_requests == 3
+    assert llm.usage.total_requests == 3
+    assert llm.usage.total_retries == 3
 
 
 def test_missing_api_key_raises_value_error(monkeypatch: pytest.MonkeyPatch) -> None:

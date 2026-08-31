@@ -53,7 +53,7 @@ class UsageStats:
     errors: List[str] = field(default_factory=list)
 
     def record(self, gen: GenerationResult) -> None:
-        self.total_requests += 1
+        self.total_requests += 1 + gen.retries
         self.total_retries += gen.retries
         self.total_input_tokens += gen.input_tokens
         self.total_output_tokens += gen.output_tokens

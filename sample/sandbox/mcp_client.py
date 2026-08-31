@@ -27,9 +27,9 @@ from mcp.types import Tool
 # (mcp_tools_swebench.py's run_tests()) or a long shell command, but an MCP
 # server that has died or deadlocked must not be able to hang the sandbox
 # (and, in turn, agent_mbpp.py/agent_swebench.py's cleanup/solution.json
-# write) forever. CLOSE_TIMEOUT_SECONDS is much shorter: shutting down an
-# already-connected session should be fast, and a hung teardown must not
-# block reaching container.cleanup() in agent_swebench.py's finally block.
+# write) forever. Connection establishment and shutdown have shorter bounds so
+# a dead server cannot block startup or container cleanup indefinitely.
+CONNECT_TIMEOUT_SECONDS = 30.0
 CALL_TOOL_TIMEOUT_SECONDS = 300.0
 CLOSE_TIMEOUT_SECONDS = 10.0
 
@@ -47,39 +47,142 @@ class MCPToolProxy:
         stdio_command: Optional[str] = None,
         http_url: Optional[str] = None,
         env: Optional[Dict[str, str]] = None,
+        connect_timeout: float = CONNECT_TIMEOUT_SECONDS,
     ) -> None:
         if bool(stdio_command) == bool(http_url):
             raise ValueError("Provide exactly one of stdio_command or http_url")
+        if connect_timeout <= 0:
+            raise ValueError("connect_timeout must be positive")
 
         self._loop = asyncio.new_event_loop()
-        self._thread = threading.Thread(target=self._loop.run_forever, daemon=True)
-        self._thread.start()
-
-        self._exit_stack: Optional[AsyncExitStack] = None
+        self._thread = threading.Thread(
+            target=self._run_event_loop,
+            name="agent-smith-mcp-loop",
+            daemon=True,
+        )
+        self._connection_ready = threading.Event()
+        self._owner_stopped = threading.Event()
+        self._close_requested = threading.Event()
+        self._cancel_requested = threading.Event()
+        self._connection_error: Optional[BaseException] = None
+        self._owner_task: Optional[asyncio.Task[Any]] = None
+        self._connection_args = (stdio_command, http_url, env)
+        self._closed = False
         self.session: Optional[ClientSession] = None
         self.tools: List[Tool] = []
+        self._thread.start()
 
-        self._run(self._connect(stdio_command, http_url, env))
+        try:
+            ready = self._connection_ready.wait(timeout=connect_timeout)
+        except BaseException:
+            self._stop_owner(graceful=False)
+            raise
+
+        if not ready:
+            self._stop_owner(graceful=False)
+            raise TimeoutError(f"MCP connection timed out after {connect_timeout}s")
+        if self._connection_error is not None:
+            error = self._connection_error
+            self._stop_owner(graceful=False)
+            raise error
+
+    def _run_event_loop(self) -> None:
+        asyncio.set_event_loop(self._loop)
+        self._owner_task = self._loop.create_task(
+            self._connection_owner(*self._connection_args)
+        )
+        self._owner_task.add_done_callback(self._owner_completed)
+        self._loop.run_forever()
+
+    def _owner_completed(self, task: asyncio.Task[Any]) -> None:
+        try:
+            task.result()
+        except BaseException as exc:
+            if not self._connection_ready.is_set():
+                self._connection_error = exc
+                self._connection_ready.set()
+        finally:
+            self._owner_stopped.set()
+            self._loop.stop()
 
     def _run(self, coro: Any, timeout: Optional[float] = None) -> Any:
-        return asyncio.run_coroutine_threadsafe(coro, self._loop).result(timeout=timeout)
+        future = asyncio.run_coroutine_threadsafe(coro, self._loop)
+        try:
+            return future.result(timeout=timeout)
+        except concurrent.futures.TimeoutError:
+            future.cancel()
+            raise
 
-    async def _connect(
+    async def _connection_owner(
         self, stdio_command: Optional[str], http_url: Optional[str], env: Optional[Dict[str, str]]
     ) -> None:
-        self._exit_stack = AsyncExitStack()
-        if stdio_command:
-            parts = shlex.split(stdio_command)
-            params = StdioServerParameters(command=parts[0], args=parts[1:], env=env)
-            read, write = await self._exit_stack.enter_async_context(stdio_client(params))
-        else:
-            assert http_url is not None
-            read, write, _ = await self._exit_stack.enter_async_context(streamablehttp_client(http_url))
+        """Own all transport contexts in one task until close().
 
-        self.session = await self._exit_stack.enter_async_context(ClientSession(read, write))
-        await self.session.initialize()
-        result = await self.session.list_tools()
-        self.tools = list(result.tools)
+        AnyIO transport contexts contain task-group cancel scopes which must be
+        exited by the same task that entered them. Keeping this owner coroutine
+        alive avoids cross-task AsyncExitStack teardown failures.
+        """
+        owner_task = asyncio.current_task()
+
+        async def cancel_when_requested() -> None:
+            while not self._cancel_requested.is_set():
+                await asyncio.sleep(0.05)
+            if owner_task is not None:
+                owner_task.cancel()
+
+        cancel_monitor = asyncio.create_task(cancel_when_requested())
+        try:
+            try:
+                async with AsyncExitStack() as exit_stack:
+                    if stdio_command:
+                        parts = shlex.split(stdio_command)
+                        params = StdioServerParameters(command=parts[0], args=parts[1:], env=env)
+                        read, write = await exit_stack.enter_async_context(stdio_client(params))
+                    else:
+                        assert http_url is not None
+                        read, write, _ = await exit_stack.enter_async_context(
+                            streamablehttp_client(http_url)
+                        )
+
+                    self.session = await exit_stack.enter_async_context(ClientSession(read, write))
+                    await self.session.initialize()
+                    result = await self.session.list_tools()
+                    self.tools = list(result.tools)
+                    self._connection_ready.set()
+                    while not self._close_requested.is_set():
+                        await asyncio.sleep(0.05)
+            except BaseException as exc:
+                if not self._connection_ready.is_set():
+                    self._connection_error = exc
+                    self._connection_ready.set()
+        finally:
+            cancel_monitor.cancel()
+            try:
+                await cancel_monitor
+            except asyncio.CancelledError:
+                pass
+            self.session = None
+            if not self._connection_ready.is_set():
+                self._connection_ready.set()
+
+    def _stop_owner(self, graceful: bool) -> None:
+        if graceful:
+            self._close_requested.set()
+        else:
+            self._cancel_requested.set()
+
+        wait_timeout = CLOSE_TIMEOUT_SECONDS if graceful else 1.0
+        if not self._owner_stopped.wait(timeout=wait_timeout):
+            self._cancel_requested.set()
+            if self._owner_task is not None and self._loop.is_running():
+                self._loop.call_soon_threadsafe(self._owner_task.cancel)
+            self._owner_stopped.wait(timeout=1.0)
+
+        if self._thread.is_alive() and self._loop.is_running():
+            self._loop.call_soon_threadsafe(self._loop.stop)
+        self._thread.join(timeout=5.0)
+        if not self._thread.is_alive() and not self._loop.is_closed():
+            self._loop.close()
 
     def call_tool(self, name: str, arguments: Dict[str, Any]) -> str:
         """Synchronously invoke one MCP tool and return its text content.
@@ -91,9 +194,11 @@ class MCPToolProxy:
         under too, but which this module cannot assume will always interrupt
         a thread-lock wait the same way it interrupts pure-Python code.
         """
-        assert self.session is not None
+        session = self.session
+        if session is None:
+            return "[Error] MCP session is not connected"
         try:
-            result = self._run(self.session.call_tool(name, arguments), timeout=CALL_TOOL_TIMEOUT_SECONDS)
+            result = self._run(session.call_tool(name, arguments), timeout=CALL_TOOL_TIMEOUT_SECONDS)
         except concurrent.futures.TimeoutError:
             return f"[Error] tool '{name}' timed out after {CALL_TOOL_TIMEOUT_SECONDS}s"
         parts = []
@@ -170,10 +275,7 @@ class MCPToolProxy:
         returning promptly even if the MCP server already died or is stuck,
         since agent_swebench.py's `container.cleanup()` is the very next
         line after this call and must not be starved by it."""
-        if self._exit_stack is not None:
-            try:
-                self._run(self._exit_stack.aclose(), timeout=CLOSE_TIMEOUT_SECONDS)
-            except Exception:
-                pass  # best-effort cleanup - the subprocess/connection may already be gone
-        self._loop.call_soon_threadsafe(self._loop.stop)
-        self._thread.join(timeout=5)
+        if self._closed:
+            return
+        self._closed = True
+        self._stop_owner(graceful=True)

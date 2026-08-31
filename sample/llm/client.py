@@ -130,6 +130,7 @@ class LLMClient:
                             time.sleep(self.backoff_seconds * (attempt + 1))
                 # exhausted retries for this key - fall through to the next key/provider
 
+        self.usage.total_requests += retries
         self.usage.total_retries += retries
         raise AllProvidersExhaustedError(
             f"All providers/keys exhausted for model '{self.model_name}'. Last error: {last_error}",

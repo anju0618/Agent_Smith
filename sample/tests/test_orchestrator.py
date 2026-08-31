@@ -186,6 +186,59 @@ def test_token_budget_stops_the_loop_before_exceeding_it() -> None:
     result = orchestrator.run("1", "mbpp", "solve this task")
 
     assert result.success is False
-    assert result.iterations == 1
+    assert result.iterations == 0
+    assert result.total_input_tokens == 0
+    assert llm_client.calls == 0
     assert result.error is not None
-    assert "token budget exhausted" in result.error
+    assert "would be exceeded" in result.error
+
+
+def test_input_budget_uses_previous_observed_usage_for_later_requests() -> None:
+    llm_client = _ScriptedLLMClient(
+        [
+            "```python\nprint(1)\n```",
+            '```python\nfinal_answer("done")\n```',
+        ]
+    )
+    orchestrator = _build_orchestrator(llm_client, max_input_tokens=300)
+
+    result = orchestrator.run("1", "mbpp", "task")
+
+    assert result.success is True
+    assert result.iterations == 2
+    assert result.total_input_tokens == 40
+
+
+class _OutputLimitCapturingLLMClient:
+    def __init__(self) -> None:
+        self.requested_limits: List[int] = []
+
+    def generate(
+        self,
+        messages: List[dict],
+        stop: Optional[List[str]] = None,
+        max_output_tokens: int = 1024,
+    ) -> GenerationResult:
+        self.requested_limits.append(max_output_tokens)
+        return GenerationResult(
+            text='```python\nfinal_answer("done")\n```',
+            input_tokens=20,
+            output_tokens=max_output_tokens,
+            request_time_ms=5.0,
+            api_url="https://fake.example/v1",
+            model_name="fake-model",
+        )
+
+
+def test_output_request_is_clamped_to_remaining_hard_limit() -> None:
+    llm_client = _OutputLimitCapturingLLMClient()
+    orchestrator = _build_orchestrator(
+        llm_client,  # type: ignore[arg-type]
+        max_output_tokens=7,
+    )
+
+    result = orchestrator.run("1", "mbpp", "solve this task")
+
+    assert result.success is True
+    assert result.total_output_tokens == 7
+    assert llm_client.requested_limits == [7]

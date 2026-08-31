@@ -6,6 +6,7 @@ argument becomes SolutionOutput.solution differ between the two benchmarks.
 """
 from __future__ import annotations
 
+import json
 import time
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -41,6 +42,30 @@ class OrchestratorConfig:
     max_time_seconds: float
     stop_sequences: List[str] = field(default_factory=lambda: ["<end_code>"])
     max_tokens_per_request: int = 1024
+
+
+def _serialized_message_bytes(messages: List[dict]) -> int:
+    serialized = json.dumps(messages, ensure_ascii=False, separators=(",", ":"))
+    return len(serialized.encode("utf-8"))
+
+
+def _conservative_input_token_bound(
+    current_message_bytes: int,
+    previous_message_bytes: Optional[int],
+    previous_input_tokens: Optional[int],
+) -> int:
+    """Return a provider-independent upper bound for the next chat input.
+
+    Supported providers tokenize from bytes or Unicode text, so the UTF-8 byte
+    length plus a small envelope allowance safely bounds the first request.
+    Later requests reuse the provider's previous exact token count and add at
+    most one token per newly-added byte. This remains conservative without
+    repeatedly applying the byte-level worst case to the unchanged prompt.
+    """
+    if previous_message_bytes is None or previous_input_tokens is None:
+        return current_message_bytes + 32
+    added_bytes = max(0, current_message_bytes - previous_message_bytes)
+    return previous_input_tokens + added_bytes + 16
 
 
 class Orchestrator:
@@ -82,6 +107,8 @@ class Orchestrator:
         error: Optional[str] = None
         solution_text = ""
         success = False
+        previous_message_bytes: Optional[int] = None
+        previous_input_tokens: Optional[int] = None
 
         for step_number in range(1, self.config.max_iterations + 1):
             if self._stop_requested:
@@ -104,11 +131,32 @@ class Orchestrator:
                 )
                 break
 
+            current_message_bytes = _serialized_message_bytes(messages)
+            input_token_bound = _conservative_input_token_bound(
+                current_message_bytes,
+                previous_message_bytes,
+                previous_input_tokens,
+            )
+            remaining_input_tokens = self.config.max_input_tokens - total_input_tokens
+            if input_token_bound > remaining_input_tokens:
+                error = (
+                    "input token budget would be exceeded by the next request "
+                    f"(conservative bound {input_token_bound} > "
+                    f"remaining {remaining_input_tokens})"
+                )
+                break
+
+            remaining_output_tokens = self.config.max_output_tokens - total_output_tokens
+            request_output_limit = min(
+                self.config.max_tokens_per_request,
+                remaining_output_tokens,
+            )
+
             try:
                 gen = self.llm_client.generate(
                     messages,
                     stop=self.config.stop_sequences,
-                    max_output_tokens=self.config.max_tokens_per_request,
+                    max_output_tokens=request_output_limit,
                 )
             except AllProvidersExhaustedError as exc:
                 total_requests += exc.attempted_requests
@@ -121,6 +169,8 @@ class Orchestrator:
             total_requests += 1 + gen.retries
             total_input_tokens += gen.input_tokens
             total_output_tokens += gen.output_tokens
+            previous_message_bytes = current_message_bytes
+            previous_input_tokens = gen.input_tokens
 
             extraction = extract_code(gen.text)
             sandbox_input = extraction.code or ""

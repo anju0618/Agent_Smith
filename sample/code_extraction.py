@@ -48,10 +48,10 @@ def _py_literal(value: str) -> str:
         return repr(value)
 
 
-def _call_from_kwargs(name: str, kwargs: dict) -> str:
+def _call_from_kwargs(name: str, kwargs: dict, parse_string_literals: bool = False) -> str:
     parts = []
     for key, value in kwargs.items():
-        if isinstance(value, str):
+        if parse_string_literals and isinstance(value, str):
             parts.append(f"{key}={_py_literal(value)}")
         else:
             parts.append(f"{key}={value!r}")
@@ -67,7 +67,7 @@ def _extract_xml_invoke(text: str) -> Optional[str]:
     for index, param_match in enumerate(_XML_PARAM_RE.finditer(body)):
         key = param_match.group(1) or f"arg{index}"
         kwargs[key] = param_match.group(2).strip()
-    return _call_from_kwargs(name, kwargs)
+    return _call_from_kwargs(name, kwargs, parse_string_literals=True)
 
 
 def _extract_json_tool_call(text: str) -> Optional[str]:
