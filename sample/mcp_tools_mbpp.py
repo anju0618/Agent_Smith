@@ -66,6 +66,7 @@ def _execute_with_timeout(code: str, timeout: float) -> Tuple[bool, str]:
         process.join(timeout=2.0)
         if process.is_alive():
             process.kill()
+            process.join()
         return False, f"Execution timed out after {timeout}s"
 
     if queue.empty():
