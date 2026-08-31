@@ -8,13 +8,15 @@ task environment, while the sandbox only ever talks to it over that exec'd
 stdio pipe. mcp_tools_swebench.py has no Docker-awareness of its own; this
 module is what decides *where* it runs.
 
-NOTE: this module has not been exercised against a real SWE-bench image in
-this environment (no Docker image pull / live run was performed while writing
-it) - see BENCHMARK_REPORT.md and README.md for what has and hasn't been
-verified end-to-end.
+Exercised end to end against three real `swebench/sweb.eval.x86_64.*` images
+(pull, container start, MCP dependency bootstrap, tool calls, `get_patch()`,
+cleanup) - see BENCHMARK_REPORT.md for the full run and for a real
+`docker cp`/UID-remapping bug this found and fixed (now avoided entirely via
+`_write_into_container`'s `docker exec` stdin redirection below).
 """
 from __future__ import annotations
 
+import shlex
 import subprocess
 from pathlib import Path
 from typing import Any, Optional
@@ -43,18 +45,40 @@ class SweBenchContainer:
         self._container = self._client.containers.run(
             self.docker_image, command="tail -f /dev/null", detach=True
         )
-        container_id: str = self._container.id
 
-        eval_tmp = Path("/tmp") / f"agent_smith_eval_{container_id[:12]}.sh"
-        eval_tmp.write_text(eval_script)
-        subprocess.run(
-            ["docker", "cp", str(eval_tmp), f"{container_id}:{EVAL_SCRIPT_PATH_IN_CONTAINER}"], check=True
-        )
-        subprocess.run(
-            ["docker", "cp", str(tools_file), f"{container_id}:{TOOLS_PATH_IN_CONTAINER}"], check=True
-        )
+        self._write_into_container(eval_script, EVAL_SCRIPT_PATH_IN_CONTAINER)
+        self._write_into_container(tools_file.read_text(), TOOLS_PATH_IN_CONTAINER)
 
         self._bootstrap_dependencies()
+
+    def _write_into_container(self, content: str, container_path: str) -> None:
+        """Write `content` to `container_path` inside the container.
+
+        Uses `docker exec` stdin redirection rather than `docker cp`: `docker
+        cp`'s tar-based copy tries to `lchown` the extracted file to match the
+        host UID, which fails with "invalid argument" on hosts where that UID
+        falls outside the container's user-namespace remapping range (hit live
+        against a real SWE-bench image in this environment - a shared host
+        with per-user subuid ranges). Piping through `docker exec` writes as
+        whatever user the container's own entrypoint runs as, sidestepping
+        that host-side UID mapping entirely.
+
+        This shells out to the `docker` CLI directly (for stdin piping)
+        rather than going through the docker-py client used elsewhere in this
+        class, so it doesn't inherit that client's default 60s per-call
+        timeout - bounded here explicitly instead, so a stuck/unresponsive
+        container fails this step with a clear TimeoutExpired rather than
+        hanging container.start() (and therefore the whole agent) with no
+        timeout at all until moulinette's own outer process kill.
+        """
+        assert self._container is not None
+        subprocess.run(
+            ["docker", "exec", "-i", self._container.id, "sh", "-c", f"cat > {shlex.quote(container_path)}"],
+            input=content,
+            text=True,
+            check=True,
+            timeout=30,
+        )
 
     def _bootstrap_dependencies(self) -> None:
         """Best-effort install of the MCP tool server's runtime deps inside the

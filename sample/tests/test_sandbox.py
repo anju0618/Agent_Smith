@@ -43,6 +43,87 @@ def test_dynamic_import_bypass_is_blocked() -> None:
     assert "[SandboxViolation]" in output
 
 
+def test_subclasses_escape_via_dot_attribute_is_blocked() -> None:
+    """Classic in-process sandbox escape: walk already-loaded classes via
+    __subclasses__ to find one whose __init__.__globals__ holds the real,
+    unrestricted builtins - completely bypassing the restricted __import__."""
+    sandbox = _sandbox(authorized_imports=["math"])
+    code = textwrap.dedent(
+        """
+        for cls in ().__class__.__bases__[0].__subclasses__():
+            try:
+                g = cls.__init__.__globals__
+            except Exception:
+                continue
+            if "__builtins__" in g:
+                b = g["__builtins__"]
+                real_import = b["__import__"] if isinstance(b, dict) else b.__import__
+                real_import("os")
+                print("ESCAPED")
+                break
+        """
+    )
+    output = sandbox.run(code)
+    assert "[SandboxViolation]" in output
+    assert "__subclasses__" in output
+    assert "ESCAPED" not in output
+
+
+def test_subclasses_escape_via_getattr_is_blocked() -> None:
+    sandbox = _sandbox(authorized_imports=["math"])
+    output = sandbox.run("getattr(object, '__subclasses__')()")
+    assert "[SandboxViolation]" in output
+
+
+def test_subclasses_escape_via_dynamically_built_name_is_blocked() -> None:
+    """getattr's guard must check the resolved name, not the literal source
+    text, since the name can be built at runtime to dodge a naive string scan."""
+    sandbox = _sandbox(authorized_imports=["math"])
+    output = sandbox.run("name = '__sub' + 'classes__'\ngetattr(object, name)()")
+    assert "[SandboxViolation]" in output
+
+
+def test_globals_attribute_access_is_blocked() -> None:
+    sandbox = _sandbox(authorized_imports=["math"])
+    output = sandbox.run("def f(): pass\nprint(f.__globals__)")
+    assert "[SandboxViolation]" in output
+
+
+def test_setattr_on_dangerous_dunder_is_blocked() -> None:
+    sandbox = _sandbox(authorized_imports=["math"])
+    output = sandbox.run("class Foo: pass\nclass Bar: pass\nsetattr(Foo, '__bases__', (Bar,))")
+    assert "[SandboxViolation]" in output
+
+
+def test_common_dunders_still_work_for_legitimate_code() -> None:
+    """The dunder blocklist must not break ordinary operator overloading,
+    iteration, or repr - only the introspection/escape-relevant ones."""
+    sandbox = _sandbox(authorized_imports=["math"])
+    code = textwrap.dedent(
+        """
+        class Point:
+            def __init__(self, x, y):
+                self.x, self.y = x, y
+            def __repr__(self):
+                return f"Point({self.x}, {self.y})"
+            def __add__(self, other):
+                return Point(self.x + other.x, self.y + other.y)
+            def __eq__(self, other):
+                return (self.x, self.y) == (other.x, other.y)
+
+        p = Point(1, 2) + Point(3, 4)
+        print(repr(p))
+        print(p == Point(4, 6))
+        print(len([1, 2, 3]))
+        print(getattr(p, "x"))
+        """
+    )
+    output = sandbox.run(code)
+    assert "[SandboxViolation]" not in output
+    assert "Point(4, 6)" in output
+    assert "True" in output
+
+
 def test_variables_persist_between_calls() -> None:
     sandbox = _sandbox()
     sandbox.run("x = 41")

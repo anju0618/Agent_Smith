@@ -42,22 +42,28 @@ Type code, press Enter on a blank line to run it, `exit` or Ctrl+D to quit.
 ### Run the MBPP agent against a real task
 
 ```sh
-# 1. Get a task.json (see "What has been verified" below for where this one
-#    came from without needing the moulinette's own docker-backed CLI)
+# 1. Get a task.json, e.g. via moulinette:
+#    cd ../moulinette && uv run python -m moulinette.__main__ dump mbpp --output ../sample/cache/mbpp_task.json
 # 2. Run the agent
 uv run python -m agent_mbpp --task-file cache/mbpp_task.json \
     --output cache/mbpp_solution.json \
-    --model-name "llama-3.1-8b-instant" --provider-url "https://api.groq.com/openai/v1"
+    --model-name "qwen/qwen3.8-27b" --provider-url "https://api.groq.com/openai/v1"
 ```
 `solution.json` is written even on failure (crash, timeout, exhausted keys) —
-see `error` and `steps` inside it for what happened.
+see `error` and `steps` inside it for what happened. (Model IDs on free-tier
+providers change often — see BENCHMARK_REPORT.md for models confirmed
+working at the time this was last run.)
 
 ### Run the SWE-bench agent
 
 ```sh
+# 1. Get a task.json:
+#    cd ../moulinette && uv run python -m moulinette.__main__ dump swebench \
+#        --task-id pydata__xarray-4629 --output ../sample/cache/swebench_task.json
+# 2. Run the agent (needs a running Docker daemon)
 uv run python -m agent_swebench --task-file cache/swebench_task.json \
     --output cache/swebench_solution.json \
-    --model-name "model/name" --provider-url "https://provider.api/v1"
+    --model-name "minimax/minimax-m3:free" --provider-url "https://openrouter.ai/api/v1"
 ```
 
 ### Tests / lint
@@ -149,7 +155,8 @@ architectural choice with no single right answer:
 | Network access | Never explicitly blocked at the socket level — enforced by omission: `socket`, `urllib`, `requests`, `http`, etc. are simply never in `authorized_imports` | Defense relies entirely on the import allowlist staying strict |
 | Execution timeout | `signal.alarm()` (Unix): CPython checks for pending signals between bytecode instructions, so this reliably interrupts both Python loops and blocking stdlib calls | Cannot preempt a C extension that blocks without releasing the GIL. A separate-process design with `SIGTERM`→`SIGKILL` (the approach Section 6.1 describes — and which moulinette's own `run-agent` uses — for the *outer* agent-process timeout) would close this gap at the cost of needing an IPC bridge for MCP tool calls |
 | Memory limit | `resource.setrlimit(RLIMIT_AS, ...)` once per process; an over-limit allocation raises a normal, catchable `MemoryError` | Applies to the whole process for its lifetime (can only be lowered, never raised again) — fine for a single-purpose agent process, but this is why the test suite exercises it in a subprocess instead of the pytest process itself |
-| Restricted builtins | `eval`, `exec`, `compile`, `input`, `breakpoint`, `help`, `exit`, `quit` are removed from the sandboxed builtins | — |
+| Restricted builtins | `eval`, `exec`, `compile`, `input`, `breakpoint`, `help`, `exit`, `quit`, `__import__`, `open` are removed/replaced in the sandboxed builtins | — |
+| Dunder attribute access | A default-deny allowlist: `check_dunder_attribute_access()` statically rejects any explicit `.__dunder__` access outside a small safe list (operator overloading, iteration, repr, ...); `getattr`/`setattr` are replaced with wrappers enforcing the same rule dynamically. Closes the classic `().__class__.__bases__[0].__subclasses__()` → a loaded class's `__init__.__globals__['__builtins__']` escape (found by independent review, reproduced, and fixed — see BENCHMARK_REPORT.md) | Does not (and cannot, short of disabling `str.format` entirely) block the same traversal reached through `str.format()`'s attribute mini-language, e.g. `"{0.__class__}".format(x)`, since that parses attribute names from a runtime string rather than as AST `Attribute` nodes |
 | `final_answer()` | A closure injected into every sandbox namespace, independent of whatever MCP server is connected; raises `FinalAnswer`, which is deliberately **not** caught by the generic exception handler, alongside `KeyboardInterrupt`/`SystemExit` | Matches Section 4.2's "exception propagation" requirement exactly |
 
 The upside of staying in-process: MCP tool wrappers (built once by
@@ -229,10 +236,17 @@ an unlisted one — new providers need no code changes, just a matching env var.
 
 ## Benchmark results and analysis
 
-See `BENCHMARK_REPORT.md` at the repository root for the full comparison
-(Section 4.7) and its "What has actually been run" section for exactly which
-parts of this pipeline have been exercised against real providers/tasks in
-this environment versus which parts are implemented-but-unverified.
+See `BENCHMARK_REPORT.md` (next to this README) for the full comparison
+(Section 4.7): 5 models across 3 providers on the same 3 SWE-bench tasks, run
+against real Docker images, with 3 independently-verified passing patches
+(from 2 different models/providers), a critical sandbox-escape vulnerability
+found by independent review and fixed (see "Sandbox design" above), several
+other real bugs this exercise found and fixed (a host-specific `docker cp`
+UID issue, MCP tool wrappers rejecting positional arguments, MBPP
+`test_imports` being silently ignored, unbounded MCP tool output, an
+MCP call with no timeout, and an undercounted `total_requests`), and an
+ablation study showing why a `success: true` field alone isn't proof of a
+real fix.
 
 ## Resources
 
