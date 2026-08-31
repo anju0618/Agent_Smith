@@ -12,12 +12,31 @@ import contextlib
 import io
 import json
 import multiprocessing
+import os
 import traceback
 from typing import List, Tuple
 
 from mcp.server.fastmcp import FastMCP
 
 mcp = FastMCP("agent-smith-mbpp-tools")
+
+
+def _test_imports() -> List[str]:
+    """Imports the task's test_list needs but the candidate solution has no
+    reason to include itself (e.g. `math` for `math.isclose(...)` assertions
+    on a task whose own solution never touches `math`). agent_mbpp.py passes
+    these through MBPPTaskInput.test_imports via this env var so run_tests()
+    can guarantee they're present, rather than leaving it to chance whether
+    the LLM's own code happens to need (and therefore import) the same
+    module - which silently NameErrors on tasks where it doesn't."""
+    raw = os.environ.get("AGENT_SMITH_TEST_IMPORTS")
+    if not raw:
+        return []
+    try:
+        imports = json.loads(raw)
+    except json.JSONDecodeError:
+        return []
+    return [line for line in imports if isinstance(line, str)]
 
 
 def _run_in_subprocess(code: str, queue: "multiprocessing.Queue") -> None:
@@ -69,7 +88,8 @@ def run_tests(code: str, test_list: List[str]) -> str:
         if every assertion passed. Execution happens in a throwaway subprocess
         so a broken candidate solution can never crash this tool server.
     """
-    full_code = code + "\n" + "\n".join(test_list)
+    imports_prefix = "\n".join(_test_imports())
+    full_code = (imports_prefix + "\n" if imports_prefix else "") + code + "\n" + "\n".join(test_list)
     success, output = _execute_with_timeout(full_code, timeout=10.0)
     return json.dumps({"success": success, "output": output})
 

@@ -92,11 +92,15 @@ print(content)
 """
 
 
-def build_system_prompt(benchmark: str, sandbox_manual: str) -> str:
+def build_system_prompt(benchmark: str, sandbox_manual: str, include_example: bool = True) -> str:
     """Assemble the full system prompt sent to the LLM (Section 4.1, point 6).
 
     `sandbox_manual` should come from MCPToolProxy.manual_text() so the prompt
     always reflects whichever MCP server is actually connected (Section 4.2).
+
+    `include_example` defaults to True for both agent CLIs; it exists so the
+    benchmark report's ablation study (Section 4.7 point 5) can build the
+    "before" prompt (no worked example) without duplicating this function.
     """
     if benchmark == "mbpp":
         final_answer_doc, example = _MBPP_FINAL_ANSWER, _MBPP_EXAMPLE
@@ -105,9 +109,11 @@ def build_system_prompt(benchmark: str, sandbox_manual: str) -> str:
     else:
         raise ValueError(f"Unknown benchmark: {benchmark}")
 
-    return (
+    prompt = (
         f"{FRAMEWORK_EXPLANATION}\n"
         f"## Available tools\n{sandbox_manual}\n\n"
         f"## Submitting your solution\n{final_answer_doc}\n"
-        f"## {example}"
     )
+    if include_example:
+        prompt += f"## {example}"
+    return prompt

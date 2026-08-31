@@ -101,6 +101,22 @@ def test_all_providers_exhausted_raises(monkeypatch: pytest.MonkeyPatch) -> None
         llm.generate([{"role": "user", "content": "hi"}])
 
 
+def test_all_providers_exhausted_reports_attempted_requests(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Every failed attempt was a real HTTP request; SolutionOutput.total_requests
+    (Section 5.1) must count them even though this call never succeeds."""
+    fake = _FakeProvider(fail_times=999)
+    _install_fake_provider(monkeypatch, fake)
+    monkeypatch.setenv("FAKE_API_KEY", "secret")
+
+    spec = ProviderSpec("fake", "https://fake.example/v1", "FAKE_API_KEY")
+    llm = client_module.LLMClient("fake-model", [spec], backoff_seconds=0, max_retries_per_key=3)
+
+    with pytest.raises(client_module.AllProvidersExhaustedError) as exc_info:
+        llm.generate([{"role": "user", "content": "hi"}])
+
+    assert exc_info.value.attempted_requests == 3
+
+
 def test_missing_api_key_raises_value_error(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("MISSING_API_KEY", raising=False)
     spec = ProviderSpec("fake", "https://fake.example/v1", "MISSING_API_KEY")

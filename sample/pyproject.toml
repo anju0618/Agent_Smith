@@ -3,7 +3,7 @@ name = "agent-smith-sample"
 version = "0.1.0"
 description = "Reference implementation of the Agent Smith agentic coding framework (MBPP + SWE-bench)"
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = "==3.10.*"
 
 dependencies = [
     "pydantic>=2.13.5",

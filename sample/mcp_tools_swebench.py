@@ -14,7 +14,6 @@ agent_swebench.py pipeline wires that up, per approach (b) of Section 4.4).
 from __future__ import annotations
 
 import argparse
-import fnmatch
 import os
 import re
 import subprocess
@@ -41,6 +40,34 @@ def _eval_script_path() -> Path:
     if override:
         return Path(override)
     return _testbed_root() / "eval.sh"
+
+
+TOOL_OUTPUT_LIMIT_CHARS = 20_000  # same scale as SandboxConfig.max_output_chars's default
+
+
+def _cap_output(text: str) -> str:
+    """Cap exploratory tool output before it becomes an Observation.
+
+    Without this, a single search_code() over a huge codebase, read_file()
+    on a huge file, or run_command()/run_tests() invoking a verbose test
+    suite could return a response large enough to eat most of the 300,000
+    cumulative input-token budget (Section 6.1.2) in one step, or balloon
+    memory relaying it through the MCP transport. Not applied to
+    get_patch(): that return value can be the literal argument to
+    final_answer(get_patch()), and truncating it would silently corrupt a
+    real patch into an invalid diff - a genuine "minimal fix" patch is
+    realistically small anyway, and printing it for inspection along the way
+    is still bounded by the sandbox's own stdout truncation
+    (sandbox/executor.py's [TruncatedOutput]).
+    """
+    if len(text) <= TOOL_OUTPUT_LIMIT_CHARS:
+        return text
+    omitted = len(text) - TOOL_OUTPUT_LIMIT_CHARS
+    return (
+        text[:TOOL_OUTPUT_LIMIT_CHARS]
+        + f"\n[TruncatedToolOutput] {omitted} additional characters were cut off "
+        f"(tool output limit: {TOOL_OUTPUT_LIMIT_CHARS} chars)."
+    )
 
 
 def _resolve_within_testbed(filepath: str) -> Path:
@@ -82,7 +109,7 @@ def read_file(filepath: str, start_line: int = 1, end_line: Optional[int] = None
     last = end_line if end_line is not None else len(lines)
     first = max(start_line, 1)
     selected = lines[first - 1: last]
-    return "\n".join(f"{i}: {line}" for i, line in enumerate(selected, start=first))
+    return _cap_output("\n".join(f"{i}: {line}" for i, line in enumerate(selected, start=first)))
 
 
 @mcp.tool()
@@ -133,9 +160,12 @@ def edit_file(filepath: str, old_str: str, new_str: str) -> str:
 def list_files(directory: str, pattern: str = "*") -> str:
     """List files in a directory matching a glob pattern.
 
+    Non-recursive by default (e.g. "*.py" lists only direct children); use a
+    "**/" prefix in pattern for a recursive search (e.g. "**/*.py").
+
     Args:
         directory: Directory to list (absolute, or relative to the repo root).
-        pattern: Glob pattern to filter file names (e.g. "*.py").
+        pattern: Glob pattern to filter file names (e.g. "*.py", "**/*.py").
     """
     try:
         path = _resolve_within_testbed(directory)
@@ -144,12 +174,8 @@ def list_files(directory: str, pattern: str = "*") -> str:
     if not path.is_dir():
         return f"[Error] directory not found: {directory}"
 
-    matches = sorted(
-        str(p)
-        for p in path.rglob("*")
-        if p.is_file() and ".git" not in p.parts and fnmatch.fnmatch(p.name, pattern)
-    )
-    return "\n".join(matches) if matches else "(no files matched)"
+    matches = sorted(str(p) for p in path.glob(pattern) if p.is_file() and ".git" not in p.parts)
+    return _cap_output("\n".join(matches)) if matches else "(no files matched)"
 
 
 # ---------------------------------------------------------------------------
@@ -186,7 +212,7 @@ def search_code(pattern: str, file_pattern: str = "*.py") -> str:
                     results.append(f"{file}:{lineno} {line}")
         except OSError:
             continue
-    return "\n".join(results) if results else "(no matches)"
+    return _cap_output("\n".join(results)) if results else "(no matches)"
 
 
 _DEF_RE_TEMPLATE = r"^\s*(?:async\s+def|def|class)\s+{name}\b"
@@ -211,15 +237,27 @@ def find_references(name: str, filepath: str = "", line: int = 0) -> str:
 
     Args:
         name: Symbol name to search for.
-        filepath: Unused hint for where the symbol is defined (kept for API
-            symmetry with tools that need it); the search is codebase-wide.
-        line: Unused hint (see filepath).
+        filepath: Optional path to the file where `name` is defined. When given
+            together with `line`, that exact location is excluded from the
+            results, since a declaration is not itself a "usage".
+        line: Optional 1-indexed line of the definition (see filepath).
 
     Returns:
-        Same format as search_code.
+        Same format as search_code: one usage per line, declaration excluded
+        when filepath/line identify it.
     """
-    del filepath, line  # codebase-wide search does not need these, kept for API symmetry
-    return str(search_code(rf"\b{re.escape(name)}\b", "*.py"))
+    results = str(search_code(rf"\b{re.escape(name)}\b", "*.py"))
+    if not filepath or not line or results.startswith("[Error]") or results == "(no matches)":
+        return results
+
+    try:
+        declaration_path = str(_resolve_within_testbed(filepath))
+    except ValueError:
+        return results
+
+    declaration_marker = f"{declaration_path}:{line} "
+    filtered = [ln for ln in results.splitlines() if not ln.startswith(declaration_marker)]
+    return "\n".join(filtered) if filtered else "(no matches other than the declaration)"
 
 
 # ---------------------------------------------------------------------------
@@ -249,7 +287,9 @@ def run_command(command: str, workdir: str = "") -> str:
     except subprocess.TimeoutExpired:
         return "[Error] command timed out after 120s"
 
-    return f"exit_code: {result.returncode}\n--- stdout ---\n{result.stdout}\n--- stderr ---\n{result.stderr}"
+    return _cap_output(
+        f"exit_code: {result.returncode}\n--- stdout ---\n{result.stdout}\n--- stderr ---\n{result.stderr}"
+    )
 
 
 @mcp.tool()
@@ -275,6 +315,9 @@ def get_patch() -> str:
 
     Returns:
         The output of `git -c core.fileMode=false diff` (Section 4.4).
+        Deliberately not passed through _cap_output - see that function's
+        docstring for why truncating a real patch would be worse than
+        leaving it whole.
     """
     root = _testbed_root()
     result = subprocess.run(
