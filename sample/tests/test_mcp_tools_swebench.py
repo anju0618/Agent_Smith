@@ -90,6 +90,17 @@ def test_search_code_rejects_parent_pattern(fake_repo: Path) -> None:
     assert "[Error]" in output
 
 
+def test_run_tests_rejects_evaluation_script_outside_testbed(
+    fake_repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("AGENT_SMITH_EVAL_SCRIPT", "/etc/passwd")
+
+    output = tools.run_tests()
+
+    assert "[Error]" in output
+    assert "outside the repository root" in output
+
+
 def test_search_function_definition(fake_repo: Path) -> None:
     output = tools.search_function_or_class_definition_in_code("is_valid_email")
     assert f"{fake_repo / 'mail.py'}:1" in output
