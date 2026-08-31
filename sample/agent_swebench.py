@@ -81,17 +81,19 @@ def main() -> None:
         Path(args.output).write_text(solution.model_dump_json(indent=2))
         sys.exit(1)
 
-    container = SweBenchContainer(task.docker_image)
+    container: Optional[SweBenchContainer] = None
     mcp_proxy = None
     orchestrator: Optional[Orchestrator] = None
 
     def handle_sigterm(signum: int, frame: object) -> None:
-        if orchestrator is not None:
-            orchestrator.request_stop()
+        if orchestrator is None:
+            raise ShutdownRequested("shutdown requested (e.g. SIGTERM)")
+        orchestrator.request_stop()
 
     signal.signal(signal.SIGTERM, handle_sigterm)
 
     try:
+        container = SweBenchContainer(task.docker_image)
         SCRATCH_DIR.mkdir(parents=True, exist_ok=True)
         container.start(eval_script=task.eval_script, tools_file=TOOLS_FILE)
         mcp_proxy = MCPToolProxy(stdio_command=container.mcp_stdio_command())
@@ -133,7 +135,8 @@ def main() -> None:
     finally:
         if mcp_proxy is not None:
             mcp_proxy.close()
-        container.cleanup()
+        if container is not None:
+            container.cleanup()
 
     Path(args.output).write_text(solution.model_dump_json(indent=2))
 

@@ -12,6 +12,8 @@ import textwrap
 from pathlib import Path
 from typing import List, Optional
 
+import pytest
+
 from models import SandboxConfig
 from sandbox.executor import DEFAULT_AUTHORIZED_IMPORTS, FinalAnswer, Sandbox
 
@@ -31,6 +33,15 @@ def test_authorized_import_is_allowed() -> None:
     assert output.strip() == "2.0"
 
 
+def test_authorized_nested_and_from_imports_are_allowed() -> None:
+    sandbox = _sandbox()
+    output = sandbox.run(
+        "import collections.abc\nfrom math import sqrt\n"
+        "print(isinstance([], collections.abc.Iterable), sqrt(9))"
+    )
+    assert output.strip() == "True 3.0"
+
+
 def test_unauthorized_import_is_blocked() -> None:
     sandbox = _sandbox()
     output = sandbox.run("import os\nprint(os.getcwd())")
@@ -41,6 +52,35 @@ def test_dynamic_import_bypass_is_blocked() -> None:
     sandbox = _sandbox()
     output = sandbox.run("m = __import__('os')\nprint(m)")
     assert "[SandboxViolation]" in output
+
+
+def test_private_module_reference_escape_is_blocked() -> None:
+    sandbox = _sandbox(authorized_imports=DEFAULT_AUTHORIZED_IMPORTS)
+    output = sandbox.run("import random\nprint(random._os.listdir('/'))")
+    assert "[SandboxViolation]" in output
+    assert "_os" in output
+
+
+def test_public_unauthorized_nested_module_is_blocked() -> None:
+    sandbox = _sandbox(authorized_imports=DEFAULT_AUTHORIZED_IMPORTS)
+    output = sandbox.run("import typing\nprint(typing.sys.modules)")
+    assert "[SandboxViolation]" in output
+    assert "unauthorized module 'sys'" in output
+
+
+def test_operator_attrgetter_private_attribute_bypass_is_blocked() -> None:
+    sandbox = _sandbox(authorized_imports=DEFAULT_AUTHORIZED_IMPORTS)
+    output = sandbox.run(
+        "import operator\nimport random\nprint(operator.attrgetter('_os')(random))"
+    )
+    assert "[SandboxViolation]" in output
+    assert "operator.attrgetter" in output
+
+
+def test_vars_builtin_and_star_import_are_blocked() -> None:
+    sandbox = _sandbox(authorized_imports=DEFAULT_AUTHORIZED_IMPORTS)
+    assert "NameError" in sandbox.run("print(vars(object))")
+    assert "[SandboxViolation]" in sandbox.run("from random import *")
 
 
 def test_subclasses_escape_via_dot_attribute_is_blocked() -> None:
@@ -122,6 +162,16 @@ def test_common_dunders_still_work_for_legitimate_code() -> None:
     assert "[SandboxViolation]" not in output
     assert "Point(4, 6)" in output
     assert "True" in output
+
+
+def test_reserved_namespace_names_cannot_override_sandbox_controls() -> None:
+    config = SandboxConfig(authorized_imports=[], allowed_directories=[])
+    with pytest.raises(ValueError, match="final_answer"):
+        Sandbox(
+            config,
+            extra_namespace={"final_answer": lambda answer: answer},
+            apply_process_memory_limit=False,
+        )
 
 
 def test_variables_persist_between_calls() -> None:

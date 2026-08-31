@@ -60,8 +60,10 @@ DEFAULT_ALLOWED_DIRECTORIES = ["/testbed", "/tmp/agent"]
 # Builtins that would let sandboxed code escape the restrictions below.
 _UNSAFE_BUILTINS = {
     "eval", "exec", "compile", "input", "breakpoint",
-    "help", "exit", "quit", "__import__", "open",
+    "help", "exit", "quit", "__import__", "open", "vars",
 }
+
+_RESERVED_GLOBAL_NAMES = {"__builtins__", "final_answer"}
 
 
 class SandboxViolation(Exception):
@@ -93,7 +95,7 @@ def _is_authorized(module_name: str, authorized: list) -> bool:
 
 # Dunder attributes ordinary MBPP/SWE-bench solution code plausibly needs to
 # access explicitly (operator overloading, iteration, context managers, ...).
-# Everything else dunder-shaped is denied by default (see
+# Every other private-looking attribute is denied by default (see
 # check_dunder_attribute_access below) rather than trying to enumerate every
 # dangerous one - the introspection surface of a live CPython process is too
 # large to blocklist completely, and the escapes that matter here
@@ -115,18 +117,16 @@ _SAFE_DUNDER_ATTRS = {
 }
 
 
-def _is_dangerous_dunder(name: object) -> bool:
+def _is_forbidden_attribute(name: object) -> bool:
     return (
         isinstance(name, str)
-        and name.startswith("__")
-        and name.endswith("__")
+        and name.startswith("_")
         and name not in _SAFE_DUNDER_ATTRS
     )
 
 
 def check_dunder_attribute_access(tree: ast.AST) -> None:
-    """Static check: reject explicit access to any dunder attribute outside
-    _SAFE_DUNDER_ATTRS.
+    """Reject explicit private-attribute access outside _SAFE_DUNDER_ATTRS.
 
     Closes the classic in-process sandbox escape:
     ``().__class__.__bases__[0].__subclasses__()`` walks already-loaded
@@ -138,6 +138,10 @@ def check_dunder_attribute_access(tree: ast.AST) -> None:
     the same escape reached dynamically via ``getattr(obj, "__subclasses__")``
     instead of dot syntax.
 
+    It also prevents allowlisted modules from exposing privileged modules through
+    private implementation details such as ``random._os``. Public module-valued
+    attributes are checked separately by _RestrictedModule below.
+
     Known residual gap, accepted for the same reason executor.py's other
     trade-offs are: the same traversal is also reachable through
     ``str.format()``'s attribute mini-language (e.g.
@@ -148,7 +152,7 @@ def check_dunder_attribute_access(tree: ast.AST) -> None:
     than it protects against for MBPP/SWE-bench style tasks.
     """
     for node in ast.walk(tree):
-        if isinstance(node, ast.Attribute) and _is_dangerous_dunder(node.attr):
+        if isinstance(node, ast.Attribute) and _is_forbidden_attribute(node.attr):
             raise SandboxViolation(f"access to '{node.attr}' is not permitted")
 
 
@@ -168,10 +172,70 @@ def check_imports(tree: ast.AST, authorized: list) -> None:
         elif isinstance(node, ast.ImportFrom):
             if node.module is None or not _is_authorized(node.module, authorized):
                 raise SandboxViolation(f"import of '{node.module}' is not permitted")
+            if any(alias.name == "*" for alias in node.names):
+                raise SandboxViolation("star imports are not permitted")
+
+
+class _RestrictedModule(ModuleType):
+    """Read-only view of an allowlisted module.
+
+    Returning a real module from restricted ``__import__`` is unsafe even when
+    the module name itself is allowlisted: several standard-library modules
+    retain privileged modules in their globals (for example ``random._os`` and
+    ``typing.sys``). This proxy blocks private attributes and refuses to expose
+    nested modules unless those modules are independently allowlisted.
+    """
+
+    def __init__(
+        self,
+        module: ModuleType,
+        authorized: list,
+        wrap_module: Callable[[ModuleType], ModuleType],
+    ) -> None:
+        super().__init__(module.__name__, module.__doc__)
+        object.__setattr__(self, "_restricted_module", module)
+        object.__setattr__(self, "_authorized_modules", authorized)
+        object.__setattr__(self, "_wrap_module", wrap_module)
+
+    def __getattribute__(self, name: str) -> Any:
+        if name in {"__name__", "__doc__", "__package__"}:
+            module = object.__getattribute__(self, "_restricted_module")
+            return getattr(module, name, None)
+        if _is_forbidden_attribute(name):
+            raise SandboxViolation(f"access to '{name}' is not permitted")
+
+        module = object.__getattribute__(self, "_restricted_module")
+        if module.__name__ == "operator" and name in {"attrgetter", "methodcaller"}:
+            raise SandboxViolation(f"operator.{name} is not permitted")
+
+        value = getattr(module, name)
+        if isinstance(value, ModuleType):
+            authorized = object.__getattribute__(self, "_authorized_modules")
+            if not _is_authorized(value.__name__, authorized):
+                raise SandboxViolation(
+                    f"module attribute '{module.__name__}.{name}' exposes "
+                    f"unauthorized module '{value.__name__}'"
+                )
+            wrap_module = object.__getattribute__(self, "_wrap_module")
+            return wrap_module(value)
+        return value
+
+    def __repr__(self) -> str:
+        module = object.__getattribute__(self, "_restricted_module")
+        return f"<restricted module {module.__name__!r}>"
 
 
 def _make_restricted_import(authorized: list) -> Callable[..., ModuleType]:
     real_import = builtins.__import__
+    proxy_cache: Dict[str, ModuleType] = {}
+
+    def wrap_module(module: ModuleType) -> ModuleType:
+        cached = proxy_cache.get(module.__name__)
+        if cached is not None:
+            return cached
+        proxy = _RestrictedModule(module, authorized, wrap_module)
+        proxy_cache[module.__name__] = proxy
+        return proxy
 
     def restricted_import(
         name: str,
@@ -182,7 +246,8 @@ def _make_restricted_import(authorized: list) -> Callable[..., ModuleType]:
     ) -> ModuleType:
         if not _is_authorized(name, authorized):
             raise SandboxViolation(f"import of '{name}' is not permitted")
-        return real_import(name, globals, locals, fromlist, level)
+        module = real_import(name, globals, locals, fromlist, level)
+        return wrap_module(module)
 
     return restricted_import
 
@@ -208,7 +273,7 @@ def _make_restricted_getattr() -> Callable[..., Any]:
     real_getattr = builtins.getattr
 
     def restricted_getattr(obj: Any, name: Any, *default: Any) -> Any:
-        if _is_dangerous_dunder(name):
+        if _is_forbidden_attribute(name):
             raise SandboxViolation(f"access to '{name}' is not permitted")
         return real_getattr(obj, name, *default)
 
@@ -219,7 +284,7 @@ def _make_restricted_setattr() -> Callable[..., Any]:
     real_setattr = builtins.setattr
 
     def restricted_setattr(obj: Any, name: Any, value: Any) -> None:
-        if _is_dangerous_dunder(name):
+        if _is_forbidden_attribute(name):
             raise SandboxViolation(f"access to '{name}' is not permitted")
         real_setattr(obj, name, value)
 
@@ -276,6 +341,10 @@ class Sandbox:
             pass  # best-effort: some sandboxed CI environments forbid lowering limits further
 
     def _build_namespace(self, extra_namespace: Dict[str, Callable]) -> dict:
+        collisions = sorted(_RESERVED_GLOBAL_NAMES & extra_namespace.keys())
+        if collisions:
+            raise ValueError(f"extra_namespace contains reserved name(s): {', '.join(collisions)}")
+
         restricted_builtins = {
             name: value for name, value in vars(builtins).items() if name not in _UNSAFE_BUILTINS
         }

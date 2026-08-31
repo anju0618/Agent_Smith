@@ -87,8 +87,9 @@ def main() -> None:
     orchestrator: Optional[Orchestrator] = None
 
     def handle_sigterm(signum: int, frame: object) -> None:
-        if orchestrator is not None:
-            orchestrator.request_stop()
+        if orchestrator is None:
+            raise ShutdownRequested("shutdown requested (e.g. SIGTERM)")
+        orchestrator.request_stop()
 
     signal.signal(signal.SIGTERM, handle_sigterm)
 
