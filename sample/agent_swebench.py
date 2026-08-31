@@ -3,10 +3,9 @@
     uv run python -m agent_swebench --task-file task.json --output solution.json \\
         --model-name "model/name" --provider-url "https://provider.api/v1"
 
-NOTE: the Docker-driven parts of this pipeline (pulling a real SWE-bench image,
-bootstrapping the MCP server inside the container, running a live task end to
-end) have not been exercised in this environment - see README.md /
-BENCHMARK_REPORT.md for exactly what has and hasn't been verified.
+Exercised end to end against real SWE-bench Docker images across 5
+models/3 providers/3 tasks - see BENCHMARK_REPORT.md for the full comparison,
+including one independently-verified passing patch.
 """
 from __future__ import annotations
 
@@ -21,7 +20,7 @@ from typing import Optional
 from docker_runner import SweBenchContainer
 from llm.client import LLMClient
 from models import SandboxConfig, SolutionOutput, SWEBenchTaskInput
-from orchestrator import Orchestrator, OrchestratorConfig
+from orchestrator import Orchestrator, OrchestratorConfig, ShutdownRequested
 from prompts import build_system_prompt
 from sandbox.executor import DEFAULT_AUTHORIZED_IMPORTS, Sandbox
 from sandbox.mcp_client import MCPToolProxy
@@ -123,6 +122,12 @@ def main() -> None:
         task_prompt = build_task_prompt(task)
         solution = orchestrator.run(task.instance_id, "swebench", task_prompt)
 
+    except ShutdownRequested as exc:
+        # A SIGTERM interrupted us outside the LLM-call window Orchestrator.run()
+        # already guards (e.g. mid sandbox exec) - still land here gracefully so
+        # the finally below reaches container.cleanup() well within moulinette's
+        # SIGTERM->SIGKILL grace period, instead of getting SIGKILLed first.
+        solution = error_solution(task.instance_id, f"stopped: {exc}")
     except Exception as exc:
         solution = error_solution(task.instance_id, f"Agent crashed: {type(exc).__name__}: {exc}")
     finally:

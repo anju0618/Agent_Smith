@@ -15,7 +15,7 @@ from typing import Optional
 
 from llm.client import LLMClient
 from models import MBPPTaskInput, SandboxConfig, SolutionOutput
-from orchestrator import Orchestrator, OrchestratorConfig
+from orchestrator import Orchestrator, OrchestratorConfig, ShutdownRequested
 from prompts import build_system_prompt
 from sandbox.executor import DEFAULT_AUTHORIZED_IMPORTS, Sandbox
 from sandbox.mcp_client import MCPToolProxy
@@ -32,10 +32,18 @@ TIMEOUT_SECONDS = 120
 
 def build_task_prompt(task: MBPPTaskInput) -> str:
     tests_preview = "\n".join(task.test_list) if task.test_list else "(no public tests provided)"
+    imports_note = (
+        f"\n\nrun_tests() automatically makes these imports available to the assertions "
+        f"above, so you don't need to add them yourself just for the tests to run: "
+        f"{'; '.join(task.test_imports)}"
+        if task.test_imports
+        else ""
+    )
     return (
         f"Task: {task.task_definition}\n\n"
         f"Function signature: {task.function_definition}\n\n"
-        f"Public tests your solution must pass (there may also be hidden tests):\n{tests_preview}\n\n"
+        f"Public tests your solution must pass (there may also be hidden tests):\n{tests_preview}"
+        f"{imports_note}\n\n"
         "Use run_tests(code, test_list) to check your solution against these assertions "
         "before submitting. Submit with final_answer(your_function_code) once confident."
     )
@@ -87,7 +95,12 @@ def main() -> None:
     mcp_proxy = None
     try:
         SCRATCH_DIR.mkdir(parents=True, exist_ok=True)
-        mcp_proxy = MCPToolProxy(stdio_command=f"{sys.executable} {MCP_TOOLS_SCRIPT}")
+        # Some MBPP tasks' test assertions need an import (e.g. math.isclose)
+        # that the candidate solution itself has no reason to include - passed
+        # to mcp_tools_mbpp.py so run_tests() can prepend it itself rather
+        # than relying on the LLM to guess it's needed (see mcp_tools_mbpp.py).
+        tool_env = {"AGENT_SMITH_TEST_IMPORTS": json.dumps(task.test_imports)}
+        mcp_proxy = MCPToolProxy(stdio_command=f"{sys.executable} {MCP_TOOLS_SCRIPT}", env=tool_env)
 
         sandbox_config = SandboxConfig(
             authorized_imports=DEFAULT_AUTHORIZED_IMPORTS,
@@ -119,6 +132,8 @@ def main() -> None:
         task_prompt = build_task_prompt(task)
         solution = orchestrator.run(str(task.task_id), "mbpp", task_prompt)
 
+    except ShutdownRequested as exc:
+        solution = error_solution(str(task.task_id), f"stopped: {exc}")
     except Exception as exc:
         solution = error_solution(str(task.task_id), f"Agent crashed: {type(exc).__name__}: {exc}")
     finally:

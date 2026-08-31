@@ -19,7 +19,18 @@ from llm.providers.openai_compatible import OpenAICompatibleProvider
 
 
 class AllProvidersExhaustedError(RuntimeError):
-    """Raised when every configured API key/provider failed for one generate() call."""
+    """Raised when every configured API key/provider failed for one generate() call.
+
+    `attempted_requests` is set before raising: every failed attempt was a
+    real HTTP request, and StepMetrics/SolutionOutput.total_requests must
+    count it (Section 5.1's "Total number of LLM API requests made,
+    including retries") even though this call never produced a StepMetrics
+    entry (there's no successful generation to attach it to).
+    """
+
+    def __init__(self, message: str, attempted_requests: int = 0) -> None:
+        super().__init__(message)
+        self.attempted_requests = attempted_requests
 
 
 def _build_chat_provider(spec: ProviderSpec) -> ChatProvider:
@@ -121,5 +132,6 @@ class LLMClient:
 
         self.usage.total_retries += retries
         raise AllProvidersExhaustedError(
-            f"All providers/keys exhausted for model '{self.model_name}'. Last error: {last_error}"
+            f"All providers/keys exhausted for model '{self.model_name}'. Last error: {last_error}",
+            attempted_requests=retries,
         )

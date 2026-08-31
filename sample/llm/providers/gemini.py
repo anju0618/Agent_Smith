@@ -55,9 +55,29 @@ class GeminiProvider:
             payload["systemInstruction"] = {"parts": [{"text": system_instruction}]}
 
         start = time.monotonic()
-        response = requests.post(url, params={"key": api_key}, json=payload, timeout=timeout)
+        try:
+            response = requests.post(url, params={"key": api_key}, json=payload, timeout=timeout)
+            response.raise_for_status()
+        except requests.RequestException as exc:
+            # Never let a requests exception propagate as-is here: requests and
+            # urllib3 build their default messages (HTTPError, ConnectionError,
+            # Timeout alike) from the *full* request URL, which for this
+            # provider includes the API key as a `?key=...` query parameter -
+            # Gemini has no header-based auth option. That string ends up in
+            # AllProvidersExhaustedError's message and from there straight into
+            # SolutionOutput.error / StepMetrics.sandbox_output - i.e.
+            # committed to disk in solution.json - unless it's rebuilt here,
+            # from `url` (never the key-bearing request/response url), before
+            # it can leak. (Found live: a real key reached three solution.json
+            # files this way and was only caught by GitHub's push protection
+            # before being pushed - see BENCHMARK_REPORT.md.)
+            status = getattr(getattr(exc, "response", None), "status_code", None)
+            status_part = f"status={status}" if status is not None else type(exc).__name__
+            raise requests.RequestException(
+                f"Gemini request failed ({status_part}) for url: {url} "
+                "(query parameters, including the API key, redacted)"
+            ) from None
         elapsed_ms = (time.monotonic() - start) * 1000
-        response.raise_for_status()
         data = response.json()
 
         candidate = data["candidates"][0]

@@ -17,6 +17,22 @@ from models import SolutionOutput, StepMetrics
 from sandbox.executor import FinalAnswer, Sandbox
 
 
+class ShutdownRequested(BaseException):
+    """Raised by request_stop() at the exact point a SIGTERM was delivered.
+
+    Deliberately a BaseException, not an Exception: Sandbox.run()'s generic
+    ``except Exception`` (and requests/urllib3's own internal error handling)
+    must never swallow it, or a SIGTERM arriving mid-LLM-call/mid-sandbox-exec
+    would silently do nothing until that call finishes on its own - which can
+    take longer than the ~10s grace period external harnesses (e.g.
+    moulinette's run-agent) give between SIGTERM and SIGKILL, causing SIGKILL
+    to hit first and skip agent_swebench.py's `finally: container.cleanup()`.
+    Raising immediately, in the signal handler itself, interrupts a blocked
+    call right away (the same technique - and the same reason - as
+    sandbox/executor.py's own SIGALRM handler raising SandboxTimeoutError).
+    """
+
+
 @dataclass
 class OrchestratorConfig:
     max_iterations: int
@@ -45,9 +61,13 @@ class Orchestrator:
 
     def request_stop(self) -> None:
         """Called from a SIGTERM handler so a killed agent still returns partial
-        metrics instead of losing them. Defensive: the outer hard timeout is
+        metrics (and, for SWE-bench, still reaches its container cleanup)
+        instead of losing them. Raises immediately (see ShutdownRequested) so a
+        SIGTERM landing mid-LLM-call interrupts it right away rather than
+        waiting for it to finish on its own; the outer hard timeout is still
         enforced by moulinette's run-agent command per Section 6.1."""
         self._stop_requested = True
+        raise ShutdownRequested("shutdown requested (e.g. SIGTERM)")
 
     def run(self, task_id: str, benchmark: str, task_prompt: str) -> SolutionOutput:
         start = time.monotonic()
@@ -91,7 +111,11 @@ class Orchestrator:
                     max_output_tokens=self.config.max_tokens_per_request,
                 )
             except AllProvidersExhaustedError as exc:
+                total_requests += exc.attempted_requests
                 error = f"LLM request failed: {exc}"
+                break
+            except ShutdownRequested as exc:
+                error = str(exc)
                 break
 
             total_requests += 1 + gen.retries

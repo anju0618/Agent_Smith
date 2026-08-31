@@ -40,6 +40,28 @@ def test_list_files_matches_pattern(fake_repo: Path) -> None:
     assert output.strip() == str(fake_repo / "mail.py")
 
 
+def test_list_files_is_non_recursive_by_default(fake_repo: Path) -> None:
+    subdir = fake_repo / "sub"
+    subdir.mkdir()
+    (subdir / "nested.py").write_text("x = 1\n")
+
+    output = tools.list_files(str(fake_repo), "*.py")
+
+    assert str(fake_repo / "mail.py") in output
+    assert "nested.py" not in output
+
+
+def test_list_files_recurses_with_double_star_pattern(fake_repo: Path) -> None:
+    subdir = fake_repo / "sub"
+    subdir.mkdir()
+    (subdir / "nested.py").write_text("x = 1\n")
+
+    output = tools.list_files(str(fake_repo), "**/*.py")
+
+    assert str(fake_repo / "mail.py") in output
+    assert str(subdir / "nested.py") in output
+
+
 def test_search_code_finds_pattern(fake_repo: Path) -> None:
     output = tools.search_code("is_valid_email", "*.py")
     assert f"{fake_repo / 'mail.py'}:1" in output
@@ -54,6 +76,13 @@ def test_find_references_includes_call_site(fake_repo: Path) -> None:
     output = tools.find_references("is_valid_email", "", 0)
     lines = output.splitlines()
     assert len(lines) == 2  # definition + one call site
+
+
+def test_find_references_excludes_declaration_when_location_given(fake_repo: Path) -> None:
+    output = tools.find_references("is_valid_email", str(fake_repo / "mail.py"), 1)
+    lines = output.splitlines()
+    assert len(lines) == 1  # only the call site, not the "def" line itself
+    assert "def is_valid_email" not in output
 
 
 def test_edit_file_applies_unique_replacement(fake_repo: Path) -> None:
@@ -90,3 +119,27 @@ def test_run_command_returns_exit_code_and_streams(fake_repo: Path) -> None:
 def test_path_traversal_outside_testbed_is_rejected(fake_repo: Path) -> None:
     output = tools.read_file("/etc/passwd")
     assert "[Error]" in output
+
+
+def test_run_command_output_is_capped(fake_repo: Path) -> None:
+    output = tools.run_command("python3 -c \"print('x' * 30000)\"")
+    assert len(output) <= tools.TOOL_OUTPUT_LIMIT_CHARS + 200
+    assert "[TruncatedToolOutput]" in output
+
+
+def test_search_code_output_is_capped(fake_repo: Path) -> None:
+    huge = fake_repo / "huge.py"
+    huge.write_text("\n".join(f"x{i} = {i}  # marker" for i in range(5000)))
+    output = tools.search_code("marker", "*.py")
+    assert len(output) <= tools.TOOL_OUTPUT_LIMIT_CHARS + 200
+    assert "[TruncatedToolOutput]" in output
+
+
+def test_get_patch_is_never_truncated(fake_repo: Path) -> None:
+    """get_patch()'s return value can be the literal final_answer() argument -
+    truncating it would silently submit a corrupted, unappliable diff."""
+    huge_value = "x" * (tools.TOOL_OUTPUT_LIMIT_CHARS * 2)
+    tools.edit_file(str(fake_repo / "mail.py"), "return '@' in mail", f'return "{huge_value}" and True')
+    patch = tools.get_patch()
+    assert "[TruncatedToolOutput]" not in patch
+    assert huge_value in patch

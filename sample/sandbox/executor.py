@@ -91,6 +91,67 @@ def _is_authorized(module_name: str, authorized: list) -> bool:
     return any(fnmatch.fnmatch(module_name, pattern) for pattern in authorized)
 
 
+# Dunder attributes ordinary MBPP/SWE-bench solution code plausibly needs to
+# access explicitly (operator overloading, iteration, context managers, ...).
+# Everything else dunder-shaped is denied by default (see
+# check_dunder_attribute_access below) rather than trying to enumerate every
+# dangerous one - the introspection surface of a live CPython process is too
+# large to blocklist completely, and the escapes that matter here
+# (__subclasses__, __globals__, __bases__/__base__/__mro__, __builtins__,
+# __code__/__closure__, __getattribute__/__reduce__/__reduce_ex__) are exactly
+# the ones a default-deny allowlist closes without asking sandboxed code to
+# avoid a name it never needed anyway.
+_SAFE_DUNDER_ATTRS = {
+    "__init__", "__name__", "__doc__", "__module__", "__qualname__",
+    "__repr__", "__str__", "__format__", "__hash__",
+    "__eq__", "__ne__", "__lt__", "__le__", "__gt__", "__ge__",
+    "__bool__", "__len__", "__iter__", "__next__", "__contains__",
+    "__getitem__", "__setitem__", "__delitem__", "__call__",
+    "__enter__", "__exit__",
+    "__add__", "__radd__", "__sub__", "__rsub__", "__mul__", "__rmul__",
+    "__truediv__", "__rtruediv__", "__floordiv__", "__rfloordiv__",
+    "__mod__", "__rmod__", "__pow__", "__rpow__",
+    "__neg__", "__pos__", "__abs__", "__round__", "__divmod__",
+}
+
+
+def _is_dangerous_dunder(name: object) -> bool:
+    return (
+        isinstance(name, str)
+        and name.startswith("__")
+        and name.endswith("__")
+        and name not in _SAFE_DUNDER_ATTRS
+    )
+
+
+def check_dunder_attribute_access(tree: ast.AST) -> None:
+    """Static check: reject explicit access to any dunder attribute outside
+    _SAFE_DUNDER_ATTRS.
+
+    Closes the classic in-process sandbox escape:
+    ``().__class__.__bases__[0].__subclasses__()`` walks already-loaded
+    classes to find one whose ``__init__.__globals__['__builtins__']`` is the
+    *real*, unrestricted builtins - completely bypassing the restricted
+    __import__/open in this sandbox's namespace, since those only guard name
+    *lookups* in sandboxed code, not arbitrary introspection of objects that
+    were never looked up through them. _make_restricted_getattr below closes
+    the same escape reached dynamically via ``getattr(obj, "__subclasses__")``
+    instead of dot syntax.
+
+    Known residual gap, accepted for the same reason executor.py's other
+    trade-offs are: the same traversal is also reachable through
+    ``str.format()``'s attribute mini-language (e.g.
+    ``"{0.__class__}".format(x)``), which parses attribute names from a
+    string at runtime rather than as AST Attribute nodes, so neither this
+    static check nor _make_restricted_getattr sees it. Disabling
+    ``str.format`` entirely would break far more legitimate solution code
+    than it protects against for MBPP/SWE-bench style tasks.
+    """
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Attribute) and _is_dangerous_dunder(node.attr):
+            raise SandboxViolation(f"access to '{node.attr}' is not permitted")
+
+
 def check_imports(tree: ast.AST, authorized: list) -> None:
     """Static check: reject any Import/ImportFrom node outside the allowlist.
 
@@ -141,6 +202,28 @@ def _make_restricted_open(allowed_directories: list) -> Callable[..., Any]:
         return real_open(file, mode, *args, **kwargs)
 
     return restricted_open
+
+
+def _make_restricted_getattr() -> Callable[..., Any]:
+    real_getattr = builtins.getattr
+
+    def restricted_getattr(obj: Any, name: Any, *default: Any) -> Any:
+        if _is_dangerous_dunder(name):
+            raise SandboxViolation(f"access to '{name}' is not permitted")
+        return real_getattr(obj, name, *default)
+
+    return restricted_getattr
+
+
+def _make_restricted_setattr() -> Callable[..., Any]:
+    real_setattr = builtins.setattr
+
+    def restricted_setattr(obj: Any, name: Any, value: Any) -> None:
+        if _is_dangerous_dunder(name):
+            raise SandboxViolation(f"access to '{name}' is not permitted")
+        real_setattr(obj, name, value)
+
+    return restricted_setattr
 
 
 def final_answer(answer: Any) -> None:
@@ -198,6 +281,8 @@ class Sandbox:
         }
         restricted_builtins["__import__"] = _make_restricted_import(self.config.authorized_imports)
         restricted_builtins["open"] = _make_restricted_open(self.config.allowed_directories)
+        restricted_builtins["getattr"] = _make_restricted_getattr()
+        restricted_builtins["setattr"] = _make_restricted_setattr()
 
         namespace: dict = {"__builtins__": restricted_builtins, "final_answer": final_answer}
         namespace.update(extra_namespace)  # MCP tool wrappers, if any (Section 4.2)
@@ -222,6 +307,7 @@ class Sandbox:
 
         try:
             check_imports(tree, self.config.authorized_imports)
+            check_dunder_attribute_access(tree)
         except SandboxViolation as exc:
             return f"[SandboxViolation] {exc}"
 
