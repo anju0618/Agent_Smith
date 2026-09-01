@@ -83,6 +83,7 @@ def main() -> None:
 
     container: Optional[SweBenchContainer] = None
     mcp_proxy = None
+    sandbox: Optional[Sandbox] = None
     orchestrator: Optional[Orchestrator] = None
 
     def handle_sigterm(signum: int, frame: object) -> None:
@@ -133,6 +134,8 @@ def main() -> None:
     except Exception as exc:
         solution = error_solution(task.instance_id, f"Agent crashed: {type(exc).__name__}: {exc}")
     finally:
+        if sandbox is not None:
+            sandbox.close()
         if mcp_proxy is not None:
             mcp_proxy.close()
         if container is not None:
