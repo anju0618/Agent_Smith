@@ -94,6 +94,7 @@ def main() -> None:
     signal.signal(signal.SIGTERM, handle_sigterm)
 
     mcp_proxy = None
+    sandbox: Optional[Sandbox] = None
     try:
         SCRATCH_DIR.mkdir(parents=True, exist_ok=True)
         # Some MBPP tasks' test assertions need an import (e.g. math.isclose)
@@ -138,6 +139,8 @@ def main() -> None:
     except Exception as exc:
         solution = error_solution(str(task.task_id), f"Agent crashed: {type(exc).__name__}: {exc}")
     finally:
+        if sandbox is not None:
+            sandbox.close()
         if mcp_proxy is not None:
             mcp_proxy.close()
 
