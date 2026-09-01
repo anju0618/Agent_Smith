@@ -1,27 +1,15 @@
 """Secure, configurable Python execution sandbox (Section 4.2).
 
-Design choices (the project explicitly calls out that isolation is a genuine
-trade-off with no single right answer - these are documented here rather than
-just implemented silently):
+By default, generated code runs in a persistent worker inside a network-
+disabled user/PID/mount namespace created by ``unshare`` and ``bubblewrap``.
+The restricted namespace and builtins checks remain defense in depth, while
+the OS boundary prevents an object-introspection escape from reaching the
+agent's host process. MCP tool functions are bridged back to the trusted
+parent process over a small JSON protocol, so tool discovery and calls remain
+dynamic and variables persist between agent steps.
 
-- In-process execution with a restricted globals/builtins dict, rather than a
-  fresh OS process per snippet. This keeps MCP tool wrappers (built once,
-  holding live connections) directly callable from sandboxed code with no
-  cross-process RPC bridge, and keeps variables naturally persistent between
-  agent steps in self.namespace (Section 3.1's "persistent variables" point).
-- Execution timeout is enforced with SIGALRM (Unix only): CPython checks for
-  pending signals between bytecode instructions, so this reliably interrupts
-  both pure-Python infinite loops and blocking stdlib calls (sleep, I/O). The
-  one case it cannot preempt is a C extension that blocks without releasing
-  the GIL - a known limitation of in-process signal-based timeouts, accepted
-  here for architectural simplicity. A fully hardened deployment could instead
-  run each snippet in its own subprocess and SIGTERM/SIGKILL it - the approach
-  Section 6.1 describes for the *outer* agent-process timeout, which
-  moulinette itself enforces via its run-agent command.
-- Memory is capped with resource.setrlimit(RLIMIT_AS) once per process: code
-  that exceeds it gets a normal, catchable MemoryError instead of being
-  OS-killed, so the sandbox can report a clean [MemoryLimitExceeded]
-  observation instead of the whole agent process just vanishing.
+``isolated=False`` is used only by the worker itself to execute code after the
+OS boundary has already been established.
 """
 from __future__ import annotations
 
@@ -37,6 +25,7 @@ from types import ModuleType
 from typing import Any, Dict, Optional
 
 from models import SandboxConfig
+from sandbox.isolated_process import IsolatedSandboxProcess
 
 try:
     import resource
@@ -65,6 +54,7 @@ _UNSAFE_BUILTINS = {
 
 _RESERVED_GLOBAL_NAMES = {"__builtins__", "final_answer"}
 _FORBIDDEN_PUBLIC_ATTRIBUTES = {"format"}
+_FORBIDDEN_MODULE_ATTRIBUTES = {"string": {"Formatter"}}
 
 
 class SandboxViolation(Exception):
@@ -206,6 +196,8 @@ class _RestrictedModule(ModuleType):
         module = object.__getattribute__(self, "_restricted_module")
         if module.__name__ == "operator" and name in {"attrgetter", "methodcaller"}:
             raise SandboxViolation(f"operator.{name} is not permitted")
+        if name in _FORBIDDEN_MODULE_ATTRIBUTES.get(module.__name__, set()):
+            raise SandboxViolation(f"{module.__name__}.{name} is not permitted")
 
         value = getattr(module, name)
         if isinstance(value, ModuleType):
@@ -307,27 +299,41 @@ class Sandbox:
         config: Optional[SandboxConfig] = None,
         extra_namespace: Optional[Dict[str, Callable]] = None,
         apply_process_memory_limit: bool = True,
+        isolated: bool = True,
     ) -> None:
         if config is None:
             config = SandboxConfig(
                 authorized_imports=DEFAULT_AUTHORIZED_IMPORTS,
                 allowed_directories=DEFAULT_ALLOWED_DIRECTORIES,
             )
+        extra = extra_namespace or {}
+        collisions = sorted(_RESERVED_GLOBAL_NAMES & extra.keys())
+        if collisions:
+            raise ValueError(f"extra_namespace contains reserved name(s): {', '.join(collisions)}")
+
         self.config = config
+        self._isolated_process: Optional[IsolatedSandboxProcess] = None
+        if isolated:
+            self.namespace = {}
+            self._isolated_process = IsolatedSandboxProcess(
+                config,
+                extra,
+                apply_process_memory_limit,
+            )
+            return
+
         if apply_process_memory_limit:
             self._apply_memory_limit()
-        self.namespace = self._build_namespace(extra_namespace or {})
+        self.namespace = self._build_namespace(extra)
 
     def _apply_memory_limit(self) -> None:
         """Cap this process's address space so runaway allocations raise
         MemoryError instead of triggering the OS OOM killer.
 
-        This is applied once, for the whole process's lifetime - a documented
-        trade-off of the in-process isolation approach (see module docstring).
-        Callers that construct many Sandboxes in one process (e.g. tests) should
-        pass apply_process_memory_limit=False and exercise this behavior in an
-        isolated subprocess instead, since RLIMIT_AS can only be lowered, never
-        raised back up, for the lifetime of a process.
+        This is applied once to the worker process's lifetime. The public
+        Sandbox normally runs in a dedicated worker, so lowering RLIMIT_AS
+        does not affect the agent or test runner. ``isolated=False`` is an
+        internal worker-only mode and should not be used for untrusted code.
         """
         if resource is None or not hasattr(resource, "RLIMIT_AS"):
             return
@@ -365,6 +371,9 @@ class Sandbox:
         FinalAnswer, KeyboardInterrupt, and SystemExit are the only things
         propagated to the caller.
         """
+        if self._isolated_process is not None:
+            return self._isolated_process.run(code)
+
         if not code.strip():
             return "[NoCodeBlock] The submitted code was empty."
 
@@ -425,6 +434,17 @@ class Sandbox:
             + f"\n[TruncatedOutput] {omitted} additional characters were cut off "
             f"(output limit: {limit} chars)."
         )
+
+    def close(self) -> None:
+        """Stop the isolated worker, if this Sandbox owns one."""
+        if self._isolated_process is not None:
+            self._isolated_process.close()
+
+    def __del__(self) -> None:
+        try:
+            self.close()
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":

@@ -1,10 +1,8 @@
 """Tests for sandbox/executor.py (Section 4.2's security constraints).
 
-Memory-limit enforcement is tested in a subprocess (see
-test_memory_limit_is_enforced) because Sandbox._apply_memory_limit() lowers
-RLIMIT_AS for the whole calling process and, once lowered, a process can never
-raise it back up - applying it directly to the pytest process itself would
-risk breaking every later test in this session.
+Memory-limit enforcement is tested through the isolated worker (see
+test_memory_limit_is_enforced), so lowering RLIMIT_AS cannot affect the pytest
+process or later tests in this session.
 """
 import subprocess
 import sys
@@ -115,6 +113,25 @@ def test_format_attribute_escape_is_blocked() -> None:
     assert "[SandboxViolation]" in output
 
 
+def test_formatter_field_escape_is_blocked() -> None:
+    sandbox = _sandbox(authorized_imports=["string"])
+    output = sandbox.run(
+        "import string\n"
+        "formatter = string.Formatter()\n"
+        "formatter.get_field('0.__class__', ((),), {})"
+    )
+    assert "[SandboxViolation]" in output
+
+
+def test_isolated_worker_cannot_see_host_root_files() -> None:
+    sandbox = _sandbox(authorized_imports=["os", "posixpath"])
+    try:
+        output = sandbox.run("import os\nprint(os.path.exists('/etc/passwd'))")
+    finally:
+        sandbox.close()
+    assert output.strip() == "False"
+
+
 def test_subclasses_escape_via_getattr_is_blocked() -> None:
     sandbox = _sandbox(authorized_imports=["math"])
     output = sandbox.run("getattr(object, '__subclasses__')()")
@@ -218,6 +235,14 @@ def test_filesystem_restriction_blocks_outside_paths(tmp_path: Path) -> None:
 def test_filesystem_restriction_allows_configured_directory(tmp_path: Path) -> None:
     sandbox = _sandbox(allowed_directories=[str(tmp_path)])
     target = str(tmp_path / "allowed.txt")
+    output = sandbox.run(f"open({target!r}, 'w').write('hi')\nprint('ok')")
+    assert output.strip() == "ok"
+
+
+def test_relative_allowed_directory_is_mounted(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.chdir(tmp_path.parent)
+    sandbox = _sandbox(allowed_directories=[tmp_path.name])
+    target = str(tmp_path / "relative.txt")
     output = sandbox.run(f"open({target!r}, 'w').write('hi')\nprint('ok')")
     assert output.strip() == "ok"
 

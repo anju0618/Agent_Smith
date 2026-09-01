@@ -24,7 +24,7 @@ from typing import Any, Optional
 import docker
 
 TESTBED_PATH_IN_CONTAINER = "/testbed"
-EVAL_SCRIPT_PATH_IN_CONTAINER = "/eval.sh"
+EVAL_SCRIPT_PATH_IN_CONTAINER = f"{TESTBED_PATH_IN_CONTAINER}/eval.sh"
 TOOLS_PATH_IN_CONTAINER = "/agent_smith_mcp_tools_swebench.py"
 
 

@@ -91,6 +91,7 @@ def main() -> None:
         sys.exit(1)
 
     mcp_proxy = None
+    sandbox = None
     try:
         mcp_proxy = _connect_mcp(args.mcp_stdio, args.mcp_server)
         extra_namespace = mcp_proxy.build_namespace() if mcp_proxy else {}
@@ -100,6 +101,8 @@ def main() -> None:
         sandbox = Sandbox(config, extra_namespace=extra_namespace)
         repl(sandbox)
     finally:
+        if sandbox:
+            sandbox.close()
         if mcp_proxy:
             mcp_proxy.close()
 

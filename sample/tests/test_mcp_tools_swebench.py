@@ -101,6 +101,25 @@ def test_run_tests_rejects_evaluation_script_outside_testbed(
     assert "outside the repository root" in output
 
 
+def test_run_tests_uses_default_evaluation_script(
+    fake_repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("AGENT_SMITH_EVAL_SCRIPT", raising=False)
+    eval_script = fake_repo / "eval.sh"
+    eval_script.write_text("#!/bin/sh\nprintf 'evaluation-ok\\n'\n")
+    eval_script.chmod(0o755)
+
+    output = tools.run_tests()
+
+    assert "evaluation-ok" in output
+
+
+def test_docker_runner_places_evaluation_script_under_testbed() -> None:
+    from docker_runner import EVAL_SCRIPT_PATH_IN_CONTAINER, TESTBED_PATH_IN_CONTAINER
+
+    assert EVAL_SCRIPT_PATH_IN_CONTAINER == f"{TESTBED_PATH_IN_CONTAINER}/eval.sh"
+
+
 def test_search_function_definition(fake_repo: Path) -> None:
     output = tools.search_function_or_class_definition_in_code("is_valid_email")
     assert f"{fake_repo / 'mail.py'}:1" in output

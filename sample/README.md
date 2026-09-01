@@ -30,6 +30,10 @@ uv sync                      # installs pydantic, requests, mcp, docker, dotenv
 cp .env.example .env         # fill in real, free-tier API keys
 ```
 
+The sandbox requires Linux `unshare` and `bubblewrap` (`bwrap`) commands. If
+they are unavailable, untrusted code execution fails closed instead of
+falling back to an in-process runner.
+
 ### Run the interactive sandbox
 
 ```sh
@@ -142,28 +146,29 @@ Each iteration of `Orchestrator.run()` (`orchestrator.py`):
 
 ## Sandbox design
 
-`sandbox/executor.py` runs LLM-generated code **in-process**, in a restricted
-`exec()` namespace, rather than spawning a fresh OS process per snippet. This
-was a deliberate trade-off, not the only valid one — the subject explicitly
-calls out that in-process vs. separate-process sandboxing is a real
-architectural choice with no single right answer:
+`sandbox/executor.py` runs LLM-generated code in a persistent worker process
+inside a network-disabled user/PID/mount namespace. `bubblewrap` exposes only
+the Python runtime, the sandbox package, declared allowed directories, and a
+temporary `/tmp`; the project root is not mounted wholesale. The worker keeps
+the restricted `exec()` namespace and reports each result over a JSON pipe.
 
 | Concern | This implementation | Trade-off |
 |---|---|---|
 | Import allowlist | AST walk (`ast.Import`/`ImportFrom`) **and** a runtime-patched `__import__`, so `__import__("os")` called as a plain function is caught too. Imported modules are exposed through restricted proxies which hide private attributes and unauthorized nested modules (`random._os`, `typing.sys`, etc.) | — |
-| Filesystem allowlist | `open` is replaced with a wrapper that `os.path.realpath`-resolves the target and checks it's under `SandboxConfig.allowed_directories` | Only guards `open`; the restricted module/private-attribute boundary must therefore remain strict so allowlisted modules cannot hand raw filesystem modules back to agent code |
-| Network access | Never explicitly blocked at the socket level — enforced by omission: `socket`, `urllib`, `requests`, `http`, etc. are simply never in `authorized_imports` | Defense relies entirely on the import allowlist staying strict |
-| Execution timeout | `signal.alarm()` (Unix): CPython checks for pending signals between bytecode instructions, so this reliably interrupts both Python loops and blocking stdlib calls | Cannot preempt a C extension that blocks without releasing the GIL. A separate-process design with `SIGTERM`→`SIGKILL` (the approach Section 6.1 describes — and which moulinette's own `run-agent` uses — for the *outer* agent-process timeout) would close this gap at the cost of needing an IPC bridge for MCP tool calls |
-| Memory limit | `resource.setrlimit(RLIMIT_AS, ...)` once per process; an over-limit allocation raises a normal, catchable `MemoryError` | Applies to the whole process for its lifetime (can only be lowered, never raised again) — fine for a single-purpose agent process, but this is why the test suite exercises it in a subprocess instead of the pytest process itself |
+| OS isolation | Worker is launched through `unshare` + `bubblewrap` with no network, a private PID/mount namespace, a minimal read-only root, and UID/GID 65534 | Requires Linux user namespaces and the `bwrap` executable; setup failure is fail-closed |
+| Filesystem allowlist | `open` is replaced with a wrapper that `os.path.realpath`-resolves the target and checks it's under `SandboxConfig.allowed_directories`; only those existing directories are mounted into the worker | The OS boundary and the wrapper are both required |
+| Network access | Network namespace is created outside bubblewrap and has no network interfaces | Depends on Linux namespace support |
+| Execution timeout | Parent enforces a wall-clock deadline and terminates the worker process group with `SIGTERM`→`SIGKILL`; the worker also uses `signal.alarm()` for a clean Python observation | A stuck parent-side MCP call is separately bounded by the RPC wait |
+| Memory limit | Worker applies `resource.setrlimit(RLIMIT_AS, ...)` to its own process | Applies to the worker, not the agent or test runner |
 | Restricted builtins | `eval`, `exec`, `compile`, `input`, `breakpoint`, `help`, `exit`, `quit`, `vars`, `__import__`, `open` are removed/replaced in the sandboxed builtins | — |
-| Private attribute access | A default-deny allowlist: `check_dunder_attribute_access()` rejects private attributes outside a small safe dunder list (operator overloading, iteration, repr, ...); `getattr`/`setattr` enforce the same rule dynamically, `str.format()` is unavailable, and `operator.attrgetter`/`methodcaller` are unavailable. This closes both classic `__subclasses__` introspection and allowlisted-module escapes such as `random._os` | — |
+| Private attribute access | A default-deny allowlist: `check_dunder_attribute_access()` rejects private attributes outside a small safe dunder list; `getattr`/`setattr` enforce the same rule dynamically, `str.format()` and `string.Formatter` are unavailable, and `operator.attrgetter`/`methodcaller` are unavailable | The OS boundary remains the primary security boundary |
 | `final_answer()` | A closure injected into every sandbox namespace, independent of whatever MCP server is connected; reserved-name collisions from MCP namespaces are rejected, and `FinalAnswer` is deliberately **not** caught by the generic exception handler | Matches Section 4.2's "exception propagation" requirement exactly |
 
-The upside of staying in-process: MCP tool wrappers (built once by
-`MCPToolProxy`, holding a live connection on a background asyncio thread) are
-directly callable from sandboxed code with no cross-process RPC bridge, and
-variables persist naturally between agent steps in `Sandbox.namespace` — no
-serialization needed for either.
+MCP tool wrappers are represented in the worker by bridge functions. Calls are
+sent to the trusted parent process, which invokes the existing dynamic
+`MCPToolProxy` wrapper and returns a JSON-safe result. The worker stays alive
+between calls, so variables persist between agent steps without exposing the
+parent process to generated code.
 
 `SandboxConfig` (`models.py`) is a Pydantic model loadable from a JSON file
 (`sandbox_template.json` is a working example); `sandbox/cli.py` is the
@@ -185,9 +190,9 @@ bounded; one owner coroutine enters and exits the AnyIO transport contexts in
 the same task so timeout cleanup cannot leak the server subprocess.
 
 **MBPP tools** (`mcp_tools_mbpp.py`): `run_tests(code, test_list)` runs the
-candidate + assertions in a throwaway subprocess with a 10s timeout, so a
-broken candidate can never hang or crash the tool server itself. Returns
-`{"success": bool, "output": str}` as JSON, per Section 4.3.2.
+candidate + assertions in a throwaway OS-isolated sandbox with a 10s timeout,
+so candidate code cannot access the MCP server's host filesystem or network.
+It returns `{"success": bool, "output": str}` as JSON, per Section 4.3.2.
 
 **SWE-bench tools** (`mcp_tools_swebench.py`): all nine mandatory tools
 (`read_file`, `edit_file`, `list_files`, `search_code`,

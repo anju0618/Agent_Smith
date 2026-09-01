@@ -50,3 +50,10 @@ def test_run_tests_infinite_loop_times_out() -> None:
     result = json.loads(run_tests(code, ["assert add(2, 3) == 5"]))
     assert result["success"] is False
     assert "timed out" in result["output"]
+
+
+def test_run_tests_rejects_unauthorized_host_import() -> None:
+    code = "import os\ndef cwd():\n    return os.getcwd()\n"
+    result = json.loads(run_tests(code, ["assert cwd()"]))
+    assert result["success"] is False
+    assert "SandboxViolation" in result["output"]
