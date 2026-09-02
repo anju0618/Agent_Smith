@@ -136,16 +136,160 @@ LLM API  <--Prompt/Response-->  Orchestrator (orchestrator.py)
 
 ## 4. `models.py` — モデル契約
 
-> ファイル冒頭のコメント: 「moulinette/models_public.py からのコピー。形は編集禁止」
+冒頭2行がこのファイルの立ち位置を明言している:
 
-採点システム（moulinette）と交わす契約となる Pydantic モデル群。
+```python
+# ABOUTME: Student-facing Pydantic models for the moulinette evaluation contract.
+# ABOUTME: This file is copied verbatim from moulinette/models_public.py — do not edit its shape.
+```
 
-| モデル | 役割 |
-|---|---|
-| `StepMetrics` | 1イテレーション分の記録。`input_tokens`/`output_tokens`/`request_time_ms` に加え、**生の** `llm_output`/`sandbox_input`/`sandbox_output` を保持する。これにより後から「本当に何が起きたか」をトレースできる（`success` フィールドだけを信じない、という後述のベンチマークレポートの結論に直結）。 |
-| `SolutionOutput` | 最終成果物。`task_id`, `benchmark`, `success`, `solution`（MBPPなら関数コード、SWE-benchならgit diff）, `steps[]`, `error` などを持つ。失敗時にも必ず書き出される。 |
-| `SandboxConfig` | `authorized_imports`（`math.*` のようなglobパターン対応）, `allowed_directories`, タイムアウト・メモリ・出力文字数の上限。 |
-| `MBPPTaskInput` / `SWEBenchTaskInput` | moulinette から渡されるタスク定義の型。 |
+つまりこれは自作の型ではなく**採点システム側のスキーマのコピー**。フィールドを1つ変えるだけで
+採点が壊れるので、「形は編集禁止」。全86行、5つの `BaseModel` に役割は3種類しかない:
+moulinette→エージェントの**入力契約**、エージェント内部だけで完結する**設定**、エージェント→
+moulinetteの**出力契約**。
+
+### `StepMetrics`（1イテレーション分の記録）
+
+```python
+class StepMetrics(BaseModel):
+    step: int
+    input_tokens: int
+    output_tokens: int
+    request_time_ms: float
+    timestamp: str = Field(default_factory=lambda: datetime.now().isoformat())
+    api_url: str = ""
+    model_name: str = ""
+    llm_output: str = ""      # コード抽出前のLLM生テキスト全文
+    sandbox_input: str = ""   # 抽出後、実際にサンドボックスへ送ったコード
+    sandbox_output: str = ""  # サンドボックスの実行結果（stdout/stderr/エラー文字列）
+    retries: int = 0
+```
+
+`orchestrator.py:191-204` が1イテレーションごとにこれを1個組み立てて `steps` に積む:
+
+```python
+steps.append(
+    StepMetrics(
+        step=step_number,
+        input_tokens=gen.input_tokens,
+        output_tokens=gen.output_tokens,
+        request_time_ms=gen.request_time_ms,
+        api_url=gen.api_url,
+        model_name=gen.model_name,
+        llm_output=gen.text,          # ← 生テキストそのもの、無加工
+        sandbox_input=sandbox_input,  # ← extract_code(gen.text) で抜き出したコード部分だけ
+        sandbox_output=observation,
+        retries=gen.retries,
+    )
+)
+```
+
+`llm_output` と `sandbox_input` は同じLLM応答から来ているが中身は別物: `llm_output` は
+`Thought: ...\nCode:\n```python\n...\n```\n<end_code>` という **Thought込みの全文**、
+`sandbox_input` はそこから ```` ```python ... ``` ```` ブロックだけを`code_extraction.py`が
+抜き出した**コード部分のみ**。両方残すのは、あとから「LLMがちゃんとThoughtを書いていたか」
+「コード抽出は正しく機能したか」を個別に検証できるようにするため。
+
+### `SolutionOutput`（タスク全体の最終成果物）
+
+`StepMetrics` が「1ステップ」なのに対し、こちらは「タスク1つ分のサマリ + 全ステップ履歴」。
+`agent_mbpp.py` / `agent_swebench.py` がこれを組み立てて `solution.json` に書き出し、
+moulinette がそれを読んで正誤判定する。
+
+```python
+class SolutionOutput(BaseModel):
+    task_id: str
+    benchmark: str          # "mbpp" or "swebench"
+    success: bool           # エージェントが final_answer() を呼んだかどうか（正解の証明ではない）
+    solution: str            # MBPP: 関数コード / SWE-bench: git diff
+    iterations: int
+    total_requests: int      # リトライ込みのLLM APIコール総数
+    total_input_tokens: int
+    total_output_tokens: int
+    total_time_seconds: float
+    steps: List[StepMetrics] = []
+    system_prompt: str = ""  # 実際に送った完全なsystem prompt（provenance検証用）
+    error: Optional[str] = None
+    timestamp: str = Field(default_factory=lambda: datetime.now().isoformat())
+```
+
+`total_input_tokens` などは理屈上 `steps` を合計すれば導出できる値だが、あえてトップレベルにも
+持たせているのは、moulinette が集計処理をせずに一発で予算超過チェックできるようにするため
+（詳細な監査は `steps` 側、合計値チェックはトップレベル側、という役割分担）。`success: true` の
+意味が「エージェントが `final_answer()` を呼んだ」でしかなく「本当に正しい」ではないことは、
+Section 17 のアブレーション実験（空文字列パッチで `success: true` を報告した事故）で
+実証されている。
+
+### `SandboxConfig`（サンドボックスの門番設定）
+
+```python
+class SandboxConfig(BaseModel):
+    authorized_imports: List[str] = []      # importのホワイトリスト（"math.*" のようなglob可）
+    allowed_directories: List[str] = []      # ファイルアクセスを許可するパス
+    max_execution_time_seconds: int = 30
+    max_memory_mb: int = 512
+    max_output_chars: int = 20_000           # プロジェクト内部の都合。moulinette契約外
+```
+
+`authorized_imports` はデフォルト**拒否**方式 — ここに無い名前は `import` した瞬間ブロックされる。
+実際の値は `agent_mbpp.py` と `agent_swebench.py` で明確に差がある:
+
+| | `agent_mbpp.py:107-116` | `agent_swebench.py:102-107` |
+|---|---|---|
+| `allowed_directories` | `[SCRATCH_DIR]` のみ | `["/testbed", SCRATCH_DIR]` |
+| `max_execution_time_seconds` | `20` | `60` |
+| `max_memory_mb` | `256` | `512` |
+
+MBPPは短いアルゴリズム問題しか解かないのでスクラッチディレクトリしか触らせずリソースも絞る。
+SWE-benchはDockerでマウントされた実リポジトリ（`/testbed`）を調査・修正する必要があるため、
+アクセス範囲もリソースも倍増させている。`agent_mbpp.py` 側のタイムアウト設定には
+実運用で踏んだ地雷の跡がコメントで残っている:
+
+```python
+# Must stay comfortably above mcp_tools_mbpp.py's own internal 10s
+# run_tests() subprocess timeout, or the outer sandbox alarm can fire
+# first on a legitimate (slow but correct) test run - found via a live
+# smoke test against a real provider, see README.md.
+max_execution_time_seconds=20,
+```
+
+`mcp_tools_mbpp.py` 内部の `run_tests()` サブプロセスタイムアウトが10秒なので、外側の
+サンドボックスタイムアウトを20秒にして、内側が確実に先にタイムアウトするよう余裕を持たせている
+——これが無いと、正しいが少し遅いテスト実行を外側のアラームが先に殺してしまい、正解を誤って
+タイムアウト扱いにする。
+
+### `MBPPTaskInput` / `SWEBenchTaskInput`（moulinetteからの入力契約）
+
+`SolutionOutput` の逆方向。moulinetteがエージェントに投げてくるタスク定義そのもの。
+
+```python
+class MBPPTaskInput(BaseModel):
+    task_id: int
+    task_definition: str        # 自然言語の問題文
+    function_definition: str    # 例: "def solve(nums):"
+    test_imports: List[str] = []
+    test_list: List[str] = []   # 公開テストのassert文そのもの
+
+class SWEBenchTaskInput(BaseModel):
+    instance_id: str
+    problem_statement: str      # 実際のGitHub issue文面
+    docker_image: str           # 例: "swebench/sweb.eval.x86_64.sympy_1776_sympy-23534:latest"
+    eval_script: str            # パッチ判定用bashスクリプト
+    hints_text: str = ""
+    repo: str = ""
+```
+
+`SWEBenchTaskInput` の各フィールドは単なるデータではなく、後続コードの**入力パラメータそのもの**
+になる。`agent_swebench.py:97-99` を見ると分かりやすい:
+
+```python
+container = SweBenchContainer(task.docker_image)
+container.start(eval_script=task.eval_script, tools_file=TOOLS_FILE)
+```
+
+`docker_image` はそのまま `docker pull` されるイメージ名、`eval_script` はそのままコンテナ内で
+実行されるbashスクリプトになる——モデル定義を読んだだけで、それが後段のDockerライフサイクル
+（Section 13）に直結していることまで追える。
 
 ---
 
@@ -203,43 +347,204 @@ for step_number in range(1, max_iterations + 1):
 
 LLM ごとにツール呼び出しの書き方の癖が異なる。このモジュールは、あらゆる形式を
 **サンドボックスが実行できる等価な Python コード文字列**に変換してから渡す。
-これによりサンドボックス自体は完全にフォーマット非依存でいられる。
+これによりサンドボックス自体は完全にフォーマット非依存でいられる。156行の小さなファイルで、
+中身は正規表現5個 + 抽出関数4個 + それを順に試す `extract_code()` 1個だけ。
 
-対応する形式（優先順位順）:
+### 使う正規表現（優先順位そのままの定義順）
 
-1. **正しく閉じた ```` ```python ... ``` ```` フェンス**（`<end_code>` または ``` ``` ``` で終端）
-   — プライマリ形式。変換不要でそのまま抽出。
-2. **閉じられていない ```` ```python ```` フェンス** — 救済策。残り全部をコードとして使い、
-   `[MalformedCodeBlock]` の note を付ける。
-3. **XML `<invoke name="...">...</invoke>`** 形式 — `<parameter>` を kwargs に変換し、
-   `result = name(key=value, ...)\nprint(result)` の形にする。
-4. **JSON/Hermes `<tool_call>{"name": ..., "arguments": {...}}</tool_call>`** 形式。
-5. **ReAct の `Action: name\nAction Input: {...}`** 形式。
-6. 上記いずれにも当たらなければ、最初の汎用フェンスブロックを最後の手段として使う。
-7. それでも何も見つからなければ `code=None` を返し、`[NoCodeBlock]` という明示的なnoteを付ける。
+```python
+_PYTHON_FENCE_RE   = re.compile(r"```python\s*\n(.*?)(?:```|<end_code>)", re.DOTALL)
+_GENERIC_FENCE_RE  = re.compile(r"```(?:\w+)?\s*\n(.*?)```", re.DOTALL)
+_UNCLOSED_FENCE_RE = re.compile(r"```python\s*\n(.*)$", re.DOTALL)
+_XML_INVOKE_RE     = re.compile(r'<invoke\s+name="([^"]+)">(.*?)</invoke>', re.DOTALL)
+_XML_PARAM_RE      = re.compile(r'<parameter(?:\s+name="([^"]+)")?>(.*?)</parameter>', re.DOTALL)
+_JSON_TOOLCALL_RE  = re.compile(r"<tool_call>\s*(\{.*?\})\s*</tool_call>", re.DOTALL)
+_REACT_RE          = re.compile(r"Action:\s*(\S+)\s*\nAction Input:\s*(\{.*?\}|\S.*)", re.DOTALL)
+```
 
-`ExtractionResult(code, note)` の `note` は、Orchestrator が Observation の先頭に付加する
-「何が起きたか」の説明文になる ── これも「暗黙に何かをしたら、必ずそれをLLMに伝える」という
-一貫した設計方針の一部。
+`_PYTHON_FENCE_RE` が `(?:```|<end_code>)` の**どちらでも**閉じられるのがポイント:
+モデルが `<end_code>` を書き忘れて ``` ``` ``` だけで閉じても、逆に ``` ``` ``` を忘れて
+`<end_code>` だけ書いても、どちらも正常系として拾える。
+
+### `extract_code()` が試す順序と、それぞれの変換結果
+
+`extract_code(llm_output: str) -> ExtractionResult` が上から順に試し、最初にヒットした形式を使う。
+`ExtractionResult(code, note)` の `note` は、ヒットした時点で空文字列（＝プライマリ形式で
+何も特別なことは起きていない）か、Orchestratorが次のObservationの先頭に付ける説明文になる。
+
+1. **正しく閉じた ```` ```python ... ``` ```` フェンス** — プライマリ形式。`note=""` でそのまま
+   抽出。変換なし。
+2. **閉じられていない ```` ```python ```` フェンス**（`_UNCLOSED_FENCE_RE`）— 救済策。
+   残り全部をコードとして使い、`note` に `[MalformedCodeBlock] The ```python fence was never
+   closed with ``` or <end_code>; the rest of the response was used as the code anyway.`
+   を付ける。
+3. **XML `<invoke>`** — `_extract_xml_invoke()` が `<parameter name="code">...</parameter>` を
+   1つずつ拾って `kwargs` 辞書に詰め、`_call_from_kwargs()` で
+   `result = name(key=value, ...)\nprint(result)` という等価コードに変換する。例えば
+
+   ```xml
+   <invoke name="search_code"><parameter name="pattern">is_valid_email</parameter></invoke>
+   ```
+
+   は次のPythonコードに変換される:
+
+   ```python
+   result = search_code(pattern='is_valid_email')
+   print(result)
+   ```
+
+   `parse_string_literals=True` が渡されるため、値がJSON数値やbool（`"true"`, `"3"` など）に
+   見える場合は `_py_literal()` が `json.loads()` を試みてPythonのリテラル（`True`, `3`）として
+   埋め込む。パースに失敗すればただの文字列として `repr()` する。
+4. **JSON/Hermes `<tool_call>{"name": ..., "arguments": {...}}</tool_call>`** —
+   `_extract_json_tool_call()` がJSONとしてパースし、同じ `_call_from_kwargs()` に渡す。
+   `name` が無い、`arguments` が辞書でない、JSONとして壊れている、のいずれかなら黙って
+   `None` を返し次の形式へフォールバックする。
+5. **ReAct `Action: name\nAction Input: {...}`** — `_extract_react()` が `Action Input` を
+   JSONとしてパース。辞書でなければ `{"value": raw_input}` として1引数関数呼び出し扱いにする
+   フォールバックまで用意されている。
+6. **末尾の保険**: 上記いずれにも当たらなければ `_GENERIC_FENCE_RE` で最初の汎用フェンス
+   （```` ```json ```` や ```` ``` ```` だけの無言語指定フェンスなど）を最後の手段として使う。
+   `note` は `[MalformedCodeBlock] No ```python fence found; used the first generic fenced
+   block instead.`
+7. **それでも何も見つからなければ** `code=None` を返し、`note` に
+   `[NoCodeBlock] No valid Python code block or recognized tool-call format ... was found in
+   the model's response. Reply with a \`\`\`python ... \`\`\` block ending in <end_code>.`
+   という、次に何を書けばいいかまで指示する明示的なフィードバックを付ける。
+
+`code=None` になったケースは `orchestrator.py:179-180` で「サンドボックス実行そのものを
+スキップし、`note` をそのままObservationとして渡す」という分岐に落ちる。ループが
+「たぶんこう直せばいいだろう」と推測して何かを実行することは絶対にない ── 常に
+「何が起きたか／何を直すべきか」を明示的にLLMへ返す、という一貫した設計方針がここにも表れている。
 
 ---
 
 ## 7. `prompts.py` — システムプロンプト構築
 
-`build_system_prompt(benchmark, sandbox_manual, include_example=True)` が、
-以下の3パーツを結合してシステムプロンプト全文を組み立てる:
+`build_system_prompt(benchmark, sandbox_manual, include_example=True)` が、以下の4パーツを
+文字列結合してシステムプロンプト全文を組み立てる。ファイル全体で120行、うち大半は
+定数として定義された素のテキストブロックで、ロジックは末尾の関数1つだけ。
 
-1. **`FRAMEWORK_EXPLANATION`** — Thought/Code/Observation ループのルール説明。
-   「コードは必ず1つの ```` ```python ... ``` ```` ブロックに全部入れて `<end_code>` で終える」
-   「ツールは必ずキーワード引数で呼ぶ（ただしこれは*助言*であり保証ではない、後述の
-   `mcp_client.py` の対策参照）」「Observationを絶対に自分で推測しない」など。
-2. **`sandbox_manual`** — `MCPToolProxy.manual_text()` から動的に生成される、
-   現在接続中のMCPサーバーが持つツール一覧とシグネチャ。**別のMCPサーバーに繋ぎ変えるだけで
-   この部分も自動的に変わる**ため、「未知のMCPサーバーでテストされる」という課題要件に対応できる。
-3. **`final_answer` の使い方の説明 + worked example**（`include_example=True` の場合）。
+### パーツ1: `FRAMEWORK_EXPLANATION`（両ベンチマーク共通、丸ごと固定文字列）
 
-`include_example` フラグは本番では常に `True` だが、`BENCHMARK_REPORT.md` の
-アブレーション実験（worked exampleを抜くと何が起きるか）のために存在する。
+```
+You are an autonomous coding agent. You solve tasks by repeating a strict
+Thought -> Code -> Observation loop:
+
+  Thought: briefly reason about what to try next.
+  Code: a single ```python ... ``` block ending with the literal token <end_code>.
+  (the sandbox executes your code and returns its result as an Observation)
+  Observation: you will be shown the sandbox's output/error for your code.
+
+Rules:
+- Put ALL of your reasoning in the Thought section, in plain text.
+- Put ALL executable code inside exactly one ```python ... ``` block per turn,
+  and end that block with <end_code> on its own line. Do not put code anywhere else.
+- Variables you define persist between turns - you do not need to redefine them.
+- Only the modules explicitly listed in the sandbox manual below may be imported.
+- Always call tools with keyword arguments matching their listed parameter names
+  exactly (e.g. run_tests(code=..., test_list=...)), never positional arguments.
+- You never get to see the result of your code until the next Observation -
+  never guess or invent an Observation yourself.
+- When you are confident you solved the task, call final_answer(...) with your
+  solution as described below. Calling it ends the loop immediately.
+- If the sandbox reports [NoCodeBlock], [SyntaxError], [SandboxViolation],
+  [Timeout], [MemoryLimitExceeded], or [TruncatedOutput], read the message
+  carefully and adjust your next Code block accordingly - never repeat the
+  exact same code after an error.
+```
+
+「必ずキーワード引数で呼べ」という指示は**あくまで助言**でしかない — モデルが位置引数で
+呼んできても壊れないように、実際の強制は `sandbox/mcp_client.py` の `_make_wrapper()` 側
+（Section 8.3）で保証されている。ここに書かれているルールと、コード側の防御が
+二重に噛み合っている一例。
+
+### パーツ2: `sandbox_manual`（呼び出し元から注入される、動的パート）
+
+`build_system_prompt()` 自身はツール名を1つも知らない。`sandbox_manual` 引数として
+`MCPToolProxy.manual_text()`（Section 8.3）の出力をそのまま受け取り、
+`## Available tools\n{sandbox_manual}\n\n` として埋め込むだけ。**別のMCPサーバーに繋ぎ変える
+だけでこの部分も自動的に変わる**ため、「未知のMCPサーバーでテストされる」という課題要件に
+そのまま対応できる。
+
+### パーツ3: `final_answer` の使い方（ベンチマークごとに完全に別文面）
+
+```python
+_MBPP_FINAL_ANSWER = """\
+Call final_answer(code) exactly once, where `code` is a string containing the
+complete Python function that solves the task (matching the given function
+signature). Example: final_answer("def add(a, b):\\n    return a + b")
+
+As soon as run_tests(...) reports {"success": true}, call final_answer with
+that exact code immediately in your NEXT turn - do not re-verify a solution
+that already passed, and do not keep exploring alternatives. Every extra turn
+spends part of your limited token and iteration budget.
+"""
+
+_SWEBENCH_FINAL_ANSWER = """\
+Call final_answer(get_patch()) exactly once, once you have verified your fix
+with run_tests(). get_patch() returns the unified git diff of every change you
+made to the repository - do not hand-write the patch yourself.
+"""
+```
+
+`_SWEBENCH_FINAL_ANSWER` の「`get_patch()`を呼べ、自分でパッチを手書きするな」という一文は
+地味だが重要 — LLMが差分を手で組み立てると、行番号やコンテキスト行のズレで `git apply`
+不能な壊れたdiffになりがちなので、必ずツール（`git diff` の薄いラッパー、Section 12）を
+経由させて機械的に正しいものだけを提出させている。
+
+`_MBPP_FINAL_ANSWER` の「テストが通ったら次のターンで即 `final_answer` を呼べ、再検証するな」
+という指示は、トークン予算・イテレーション予算をエージェント自身に節約させるための
+プロンプトレベルのガードレール。
+
+### パーツ4: worked example（`include_example=True` の場合のみ）
+
+MBPP用・SWE-bench用それぞれに、Thought→Code→Observationを1〜2ターン分そのまま書いた例が
+定数として埋め込まれている（`_MBPP_EXAMPLE`, `_SWEBENCH_EXAMPLE`）。例えばSWE-bench用は:
+
+````
+Thought: I need to find where `is_valid_email` is defined before changing it.
+Code:
+```python
+result = search_function_or_class_definition_in_code("is_valid_email")
+print(result)
+```
+<end_code>
+
+Observation: /testbed/src/mail.py:65 def is_valid_email(mail: str) -> bool:
+````
+
+この `include_example` フラグは本番の2つのCLIでは常に `True` で呼ばれるが、
+`BENCHMARK_REPORT.md` のアブレーション実験（同じ関数を `include_example=False` で呼び、
+worked exampleだけを抜いた「before」プロンプトを作る）のためにわざわざ引数化されている。
+Section 17で触れる通り、この1引数の有無だけで「`success: true` の意味」が根本的に変わる
+実験結果が出ている ── worked exampleが無いと、モデルはツール呼び出し結果を `print()` せずに
+コードを実行し続け、`sandbox_output` が空のまま `final_answer()` を呼んでしまう。
+
+### 組み立て本体
+
+```python
+def build_system_prompt(benchmark, sandbox_manual, include_example=True) -> str:
+    if benchmark == "mbpp":
+        final_answer_doc, example = _MBPP_FINAL_ANSWER, _MBPP_EXAMPLE
+    elif benchmark == "swebench":
+        final_answer_doc, example = _SWEBENCH_FINAL_ANSWER, _SWEBENCH_EXAMPLE
+    else:
+        raise ValueError(f"Unknown benchmark: {benchmark}")
+
+    prompt = (
+        f"{FRAMEWORK_EXPLANATION}\n"
+        f"## Available tools\n{sandbox_manual}\n\n"
+        f"## Submitting your solution\n{final_answer_doc}\n"
+    )
+    if include_example:
+        prompt += f"## {example}"
+    return prompt
+```
+
+未知の `benchmark` 文字列が来たら黙ってどちらかにフォールバックするのではなく即座に
+`ValueError` — システムプロンプトの中身を静かに間違えるくらいなら、起動直後にはっきり
+落ちたほうがいい、という判断。
 
 ---
 
@@ -495,17 +800,121 @@ Google AI Studio 用。構造が根本的に異なる（エンドポイントが
 
 ## 10. `config.py` — 環境変数とプロバイダ設定
 
-- `load_env()`: プロジェクトルートの `.env` を（一度だけ）読み込む。シェルで既に設定済みの
-  環境変数は上書きしない (`override=False`)。
-- `ProviderSpec`: 1プロバイダの静的定義（名前、base_url、APIキーの環境変数プレフィックス、
-  `kind`（`"openai_compatible"` か `"gemini"`））。`collect_api_keys()` が
-  `<PREFIX>_API_KEY`, `_2`, `_3`, ... を集める。
-- `KNOWN_PROVIDERS`: OpenRouter / Groq / Together / Fireworks / Google AI Studio の
-  レジストリ。
-- `resolve_provider(base_url)`: `--provider-url` を既知レジストリと前方一致で照合し、
-  ヒットしなければ **URLから `<HOST>_API_KEY` という環境変数名を自動生成**した
-  `ProviderSpec` を即席で作る。これにより「新しいプロバイダを追加するのにコード変更は不要、
-  対応する環境変数を用意するだけでよい」という Section 5.6 の要求を満たす。
+冒頭のdocstringが明言する通り、このファイルの存在理由は「`os.environ` に直接触るコードを
+このファイル1つに集約し、他のどこにもAPIキーをハードコードさせないための建て付け」そのもの。
+108行で `load_env()` / `ProviderSpec` / `KNOWN_PROVIDERS` / `resolve_provider()` の4点だけ。
+
+### `load_env()` — 冪等な `.env` 読み込み
+
+```python
+_ENV_LOADED = False
+
+def load_env() -> None:
+    global _ENV_LOADED
+    if _ENV_LOADED:
+        return
+    env_path = Path(__file__).resolve().parent / ".env"
+    load_dotenv(dotenv_path=env_path, override=False)
+    _ENV_LOADED = True
+
+load_env()  # モジュールがimportされた瞬間に1回だけ実行される
+```
+
+`override=False` が地味に重要 — CIやDocker実行時にシェル側で既に環境変数がセットされている場合、
+リポジトリに置かれた `.env` の値で**上書きしてしまわない**。モジュールレベルの `_ENV_LOADED`
+フラグでプロセス内では1回しか読み込まない（`config` を複数箇所からimportしても`python-dotenv`
+を何度も叩かない）。
+
+### `ProviderSpec` — 1プロバイダの静的定義とキー収集
+
+```python
+@dataclass(frozen=True)
+class ProviderSpec:
+    name: str
+    base_url: str
+    api_key_env_prefix: str
+    kind: str = "openai_compatible"  # or "gemini"
+
+    def collect_api_keys(self) -> List[str]:
+        keys = []
+        primary = os.environ.get(self.api_key_env_prefix)
+        if primary:
+            keys.append(primary)
+        index = 2
+        while True:
+            value = os.environ.get(f"{self.api_key_env_prefix}_{index}")
+            if not value:
+                break
+            keys.append(value)
+            index += 1
+        return keys
+```
+
+`collect_api_keys()` は「複数トークンのローテーションが必須」という要件をここ1箇所で
+満たしている。例えば `.env` に
+
+```
+GROQ_API_KEY=key_a
+GROQ_API_KEY_2=key_b
+GROQ_API_KEY_3=key_c
+```
+
+と書けば `collect_api_keys()` は `["key_a", "key_b", "key_c"]` を返す。これが
+`llm/client.py`（Section 9.2）の `LLMClient` に渡り、1つのキーがレート制限に当たっても
+別のキーへ自動的にローテーションする土台になる。番号が飛んでいる（`_2` は無いが `_3` は
+ある、など）場合は `_2` が見つからなかった時点でループが止まるので、そこで収集は打ち切られる
+——「歯抜けの番号は末尾切り捨て」という単純な仕様。
+
+### `KNOWN_PROVIDERS` — 既知の無料枠プロバイダのレジストリ
+
+```python
+KNOWN_PROVIDERS: List[ProviderSpec] = [
+    ProviderSpec("openrouter", "https://openrouter.ai/api/v1", "OPENROUTER_API_KEY", "openai_compatible"),
+    ProviderSpec("groq", "https://api.groq.com/openai/v1", "GROQ_API_KEY", "openai_compatible"),
+    ProviderSpec("together", "https://api.together.xyz/v1", "TOGETHER_API_KEY", "openai_compatible"),
+    ProviderSpec("fireworks", "https://api.fireworks.ai/inference/v1", "FIREWORKS_API_KEY", "openai_compatible"),
+    ProviderSpec("google_ai_studio", "https://generativelanguage.googleapis.com/v1beta", "GOOGLE_AI_STUDIO_API_KEY", "gemini"),
+]
+```
+
+5行のリテラルなリストで、新しいプロバイダを"公式サポート"扱いにしたければここに1行足すだけ。
+`kind` フィールドが `"openai_compatible"` か `"gemini"` かで、`llm/client.py` がどちらの
+`ChatProvider` 実装（Section 9.3 / 9.4）を使うかが決まる。
+
+### `resolve_provider(base_url)` — 未知のプロバイダも自動サポート
+
+```python
+def _env_var_from_url(base_url: str) -> str:
+    host = re.sub(r"^https?://", "", base_url).split("/")[0]
+    host = re.sub(r"[^a-zA-Z0-9]+", "_", host).strip("_").upper()
+    return f"{host}_API_KEY"
+
+def resolve_provider(base_url: str) -> ProviderSpec:
+    normalized = base_url.rstrip("/")
+    for spec in KNOWN_PROVIDERS:
+        spec_url = spec.base_url.rstrip("/")
+        if normalized == spec_url or normalized.startswith(spec_url):
+            return spec
+    return ProviderSpec(
+        name=normalized, base_url=base_url,
+        api_key_env_prefix=_env_var_from_url(base_url), kind="openai_compatible",
+    )
+```
+
+`--provider-url` が `KNOWN_PROVIDERS` のどれとも前方一致しなければ、URLのホスト名から
+機械的に環境変数名を組み立てて即席の `ProviderSpec` を作る。具体例:
+
+```
+--provider-url "https://api.novita.ai/v3/openai"
+  → host = "api.novita.ai"
+  → api_key_env_prefix = "API_NOVITA_AI_API_KEY"
+```
+
+つまり「新しいプロバイダを追加するのにコード変更は一切不要、`.env` に対応する環境変数を
+1つ用意するだけでよい」という Section 5.6 の要求を、コードを1行も書かずに満たしている。
+ただし `kind` は常に `"openai_compatible"` に固定されるため、Geminiのような非互換API構造の
+プロバイダを未知のURLとして渡した場合は動かない — これは仕様として妥当なトレードオフで、
+「本当に異なるワイヤ形式」は `KNOWN_PROVIDERS` に明示的に登録するしかない設計になっている。
 
 ---
 
@@ -558,50 +967,105 @@ task.json 読み込み・バリデーション（Pydanticモデルへ）
 
 ## 12. `mcp_tools_mbpp.py` / `mcp_tools_swebench.py` — MCP ツールサーバー
 
-どちらも `mcp.server.fastmcp.FastMCP` を使い、`@mcp.tool()` デコレータでツールを定義する
-別プロセス。`--http <port>` を渡せば streamable HTTP、渡さなければ stdio で待ち受ける。
+エージェント本体（`orchestrator.py`＋`sandbox/`）から見ると、これらは「MCPサーバーという
+名の**別プロセス**」でしかない。どちらも `mcp.server.fastmcp.FastMCP` を使い、
+`@mcp.tool()` デコレータを付けた素のPython関数を1つ書くだけで、それが自動的にJSON Schema付きの
+MCPツールとして公開される。`--http <port>` を渡せば streamable HTTP、渡さなければ stdio
+（標準入出力）で待ち受ける——起動オプション以外の設計思想は2ファイルで大きく異なる。
 
-### `mcp_tools_mbpp.py`
+### `mcp_tools_mbpp.py`（109行、ツールは1個だけ）
 
-ツールは `run_tests(code, test_list) -> str` の1つだけ（Section 4.3.2）。
+MBPPは「短い関数を書いて、公開テストが通るか確認する」だけのタスクなので、ツールは
+`run_tests(code: str, test_list: List[str]) -> str` のたった1つ（Section 4.3.2）。中身は
+候補コードを**もう一段サンドボックスに包んで**実行する、という構造になっている:
 
-- 候補コード + assertion群 + 秘密のマーカー文字列（`secrets.token_hex(16)` 由来、
-  推測不可能にすることで候補コードが `print()` で偽装するのを防ぐ）を1つのPythonスクリプトに
-  連結し、**エージェント本体が使うのとは別の、使い捨てのサンドボックス**
-  （`allowed_directories=[]`、10秒タイムアウト）で実行する。
-  これにより候補コードはMCPサーバー自身のホストファイルシステムやネットワークに一切触れない。
-- マーカーが出力に含まれていれば成功と判定し、`{"success": bool, "output": str}` の
-  JSON文字列を返す。
-- `_test_imports()` が `AGENT_SMITH_TEST_IMPORTS` 環境変数から `test_imports` を読み、
-  候補コードの前に自動的に前置する。
+```python
+@mcp.tool()
+def run_tests(code: str, test_list: List[str]) -> str:
+    imports_prefix = "\n".join(_test_imports())
+    marker = f"__AGENT_SMITH_MBPP_PASS_{secrets.token_hex(16)}__"
+    full_code = (
+        (imports_prefix + "\n" if imports_prefix else "")
+        + code
+        + "\n"
+        + "\n".join(test_list)
+        + f"\nprint({marker!r})"
+    )
+    sandbox = Sandbox(SandboxConfig(
+        authorized_imports=DEFAULT_AUTHORIZED_IMPORTS,
+        allowed_directories=[],       # ← ファイルアクセスは一切許可しない
+        max_execution_time_seconds=10,
+        max_memory_mb=256,
+    ))
+    output = sandbox.run(full_code)
+    ...
+    success = marker in output
+    return json.dumps({"success": success, "output": output})
+```
 
-### `mcp_tools_swebench.py`
+ここで起きていることを順に追うと分かりやすい:
 
-必須9ツールをすべて実装（Section 4.5）。**Docker固有のロジックは一切持たない** ──
-`TESTBED_PATH` 環境変数さえ設定されていれば、ホスト上のベアなチェックアウトでも、
-コンテナの中でも同じように動く。
+1. **候補コード + テストのassert文 + 予測不可能なマーカー文字列**を1つのPythonスクリプトに
+   連結する。マーカーは `secrets.token_hex(16)`（暗号論的に安全な乱数）から作られるので、
+   候補コードが `print("__AGENT_SMITH_MBPP_PASS__")` のようなハードコードで偽装することは
+   事実上不可能。
+2. それを**エージェント本体が使うのとは別の、使い捨ての `Sandbox` インスタンス**
+   （`allowed_directories=[]` — ファイルアクセスなし、10秒タイムアウト）で実行する。
+   つまり「候補コードを検証するためのコード」自体が、エージェント本体と全く同じ
+   多層防御（Section 8）の中で動く——LLMが書いたコードは`run_tests`を介しても
+   MCPサーバー自身のホストファイルシステムやネットワークには一切触れられない。
+3. 全部の `assert` 文を通過すれば最後の `print(marker)` まで到達し、出力にマーカー文字列が
+   含まれる。含まれていれば `success: true`。1つでも `assert` が失敗すれば例外でスクリプトが
+   途中終了し、マーカーは出力されない＝`success: false`。
+4. `_test_imports()` が環境変数 `AGENT_SMITH_TEST_IMPORTS`（`agent_mbpp.py` が
+   `MBPPTaskInput.test_imports` から詰め込んだJSON文字列、Section 11参照）を読み、
+   候補コードの**前**に自動的に前置する。これが無いと、テストのassertion側だけが必要とする
+   import（例: `math.isclose` を使うテスト）を、候補コード自身がたまたま書いていない限り
+   `NameError` になる——実際に427タスク中13タスクでこれが問題になっていたと
+   `BENCHMARK_REPORT.md` に記録がある。
 
-| カテゴリ | ツール | 補足 |
-|---|---|---|
-| ファイルシステム | `read_file(filepath, start_line, end_line)` | `cat -n` 風に行番号付きで返す |
-| | `edit_file(filepath, old_str, new_str)` | 完全一致文字列を1箇所だけ置換。`.py`なら編集後に `py_compile` で構文チェックし、壊れたら `[EditSyntaxError]` を明示的に返す（Section 4.1の必須フィードバック） |
-| | `list_files(directory, pattern)` | 非再帰デフォルト、`**/` プレフィックスで再帰 |
-| コード検索 | `search_code(pattern, file_pattern)` | grep風の正規表現検索、`path:line content` 形式で返す |
-| | `search_function_or_class_definition_in_code(name)` | `search_code` の定義検索特化ラッパー |
-| | `find_references(name, filepath, line)` | 定義位置自体を結果から除外できる |
-| 実行系 | `run_command(command, workdir)` | シェルコマンド実行、120秒タイムアウト、SIGTERM→SIGKILLで確実に終了させる |
-| | `run_tests()` | `AGENT_SMITH_EVAL_SCRIPT`（無ければ `<testbed>/eval.sh`）を `run_command` 経由で実行 |
-| | `get_patch()` | `git -c core.fileMode=false diff` の出力をそのまま返す（Section 4.4） |
+### `mcp_tools_swebench.py`（411行、必須9ツールすべて）
 
-- **パスの脱出防止**: `_resolve_within_testbed()` が絶対パス化・`resolve()` した上で
-  `TESTBED_PATH` の配下かどうかを検証し、外れていれば例外にする。`list_files`/`search_code` の
-  glob展開結果も同様にチェックする（`_matching_files`）。
+SWE-benchは実リポジトリの調査・修正が必要なので、ツール数も複雑さも桁違い。しかし設計の芯は
+1つ: **`TESTBED_PATH` 環境変数さえ設定されていれば動く**、Docker固有のロジックを一切持たない
+プレーンなファイルシステム/subprocess操作の集合体、という点（Section 4.4）。同じコードが
+ホスト上のベアなチェックアウトでも、コンテナの中でも変わらず動く。
+
+| カテゴリ | ツール | シグネチャ | 補足 |
+|---|---|---|---|
+| ファイルシステム | `read_file` | `(filepath, start_line=1, end_line=None)` | `cat -n` 風に `"<行番号>: <内容>"` を1行ずつ返す |
+| | `edit_file` | `(filepath, old_str, new_str)` | 完全一致文字列を**必ず1箇所だけ**置換（0箇所や複数箇所ヒットは `[Error]`）。`.py`なら編集後に `python3 -m py_compile` で構文チェックし、壊れたら `[EditSyntaxError]` を返す |
+| | `list_files` | `(directory, pattern="*")` | 非再帰がデフォルト、`pattern="**/*.py"` のように `**/` を付けると再帰 |
+| コード検索 | `search_code` | `(pattern, file_pattern="*.py")` | grep風の正規表現検索、`"<絶対パス>:<行番号> <行内容>"` 形式 |
+| | `search_function_or_class_definition_in_code` | `(name)` | `search_code` に `r"^\s*(?:async\s+def|def|class)\s+{name}\b"` を渡す定義検索特化ラッパー |
+| | `find_references` | `(name, filepath="", line=0)` | `\bname\b` で全ヒットを取り、`filepath`+`line`が定義位置と一致する行だけ結果から除外する |
+| 実行系 | `run_command` | `(command, workdir="")` | シェルコマンドを`shell=True`で実行、120秒タイムアウト。`start_new_session=True`でプロセスグループごと`SIGTERM`→2秒待って`SIGKILL`と、確実に終了させる二段構え |
+| | `run_tests` | `()` | `AGENT_SMITH_EVAL_SCRIPT`（無ければ`<testbed>/eval.sh`）を`run_command`経由で`bash`実行するだけの薄いラッパー |
+| | `get_patch` | `()` | `git -c core.fileMode=false diff` の標準出力をそのまま返す（Section 4.4） |
+
+いくつかの実装ディテールに、実際に踏んだ地雷の跡が見える:
+
+- **パスの脱出防止** (`_resolve_within_testbed()`): 引数のパスを絶対パス化・`Path.resolve()`
+  した上で `TESTBED_PATH` の配下かどうかを検証し、外れていれば `ValueError` にする。
+  `list_files`/`search_code` の**glob展開結果**も `_matching_files()` が同じチェックを
+  かける——シンボリックリンクや `../` を含むパターンで `TESTBED_PATH` の外を読ませようとする
+  経路を塞ぐため。`_validate_glob_pattern()` は `pattern` 自体が絶対パスだったり `..` を
+  含んでいたりする段階で先に拒否する。
+- **`edit_file` の「完全一致1箇所のみ」制約**: `old_str` が0回ヒットなら `[Error] old_str
+  not found`、2回以上ヒットなら `[Error] old_str is not unique ... include more context` と
+  返す。曖昧な置換を許すと「LLMが意図した箇所と違う場所を書き換えてしまう」事故につながるため、
+  **あいまいさを検出したら実行せず、LLMに前後関係を増やして書き直させる**という設計。
+- **`run_command` の二段階kill**: `SIGTERM` を送って2秒待ち、まだ生きていれば `SIGKILL`。
+  `os.killpg` でプロセスグループ全体（コマンドがさらに子プロセスを産んでいた場合も含む）を
+  対象にしているので、`sleep 999 & sleep 999 &` のような多重子プロセスを起動するコマンドでも
+  タイムアウト後に取りこぼしなく終了させられる。
 - **出力サイズの上限** `_cap_output()`（20,000文字、`SandboxConfig.max_output_chars` と
-  同スケール）: これが無いと、巨大リポジトリでの検索や冗長なテスト出力が
+  同スケール）: これが無いと、巨大リポジトリでの `search_code` や冗長なテスト出力が
   SWE-benchの累積300,000トークン予算を1ステップで大きく消費しかねない。
-  ただし **`get_patch()` だけは例外**で切り詰めない ── その返り値は
-  `final_answer(get_patch())` の直接の引数になりうるため、切り詰めると
-  壊れた（適用不能な）diffをそのまま提出してしまうことになるから。
+  ただし **`get_patch()` だけは意図的にこの関数を通さない**——その返り値は
+  `final_answer(get_patch())` の直接の引数になりうるため、切り詰めると壊れた（`git apply`
+  不能な）diffをそのまま提出してしまうことになるから。関数のdocstringにもその理由が
+  明記されている。
 
 ---
 
@@ -648,25 +1112,159 @@ task.json 読み込み・バリデーション（Pydanticモデルへ）
 
 ## 14. 設定ファイル・補助ファイル
 
-- **`pyproject.toml`**: `uv` で管理。ランタイム依存は `pydantic`, `python-dotenv`,
-  `requests`, `mcp`, `docker` の5つのみ。開発依存として `flake8`, `mypy`, `pytest`。
-  `[project.scripts] sandbox = "sandbox.cli:main"` により `uv run sandbox` が使えるようになる。
-  `requires-python = "==3.10.*"` に固定。
-- **`Makefile`**: `install`/`run`（`agent_mbpp --help`）/`debug`（`pdb`経由）/`sandbox`/
-  `clean`/`fclean`/`lint`/`lint-strict`/`test` のショートカット。
-- **`.env.example`**: 各プロバイダのAPIキー環境変数のテンプレート。`_2`, `_3` サフィックスで
-  複数キーを登録できることがコメントで明記されている。実運用の `.env` は `.gitignore` されており
-  「ソースにキーをハードコードすることは即セキュリティ違反」と明記。
-- **`sandbox_template.json`**: `SandboxConfig` のJSON表現の実例。デフォルトの
-  `DEFAULT_AUTHORIZED_IMPORTS`/`DEFAULT_ALLOWED_DIRECTORIES` と同内容。
-- **`conftest.py`**: pytest がどこから呼ばれてもプロジェクトルートを `sys.path` に
-  追加するだけの小さなブートストラップ。
-- **`.flake8`**: flake8 の設定（詳細は個別ファイル参照）。
-- **`cache/`**: `dump` してきたタスクJSONや生成した`solution.json`の一時置き場
-  （`.gitkeep` のみコミット対象）。
-- **`solutions/`**: `BENCHMARK_REPORT.md` の実測結果として得られた15本の `solution.json`
-  （＋アブレーション実験の1本、＋タスク定義そのもの）が証跡として保存されている。
-  命名規則は `<provider>_<model>_<task>.json`。
+### `pyproject.toml` — 依存関係とプロジェクトメタデータ
+
+```toml
+[project]
+requires-python = "==3.10.*"
+
+dependencies = [
+    "pydantic>=2.13.5",
+    "python-dotenv>=1.2.3",
+    "requests>=2.34.2",
+    "mcp>=1.2.0,<2",
+    "docker>=7.1.0",
+]
+
+[dependency-groups]
+dev = ["flake8>=7.3.0", "mypy>=2.3.1", "pytest>=9.1.1"]
+
+[project.scripts]
+sandbox = "sandbox.cli:main"
+
+[tool.uv.build-backend]
+module-name = "sandbox"
+module-root = ""
+```
+
+`uv` で管理されており、ランタイム依存はわずか5つ——`pydantic`（モデル契約）、
+`python-dotenv`（`.env`読み込み）、`requests`（LLM API呼び出し）、`mcp`（MCPクライアント/
+サーバーSDK）、`docker`（`docker_runner.py`用の`docker-py`）。依存が少ないほど攻撃対象面
+（サプライチェーンリスク）も小さくなる、という意図が読み取れる。`requires-python = "==3.10.*"`
+はレンジ指定ではなく**ピン留め**——`match`文の有無やasyncioの挙動差など、マイナーバージョンの
+違いがサンドボックス（Section 8）のような低レベルなコードの挙動に影響しうるため、
+「動作確認したバージョンだけを保証する」という選択。`[project.scripts]` の1行により
+`uv run sandbox` というコマンドが使えるようになる仕組みも、実体は`sandbox/cli.py`の`main()`
+関数を指すエントリポイント定義でしかない。
+
+### `Makefile` — よく使う操作のショートカット
+
+```makefile
+install:
+	uv sync
+
+run:
+	uv run python -m agent_mbpp --help
+
+debug:
+	uv run python -m pdb -m agent_mbpp --help
+
+sandbox:
+	uv run sandbox
+
+lint:
+	uv run flake8 --exclude=.venv .
+	uv run mypy --exclude .venv --exclude models.py --explicit-package-bases \
+		--warn-return-any --warn-unused-ignores --ignore-missing-imports \
+		--disallow-untyped-defs --check-untyped-defs .
+
+test:
+	uv run pytest -v
+```
+
+`lint` が `mypy` に渡している大量のフラグに設計判断が見える: `--exclude models.py` は
+「moulinetteからのコピーなので型エラーがあってもこちらでは直さない（直せない）」という
+Section 4の「形は編集禁止」ルールがそのままツール設定にも反映されたもの。
+`--disallow-untyped-defs --check-untyped-defs` は「型注釈のない関数を書かせない」厳格運用。
+`lint-strict`（Makefile末尾近く）はさらに `mypy --strict` を使う、より厳しい別バリアント。
+`clean`/`fclean` は `__pycache__`・`.mypy_cache`・`.venv` などの掃除で、`fclean` が
+`.venv` ごと消す（`fclean: clean` のあとに `rm -rf .venv` を実行、Makefileの依存チェーンで
+`clean` を先に走らせてから追加で消す構造）。
+
+### `.env.example` — 環境変数テンプレート
+
+```
+# Copy this file to .env and fill in real keys. .env is gitignored - never commit real
+# keys, and never hardcode them in source (instant security failure per Section 6.3).
+#
+# Multi-token management (Section 5.6.1): add _2, _3, ... suffixes for extra keys
+# per provider; the LLM client rotates between them automatically.
+
+OPENROUTER_API_KEY=
+OPENROUTER_API_KEY_2=
+
+GROQ_API_KEY=
+
+TOGETHER_API_KEY=
+FIREWORKS_API_KEY=
+GOOGLE_AI_STUDIO_API_KEY=
+```
+
+キーの値は書かれていない、いわば「穴埋め用の空フォーム」。`config.py`（Section 10）の
+`ProviderSpec.api_key_env_prefix` と1対1で対応する変数名になっているので、このファイルを見れば
+`config.py` のどのプロバイダがサポート対象か一目で分かる。コメントの「`.env`は
+gitignore済み、ソースへのハードコードは即セキュリティ違反」という一文は、Section 9.4の
+Geminiキー漏洩インシデントが実際に起きたあとに重みを増す注記。
+
+### `sandbox_template.json` — `SandboxConfig` のJSON実例
+
+```json
+{
+  "authorized_imports": [
+    "math", "math.*", "collections", "collections.*", "itertools", "re", "json",
+    "typing", "typing.*", "functools", "operator", "heapq", "bisect", "copy",
+    "string", "random", "datetime", "datetime.*", "array", "cmath"
+  ],
+  "allowed_directories": ["/testbed", "/tmp/agent"],
+  "max_execution_time_seconds": 30,
+  "max_memory_mb": 512,
+  "max_output_chars": 20000
+}
+```
+
+これは `sandbox/executor.py` の `DEFAULT_AUTHORIZED_IMPORTS`/`DEFAULT_ALLOWED_DIRECTORIES`
+と同じ内容をJSONとして書き出したもので、`uv run sandbox sandbox_template.json`
+（Section 8.4）に渡す設定例として、また「`SandboxConfig`のフィールドをJSONでどう表現するか」の
+リファレンスとして機能する。ホワイトリストの中身自体も観察に値する——`os`, `sys`, `subprocess`,
+`socket` のようなI/O系モジュールは1つも含まれておらず、`math`/`itertools`/`collections`
+のような**純粋な計算用ライブラリ**だけに絞られている。`random` が入っているのは意外に見えるが、
+MBPPのアルゴリズム問題には乱数を使う解法もあるため、危険度と必要性を天秤にかけた結果の許可。
+
+### `conftest.py` — pytestブートストラップ
+
+```python
+"""Ensures the project root is importable regardless of how pytest is invoked."""
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+```
+
+たった5行。`sample/`をカレントディレクトリにせず、リポジトリのどこから`pytest`を呼んでも
+`from models import ...`のような絶対importが解決できるようにするためだけの存在。
+
+### `.flake8`
+
+```ini
+[flake8]
+max-line-length = 110
+extend-exclude = .venv,models.py
+```
+
+`max-line-length = 110`はPEP8標準の79より緩め——サンドボックス周りのコメントや正規表現が
+長くなりがちな実態に合わせた現実的な妥協。`models.py`の除外理由は`Makefile`の`mypy`設定と同じ
+（moulinetteからのコピーは自分たちのスタイルルールの対象外）。
+
+### `cache/` と `solutions/` — 生成物置き場
+
+- **`cache/`**: `dump`してきたタスクJSON（`mbpp_task.json`など）や、実行結果の`solution.json`
+  を一時的に置くためのディレクトリ。中身自体はコミット対象外で、`.gitkeep`だけがGitに
+  含まれている（空ディレクトリでもディレクトリ構造自体はリポジトリに残したいという意図）。
+- **`solutions/`**: こちらは逆に**実測結果を証跡として意図的にコミットしている**ディレクトリ。
+  `BENCHMARK_REPORT.md`（Section 17）の裏付けとなる15本の`solution.json`（＋アブレーション
+  実験用の1本、＋元になったタスク定義そのもの）が並んでいる。命名規則は
+  `<provider>_<model>_<task>.json`で、どのプロバイダ・モデル・タスクの組み合わせの結果かが
+  ファイル名だけで分かるようになっている。
 
 ---
 
@@ -687,6 +1285,58 @@ task.json 読み込み・バリデーション（Pydanticモデルへ）
 | `test_mcp_tools_swebench.py` | 必須9ツールを、`TESTBED_PATH`直下に作った小さな偽リポジトリに対して検証 |
 | `test_agent_startup.py` | 両エージェントCLIの起動時エラー処理とシャットダウン処理 |
 | `test_edge_cases.py` | 各コンポーネント共通の境界値・不正入力ケース |
+
+### `test_sandbox.py` の内訳（テスト名がそのまま脅威モデルの一覧になっている）
+
+Section 8.1で見たエスケープ対策1つ1つに、それをピンポイントで殺そうとするテストが対応している:
+
+```
+test_authorized_import_is_allowed
+test_unauthorized_import_is_blocked
+test_dynamic_import_bypass_is_blocked          # __import__("os") のような関数呼び出し経由
+test_private_module_reference_escape_is_blocked # random._os のような非公開の入れ子モジュール
+test_public_unauthorized_nested_module_is_blocked
+test_operator_attrgetter_private_attribute_bypass_is_blocked
+test_vars_builtin_and_star_import_are_blocked
+test_subclasses_escape_via_dot_attribute_is_blocked      # ().__class__.__bases__[0].__subclasses__()
+test_subclasses_escape_via_getattr_is_blocked            # getattr(obj, "__subclasses__")
+test_subclasses_escape_via_dynamically_built_name_is_blocked  # getattr(obj, "__sub"+"classes__")
+test_globals_attribute_access_is_blocked                 # obj.__init__.__globals__
+test_setattr_on_dangerous_dunder_is_blocked
+test_format_attribute_escape_is_blocked                  # "{0.__class__}".format(x)
+test_formatter_field_escape_is_blocked
+test_common_dunders_still_work_for_legitimate_code        # 過剰ブロックしていないことの回帰確認
+test_reserved_namespace_names_cannot_override_sandbox_controls
+test_isolated_worker_cannot_see_host_root_files
+test_variables_persist_between_calls
+test_final_answer_raises_and_carries_value
+test_filesystem_restriction_blocks_outside_paths
+test_timeout_interrupts_infinite_loop
+test_memory_limit_is_enforced
+```
+
+`test_subclasses_escape_via_*` が3種類（dot記法／`getattr`／動的組み立て名）に分かれているのは、
+Section 8.1で説明した「静的AST拒否だけでは `getattr` 経由のバイパスを防げず、動的パッチだけでは
+文字列連結で名前を組み立てるケースを防げない」という多層防御が、実際にテストレベルでも
+1対1に対応していることの証拠。`test_common_dunders_still_work_for_legitimate_code`
+の存在も重要 — 防御を固めすぎて `__init__`/`__eq__`/`__iter__` のような正当な用途まで
+壊していないか、という**過剰ブロックの回帰テスト**も同じファイルに同居している。
+
+### `test_gemini_provider.py` — キー漏洩防止の専用テスト
+
+Section 9.4 のキー漏洩インシデントを踏まえて作られた3テスト:
+
+```
+test_http_error_message_never_contains_the_api_key
+test_connection_error_message_never_contains_the_api_key
+test_successful_call_still_works
+```
+
+前者2つは、`requests` が投げる `HTTPError`/`ConnectionError` を偽の異常応答で意図的に
+発生させ、そのメッセージ文字列に `?key=...` の値が**含まれていないこと**を assert する
+（`assert fake_api_key not in str(exc)` のような形）。3つ目は「キーを隠す対策のせいで
+正常系のレスポンス処理まで壊していないか」の回帰確認 — ここでも「防御を追加したら、
+正常系を壊していないかのテストも必ずセットで書く」という同じパターンが繰り返されている。
 
 ---
 
