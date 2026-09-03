@@ -1,108 +1,54 @@
-"""Agent/Orchestrator: the Thought -> Code -> Observation loop (Section 4.1).
+"""エージェント/オーケストレータ: Thought -> Code -> Observationループ本体(セクション4.1)。
 
-Shared verbatim between agent_mbpp.py and agent_swebench.py - only the system
-prompt, sandbox configuration, connected MCP server, and how final_answer's
-argument becomes SolutionOutput.solution differ between the two benchmarks.
+agent_mbpp.pyとagent_swebench.pyの間でそのまま共有される - 両ベンチマーク間で異なるのは
+システムプロンプト、サンドボックス設定、接続するMCPサーバ、そしてfinal_answer()の引数が
+どうSolutionOutput.solutionになるかだけである。
 """
-# ============================================================================
-# 【日本語解説】このファイルの立ち位置
-# ============================================================================
-# 234行、クラス1個＋ヘルパー関数2個＋例外1個というコンパクトな構成。
-# インポートを見ると役割分担がそのまま見える:
-#   - code_extraction.extract_code   … LLM出力からコードを抜き出す
-#   - llm.client.LLMClient           … LLMを呼ぶ
-#   - models.SolutionOutput/StepMetrics … 結果を型にまとめる（契約）
-#   - sandbox.executor.Sandbox/FinalAnswer … コードを実行する
-# Orchestrator自身はこの4役だけを指揮する「指揮者」で、それぞれの実処理は
-# 一切持たない。MBPP/SWE-benchどちらのエージェントも、このファイルを
-# 一字一句同じまま使う——違いはシステムプロンプト・サンドボックス設定・
-# 接続するMCPサーバーだけ。
-# ============================================================================
-from __future__ import annotations
+from __future__ import annotations  # 型注釈を文字列として遅延評価する(将来のアノテーション構文をサポート)
 
-import json
-import time
-from dataclasses import dataclass, field
-from datetime import datetime
-from typing import List, Optional
+import json  # メッセージ列をシリアライズしてバイト長を測るために使用
+import time  # 経過時間の計測に使用
+from dataclasses import dataclass, field  # 設定用データクラスの定義に使用
+from datetime import datetime  # 結果に付与するタイムスタンプ生成用
+from typing import List, Optional  # 型注釈のため
 
-from code_extraction import extract_code
-from llm.client import AllProvidersExhaustedError, LLMClient
-from models import SolutionOutput, StepMetrics
-from sandbox.executor import FinalAnswer, Sandbox
+from code_extraction import extract_code  # LLM出力からコードブロックを抽出するユーティリティ
+from llm.client import AllProvidersExhaustedError, LLMClient  # LLMクライアントと、全プロバイダが失敗した際の例外
+from models import SolutionOutput, StepMetrics  # 最終結果・各ステップの計測値のデータモデル
+from sandbox.executor import FinalAnswer, Sandbox  # サンドボックス実行環境と、final_answer()が投げる例外
 
 
 class ShutdownRequested(BaseException):
-    """Raised by request_stop() at the exact point a SIGTERM was delivered.
+    """request_stop()がSIGTERM受信のまさにその瞬間に送出する例外。
 
-    Deliberately a BaseException, not an Exception: Sandbox.run()'s generic
-    ``except Exception`` (and requests/urllib3's own internal error handling)
-    must never swallow it, or a SIGTERM arriving mid-LLM-call/mid-sandbox-exec
-    would silently do nothing until that call finishes on its own - which can
-    take longer than the ~10s grace period external harnesses (e.g.
-    moulinette's run-agent) give between SIGTERM and SIGKILL, causing SIGKILL
-    to hit first and skip agent_swebench.py's `finally: container.cleanup()`.
-    Raising immediately, in the signal handler itself, interrupts a blocked
-    call right away (the same technique - and the same reason - as
-    sandbox/executor.py's own SIGALRM handler raising SandboxTimeoutError).
+    意図的にExceptionではなくBaseExceptionを継承している: Sandbox.run()の汎用的な
+    ``except Exception``(およびrequests/urllib3自身の内部エラー処理)がこれを
+    誤って握りつぶしてはならないため。LLM呼び出し中/サンドボックス実行中に
+    SIGTERMが届いた場合、その呼び出しが自然に終わるまで何もしないままでは、
+    外部のハーネス(例: moulinetteのrun-agentコマンド)がSIGTERMとSIGKILLの間に
+    与える猶予期間(約10秒)より長くかかってしまうことがあり、その結果SIGKILLが
+    先に命中してagent_swebench.pyの`finally: container.cleanup()`がスキップ
+    されてしまう。シグナルハンドラ自身の中で即座に例外を送出することで、
+    ブロックされている呼び出しをすぐに中断させる(sandbox/executor.py自身の
+    SIGALRMハンドラがSandboxTimeoutErrorを送出するのと同じ技法・同じ理由による)。
     """
-    # -------------------------------------------------------------------
-    # 【日本語解説】なぜ Exception ではなく BaseException を継承するのか
-    # -------------------------------------------------------------------
-    # SIGTERMは「プロセスに終了してくれと頼む信号」。moulinette（採点
-    # システム）はSIGTERMを送ったあと、約10秒だけ待ってそれでも終わら
-    # なければSIGKILL（問答無用の即死、後始末する隙を与えない）を送る。
-    #
-    # もしこの例外が普通の Exception だったら、LLM API呼び出し中や
-    # サンドボックス実行中に多用されている汎用の except Exception:（例:
-    # Sandbox.run() 内部や requests/urllib3 のエラーハンドリング）に
-    # 握りつぶされてしまい、SIGTERMが届いても「その処理が自然に終わるまで」
-    # 何も起きない。それが10秒を超えたらSIGKILLが先に来て、
-    # agent_swebench.py の finally: container.cleanup()（Dockerコンテナの
-    # 後片付け）が実行されないままプロセスごと消されてしまう。
-    #
-    # BaseException を直接継承しておけば、except Exception では捕まらず
-    # スルーされるため、request_stop() が呼ばれた瞬間にどこで実行中でも
-    # 即座にこの例外が上（agent_*.py側のtry/except/finally）まで伝播する。
-    # -------------------------------------------------------------------
 
 
 @dataclass
 class OrchestratorConfig:
-    # -------------------------------------------------------------------
-    # 【日本語解説】OrchestratorConfig = 予算の入れ物
-    # -------------------------------------------------------------------
-    # イテレーション数・入力トークン・出力トークン・時間という4種類の予算と、
-    # stop_sequences（後述）をまとめた設定。agent_mbpp.py/agent_swebench.py
-    # がこの値をベンチマークごとに変えて渡す
-    #   MBPP     : max_iterations=10,  max_input_tokens=6,000,   ...
-    #   SWE-bench: max_iterations=30,  max_input_tokens=300,000, ...
-    # -------------------------------------------------------------------
-    max_iterations: int
-    max_input_tokens: int
-    max_output_tokens: int
-    max_time_seconds: float
-    stop_sequences: List[str] = field(default_factory=lambda: ["<end_code>"])
-    # 【重要】ここがprompts.pyで説明した <end_code> の実体。LLM API呼び出し
-    # 時にこの文字列を stop sequence として渡すことで、LLMが <end_code> を
-    # 出力した瞬間に生成が強制的に打ち切られる。これが無いと、LLMが
-    # まだ実行してもいないツールの結果（Observation）を幻覚で先読みして
-    # 自分で書き続けてしまう危険がある。
-    max_tokens_per_request: int = 1024
-    # 1回のLLM APIリクエストで許可する最大出力トークン数（予算全体とは別に、
-    # 1回あたりの上限も設けている）。
+    # オーケストレータの動作を制御する設定値をまとめたデータクラス
+    max_iterations: int  # 最大反復(ステップ)回数
+    max_input_tokens: int  # 累積入力トークン数の上限
+    max_output_tokens: int  # 累積出力トークン数の上限
+    max_time_seconds: float  # 実行時間の上限(秒)
+    stop_sequences: List[str] = field(default_factory=lambda: ["<end_code>"])  # LLM生成を止める停止シーケンス(デフォルトは"<end_code>")
+    max_tokens_per_request: int = 1024  # 1回のLLMリクエストあたりの最大出力トークン数
 
 
 def _serialized_message_bytes(messages: List[dict]) -> int:
-    # ---------------------------------------------------------------
-    # 【日本語解説】メッセージ全体をJSONにシリアライズしたUTF-8バイト数
-    # ---------------------------------------------------------------
-    # トークン数そのものではなく「バイト数」を測っているのは、実際に
-    # APIを叩く前にプロバイダ非依存でおおよそのサイズを見積もるため
-    # （後述の _conservative_input_token_bound で使われる）。
-    # ---------------------------------------------------------------
-    serialized = json.dumps(messages, ensure_ascii=False, separators=(",", ":"))
-    return len(serialized.encode("utf-8"))
+    # メッセージ列をJSONにシリアライズし、そのUTF-8バイト長を返す(トークン数見積もりの基礎データ)
+    serialized = json.dumps(messages, ensure_ascii=False, separators=(",", ":"))  # 余分な空白なしでJSON文字列化(ASCIIエスケープはしない)
+    return len(serialized.encode("utf-8"))  # UTF-8エンコード後のバイト数を返す
 
 
 def _conservative_input_token_bound(
@@ -110,46 +56,23 @@ def _conservative_input_token_bound(
     previous_message_bytes: Optional[int],
     previous_input_tokens: Optional[int],
 ) -> int:
-    """Return a provider-independent upper bound for the next chat input.
+    """次回のチャット入力に対する、プロバイダに依存しない安全側の上限トークン数を返す。
 
-    Supported providers tokenize from bytes or Unicode text, so the UTF-8 byte
-    length plus a small envelope allowance safely bounds the first request.
-    Later requests reuse the provider's previous exact token count and add at
-    most one token per newly-added byte. This remains conservative without
-    repeatedly applying the byte-level worst case to the unchanged prompt.
+    対応しているプロバイダはバイト列またはUnicodeテキストからトークン化を行うため、
+    UTF-8バイト長に小さな余裕(エンベロープ分)を足したものが最初のリクエストを
+    安全に見積もる上限となる。それ以降のリクエストでは、プロバイダが返した直前の
+    正確なトークン数を再利用し、新たに増えたバイト1つにつき最大1トークンを加算する。
+    これにより、変化していないプロンプト部分に毎回バイト単位の最悪見積もりを
+    適用することなく、安全側の見積もりを維持できる。
     """
-    # =====================================================================
-    # 【日本語解説】トークン予算を「送信前に」見積もる仕組み
-    # =====================================================================
-    # 「実際にAPIを叩いてから初めてトークン超過が分かる」のではなく、送る前に
-    # 上限を見積もりたい。でもトークン数はプロバイダ依存（バイト数から計算
-    # するとは限らない）なので厳密には分からない。そこで:
-    #
-    #   ・初回（previous_* が None）:
-    #       メッセージのUTF-8バイト数 + 32 を保守的な上限とみなす。
-    #       「バイト数 ≧ トークン数」という安全側の前提に基づく単純な見積もり。
-    #
-    #   ・2回目以降:
-    #       前回の"実測"トークン数（previous_input_tokens、実際にLLM APIの
-    #       レスポンスから得られた正確な値）を土台にして、
-    #       「今回増えた分のバイト数 + 16」だけを足す。
-    #       プロンプト全体に毎回バイト単位のワーストケースを適用するのでは
-    #       なく、変化していない部分は前回の実測値をそのまま信用し、増分
-    #       だけに保守的な見積もりを適用することで、無駄に厳しくなりすぎ
-    #       ないようにしている。
-    #
-    # +32 や +16 という定数は「メッセージのJSON構造（role, content などの
-    # キー名やクォート）が増える分」を吸収するための小さな余裕（envelope
-    # allowance）。
-    # =====================================================================
     if previous_message_bytes is None or previous_input_tokens is None:
-        return current_message_bytes + 32
-    added_bytes = max(0, current_message_bytes - previous_message_bytes)
-    return previous_input_tokens + added_bytes + 16
+        return current_message_bytes + 32  # 初回リクエストの場合はバイト数に固定の余裕32を足した値を返す
+    added_bytes = max(0, current_message_bytes - previous_message_bytes)  # 前回からメッセージが何バイト増えたかを計算(負にはしない)
+    return previous_input_tokens + added_bytes + 16  # 前回の実測トークン数に、増加バイト数と余裕16を足して返す
 
 
 class Orchestrator:
-    """Runs one task to completion (or to a limit) and returns a SolutionOutput."""
+    """1つのタスクを完了(または上限到達)まで実行し、SolutionOutputを返すクラス。"""
 
     def __init__(
         self,
@@ -158,264 +81,160 @@ class Orchestrator:
         system_prompt: str,
         config: OrchestratorConfig,
     ) -> None:
-        # 依存を全部コンストラクタで受け取るだけ。Orchestrator自身は
-        # LLMクライアントもサンドボックスも「生成」しない——それは
-        # agent_mbpp.py/agent_swebench.py側の責務。
-        self.llm_client = llm_client
-        self.sandbox = sandbox
-        self.system_prompt = system_prompt
-        self.config = config
-        self._stop_requested = False
-        # SIGTERM受信フラグ。request_stop()がTrueにする。
+        # 依存オブジェクトと設定を保持し、停止フラグを初期化するコンストラクタ
+        self.llm_client = llm_client  # LLMへの問い合わせに使うクライアント
+        self.sandbox = sandbox  # コード実行に使うサンドボックス
+        self.system_prompt = system_prompt  # 会話冒頭で使うシステムプロンプト
+        self.config = config  # 反復回数・トークン数などの制限設定
+        self._stop_requested = False  # SIGTERMなどによる停止要求フラグ(初期値はFalse)
 
     def request_stop(self) -> None:
-        """Called from a SIGTERM handler so a killed agent still returns partial
-        metrics (and, for SWE-bench, still reaches its container cleanup)
-        instead of losing them. Raises immediately (see ShutdownRequested) so a
-        SIGTERM landing mid-LLM-call interrupts it right away rather than
-        waiting for it to finish on its own; the outer hard timeout is still
-        enforced by moulinette's run-agent command per Section 6.1."""
-        # ---------------------------------------------------------------
-        # 【日本語解説】SIGTERMハンドラから呼ばれる唯一の入口
-        # ---------------------------------------------------------------
-        # agent_mbpp.py/agent_swebench.py の signal.signal(SIGTERM, ...) が
-        # 登録したハンドラから呼ばれる。フラグを立てるだけでなく、その場で
-        # 即座に ShutdownRequested を raise することで、たとえ run() ループの
-        # 「毎ターン先頭」のチェック（下記 self._stop_requested）に到達する
-        # 前でも、LLM呼び出し中やサンドボックス実行中の処理をすぐ中断できる。
-        # ---------------------------------------------------------------
-        self._stop_requested = True
-        raise ShutdownRequested("shutdown requested (e.g. SIGTERM)")
+        """SIGTERMハンドラから呼び出され、killされたエージェントでも部分的な計測値を
+        返せるようにする(SWE-benchの場合はコンテナのクリーンアップにも到達できるようにする)、
+        失われてしまわないようにするための関数。ShutdownRequestedを即座に送出するため
+        (詳細はShutdownRequested参照)、LLM呼び出し中に届いたSIGTERMも自然終了を
+        待たずにすぐに中断される。外側のハードタイムアウトは、セクション6.1に従い
+        moulinetteのrun-agentコマンド側で別途強制される。"""
+        self._stop_requested = True  # 停止要求フラグを立てる
+        raise ShutdownRequested("shutdown requested (e.g. SIGTERM)")  # 呼び出し元(通常はシグナルハンドラ内)から直ちに例外を送出する
 
     def run(self, task_id: str, benchmark: str, task_prompt: str) -> SolutionOutput:
-        # =====================================================================
-        # 【日本語解説】run() = Thought → Code → Observation ループの本体
-        # =====================================================================
-        # 1タスクを最後まで走らせ、成功しても失敗しても必ず SolutionOutput を
-        # 返す。以下、実行順に見ていく。
-        # =====================================================================
-        start = time.monotonic()
-        # 壁時計の開始時刻。time.monotonic() はシステム時刻の変更（NTP補正
-        # など）の影響を受けないので、経過時間の計測に適している。
+        # 1タスク分のThought->Code->Observationループを実行し、最終的なSolutionOutputを組み立てて返すメインメソッド
+        start = time.monotonic()  # 経過時間計測用の開始時刻を記録
         messages: List[dict] = [
-            {"role": "system", "content": self.system_prompt},
-            {"role": "user", "content": task_prompt},
+            {"role": "system", "content": self.system_prompt},  # システムプロンプトを最初のメッセージとして設定
+            {"role": "user", "content": task_prompt},  # タスク内容をユーザーメッセージとして追加
         ]
-        # OpenAI形式のchatメッセージ配列。この後、ターンが進むたびに
-        # assistant（LLMの応答）とuser（Observation）が交互に追記されて
-        # いく——つまりこの messages リスト自体が会話履歴そのもの。
-        steps: List[StepMetrics] = []
-        total_input_tokens = 0
-        total_output_tokens = 0
-        total_requests = 0
-        error: Optional[str] = None
-        solution_text = ""
-        success = False
-        previous_message_bytes: Optional[int] = None
-        previous_input_tokens: Optional[int] = None
-        # 直前ターンのバイト数・トークン数。_conservative_input_token_bound
-        # に渡すための状態。
+        steps: List[StepMetrics] = []  # 各ステップの計測値を貯めるリスト
+        total_input_tokens = 0  # 累積入力トークン数のカウンタ
+        total_output_tokens = 0  # 累積出力トークン数のカウンタ
+        total_requests = 0  # LLMへの総リクエスト回数のカウンタ(リトライ含む)
+        error: Optional[str] = None  # 途中で発生したエラーメッセージ(正常終了ならNoneのまま)
+        solution_text = ""  # 最終的な解答文字列(final_answer()が呼ばれるまでは空)
+        success = False  # タスクが成功したかどうかのフラグ
+        previous_message_bytes: Optional[int] = None  # 直前ステップでのメッセージ列バイト数(トークン見積もりに使用)
+        previous_input_tokens: Optional[int] = None  # 直前ステップでの実測入力トークン数(トークン見積もりに使用)
 
         for step_number in range(1, self.config.max_iterations + 1):
-            # -----------------------------------------------------------
-            # 【日本語解説】6-1. 停止条件チェック（毎ターン最初の関門）
-            # -----------------------------------------------------------
-            # 4種類の「もう使い切った」チェック＋1種類の「次のリクエストで
-            # 超過しそうか事前チェック」の、計5段階の関所を毎ターン通す。
-            # どの条件で止まっても error に理由の文字列を入れて break する。
-            # -----------------------------------------------------------
+            # 1からmax_iterationsまでステップ番号を回すメインループ
             if self._stop_requested:
-                # SIGTERM済み。ループ先頭でのポーリングによる二重の安全網
-                # （request_stop() 自体はもっと早く例外で割り込むが、万一
-                # フラグだけ立って例外が別の場所で吸収されていた場合の保険）。
-                error = "stopped: shutdown requested (e.g. SIGTERM)"
-                break
-            elapsed = time.monotonic() - start
+                error = "stopped: shutdown requested (e.g. SIGTERM)"  # 停止要求が来ていればエラーメッセージを設定
+                break  # ループを抜ける
+            elapsed = time.monotonic() - start  # ここまでの経過時間を計算
             if elapsed >= self.config.max_time_seconds:
-                # 時間予算切れ。
-                error = f"time budget exhausted ({elapsed:.1f}s >= {self.config.max_time_seconds}s)"
-                break
+                error = f"time budget exhausted ({elapsed:.1f}s >= {self.config.max_time_seconds}s)"  # 時間制限超過のエラーメッセージを設定
+                break  # ループを抜ける
             if total_input_tokens >= self.config.max_input_tokens:
-                # 入力トークン予算切れ（これまでの累計）。
                 error = (
                     f"input token budget exhausted "
                     f"({total_input_tokens} >= {self.config.max_input_tokens})"
-                )
-                break
+                )  # 入力トークン予算超過のエラーメッセージを設定
+                break  # ループを抜ける
             if total_output_tokens >= self.config.max_output_tokens:
-                # 出力トークン予算切れ（これまでの累計）。
                 error = (
                     f"output token budget exhausted "
                     f"({total_output_tokens} >= {self.config.max_output_tokens})"
-                )
-                break
+                )  # 出力トークン予算超過のエラーメッセージを設定
+                break  # ループを抜ける
 
-            # 「次に送るメッセージが、まだ送ってもいないのに予算を超過し
-            # そうか」を事前に見積もる（_conservative_input_token_bound、
-            # 上のヘルパー関数の説明を参照）。
-            current_message_bytes = _serialized_message_bytes(messages)
+            current_message_bytes = _serialized_message_bytes(messages)  # 現在のメッセージ列のバイト数を計算
             input_token_bound = _conservative_input_token_bound(
                 current_message_bytes,
                 previous_message_bytes,
                 previous_input_tokens,
-            )
-            remaining_input_tokens = self.config.max_input_tokens - total_input_tokens
+            )  # 次のリクエストで消費されうる入力トークン数の安全側の上限を見積もる
+            remaining_input_tokens = self.config.max_input_tokens - total_input_tokens  # 入力トークン予算の残量を計算
             if input_token_bound > remaining_input_tokens:
-                # 送ったら確実に超過すると"保守的に"予測されるなら、実際には
-                # 送らずに未然にループを止める。
                 error = (
                     "input token budget would be exceeded by the next request "
                     f"(conservative bound {input_token_bound} > "
                     f"remaining {remaining_input_tokens})"
-                )
-                break
+                )  # 次のリクエストで予算を超えると見込まれる場合のエラーメッセージを設定
+                break  # ループを抜ける
 
-            # このリクエストで許可する出力トークン数 = 「1リクエストあたりの
-            # 上限」と「残り出力トークン予算」の小さい方。
-            remaining_output_tokens = self.config.max_output_tokens - total_output_tokens
+            remaining_output_tokens = self.config.max_output_tokens - total_output_tokens  # 出力トークン予算の残量を計算
             request_output_limit = min(
                 self.config.max_tokens_per_request,
                 remaining_output_tokens,
-            )
+            )  # 1リクエストあたりの上限と残り予算の小さい方を今回の出力上限として採用
 
-            # -----------------------------------------------------------
-            # 【日本語解説】6-2. LLM呼び出し
-            # -----------------------------------------------------------
             try:
                 gen = self.llm_client.generate(
                     messages,
-                    stop=self.config.stop_sequences,  # ["<end_code>"]
+                    stop=self.config.stop_sequences,
                     max_output_tokens=request_output_limit,
-                )
+                )  # LLMにメッセージ列を送り、応答を生成させる
             except AllProvidersExhaustedError as exc:
-                # 全プロバイダ・全APIキーが尽きた（llm/client.py参照）。
-                # 成功パスを一度も通っていないのでStepMetricsは作れないが、
-                # 実際に送られたHTTPリクエスト数だけは失わずに加算する。
-                total_requests += exc.attempted_requests
-                error = f"LLM request failed: {exc}"
-                break
+                total_requests += exc.attempted_requests  # 試行した全リクエスト数を加算
+                error = f"LLM request failed: {exc}"  # 全プロバイダ失敗のエラーメッセージを設定
+                break  # ループを抜ける
             except ShutdownRequested as exc:
-                # LLM APIコール中にSIGTERMが届いたケース。
-                error = str(exc)
-                break
+                error = str(exc)  # 停止要求による中断メッセージを設定
+                break  # ループを抜ける
 
-            # ここまで来たら、このターンのLLM呼び出しは成功している。
-            total_requests += 1 + gen.retries
-            total_input_tokens += gen.input_tokens
-            total_output_tokens += gen.output_tokens
-            previous_message_bytes = current_message_bytes
-            previous_input_tokens = gen.input_tokens
-            # 次のターンの _conservative_input_token_bound 計算のために、
-            # 「実測された」今回の入力トークン数を保存しておく。
+            total_requests += 1 + gen.retries  # 今回の呼び出し分(本試行+リトライ回数)を総リクエスト数に加算
+            total_input_tokens += gen.input_tokens  # 今回消費した入力トークン数を累積に加算
+            total_output_tokens += gen.output_tokens  # 今回消費した出力トークン数を累積に加算
+            previous_message_bytes = current_message_bytes  # 次回の見積もりのために今回のメッセージバイト数を保存
+            previous_input_tokens = gen.input_tokens  # 次回の見積もりのために今回の実測入力トークン数を保存
 
-            # -----------------------------------------------------------
-            # 【日本語解説】6-3. コード抽出とサンドボックス実行
-            # -----------------------------------------------------------
-            extraction = extract_code(gen.text)
-            # gen.text = LLMのコード抽出前の生テキスト全文（後で
-            # StepMetrics.llm_output にそのまま入る）。
-            sandbox_input = extraction.code or ""
-            # extraction.code = 抜き出されたコード部分だけ（後で
-            # StepMetrics.sandbox_input に入る）。llm_output とは別物。
-            final_answer_raised: Optional[FinalAnswer] = None
+            extraction = extract_code(gen.text)  # LLM出力からPythonコード部分を抽出
+            sandbox_input = extraction.code or ""  # 抽出されたコード(なければ空文字列)をサンドボックス入力として記録用に保持
+            final_answer_raised: Optional[FinalAnswer] = None  # final_answer()が呼ばれた場合にその例外を保持する変数
 
             if extraction.code is None:
-                # コードが1つも見つからなかった（[NoCodeBlock]など）。
-                # サンドボックス実行自体をスキップし、抽出層のnoteを
-                # そのまま次のObservationとしてLLMに見せる。
-                observation = extraction.note
+                observation = extraction.note  # コードが抽出できなかった場合は、その理由メモをそのままObservationとする
             else:
                 try:
-                    sandbox_output = self.sandbox.run(extraction.code)
-                    # note（フォーマット変換や救済が起きたことの説明）が
-                    # あれば、実行結果の前に付け加えて見せる。
+                    sandbox_output = self.sandbox.run(extraction.code)  # 抽出したコードをサンドボックス内で実行
                     observation = (
                         f"{extraction.note}\n{sandbox_output}" if extraction.note else sandbox_output
-                    )
+                    )  # 補足メモがあれば実行結果の前に付加してObservationとする
                 except FinalAnswer as fa:
-                    # sandbox.py の設計ポリシー: FinalAnswer は特別扱いの
-                    # 例外で、Sandbox.run() 内部の汎用 except Exception には
-                    # 一切握りつぶされず、ここまで確実に伝播してくる。
-                    final_answer_raised = fa
-                    observation = f"[FinalAnswer submitted] {fa.answer!r}"
+                    final_answer_raised = fa  # final_answer()呼び出しによる例外を捕捉して保持
+                    observation = f"[FinalAnswer submitted] {fa.answer!r}"  # 提出された解答内容をObservationとして記録
 
-            # -----------------------------------------------------------
-            # 【日本語解説】6-4. StepMetricsの記録
-            # -----------------------------------------------------------
-            # ここまでで集めた全情報（LLM生テキスト、抽出後のコード、
-            # 実行結果、トークン数、レイテンシ、リトライ回数）を1個の
-            # StepMetrics にまとめて steps に積む。
-            # -----------------------------------------------------------
             steps.append(
                 StepMetrics(
-                    step=step_number,
-                    input_tokens=gen.input_tokens,
-                    output_tokens=gen.output_tokens,
-                    request_time_ms=gen.request_time_ms,
-                    api_url=gen.api_url,
-                    model_name=gen.model_name,
-                    llm_output=gen.text,
-                    sandbox_input=sandbox_input,
-                    sandbox_output=observation,
-                    retries=gen.retries,
+                    step=step_number,  # このステップの番号
+                    input_tokens=gen.input_tokens,  # このステップで消費した入力トークン数
+                    output_tokens=gen.output_tokens,  # このステップで消費した出力トークン数
+                    request_time_ms=gen.request_time_ms,  # このステップのLLMリクエストにかかった時間(ミリ秒)
+                    api_url=gen.api_url,  # 実際に使用されたAPIのURL
+                    model_name=gen.model_name,  # 実際に使用されたモデル名
+                    llm_output=gen.text,  # LLMが生成した生テキスト
+                    sandbox_input=sandbox_input,  # サンドボックスに渡したコード
+                    sandbox_output=observation,  # サンドボックス実行結果(Observation)
+                    retries=gen.retries,  # このステップでのリトライ回数
                 )
-            )
+            )  # 今回のステップの計測値をstepsリストに追加
 
             if final_answer_raised is not None:
-                # final_answer() が呼ばれた = このタスクは完了。
-                # ループを即座に抜ける（以降のイテレーションは行わない）。
-                success = True
-                solution_text = str(final_answer_raised.answer)
-                break
+                success = True  # final_answer()が呼ばれたのでタスク成功とみなす
+                solution_text = str(final_answer_raised.answer)  # 提出された解答を文字列化して保存
+                break  # ループを抜ける(タスク完了)
 
-            # -----------------------------------------------------------
-            # 【日本語解説】6-5. 会話履歴に今回のやり取りを追記して次のターンへ
-            # -----------------------------------------------------------
-            # LLMの発言（Thought+Code、gen.text そのもの）を assistant
-            # メッセージとして、実行結果を user メッセージとして追記する。
-            # 次のループ反復では、この積み上がった messages がそのまま
-            # LLMへの入力になる（＝会話履歴として毎回全量を送っている）。
-            # -----------------------------------------------------------
-            messages.append({"role": "assistant", "content": gen.text})
-            messages.append({"role": "user", "content": f"Observation:\n{observation}"})
+            messages.append({"role": "assistant", "content": gen.text})  # LLMの応答をアシスタントメッセージとして会話履歴に追加
+            messages.append({"role": "user", "content": f"Observation:\n{observation}"})  # 実行結果(Observation)をユーザーメッセージとして会話履歴に追加
         else:
-            # -----------------------------------------------------------
-            # 【日本語解説】for...else — 「breakされずにループが自然終了」を検出
-            # -----------------------------------------------------------
-            # Pythonのfor文のelse節は、ループがbreakで抜けなかった場合にのみ
-            # 実行される。つまりここに来るのは「max_iterations回すべて
-            # 使い切ったのに final_answer() も呼ばれず、他のどの break 条件
-            # にも当たらなかった」場合だけ。
-            # -----------------------------------------------------------
-            error = f"max iterations reached ({self.config.max_iterations})"
+            # forループがbreakされずに最後まで回りきった場合(=最大反復回数に到達した場合)の処理
+            error = f"max iterations reached ({self.config.max_iterations})"  # 最大反復回数到達のエラーメッセージを設定
 
         if not success and error is None:
-            # 理論上ここには来ないはずだが（success=Trueにならずbreakした
-            # 経路は必ずerrorをセットしている）、念のための防御的フォール
-            # バック。
-            error = "loop ended without a final_answer() call"
+            error = "loop ended without a final_answer() call"  # 成功もエラーもない状態でループが終わった場合の保険的なエラーメッセージ
 
-        # ---------------------------------------------------------------
-        # 【日本語解説】最終的に必ず SolutionOutput を返す
-        # ---------------------------------------------------------------
-        # 成功でも失敗でも（予算切れ・SIGTERM・全プロバイダ全滅・
-        # イテレーション上限到達、どの経路でも）、ここまでに積み上がった
-        # steps を含んだ SolutionOutput を必ず返す。「途中経過を失わない」
-        # というこのプロジェクト全体の設計方針が、最後のこの return 文に
-        # 集約されている。
-        # ---------------------------------------------------------------
         return SolutionOutput(
-            task_id=task_id,
-            benchmark=benchmark,
-            success=success,
-            solution=solution_text,
-            iterations=len(steps),
-            total_requests=total_requests,
-            total_input_tokens=total_input_tokens,
-            total_output_tokens=total_output_tokens,
-            total_time_seconds=time.monotonic() - start,
-            steps=steps,
-            system_prompt=self.system_prompt,
-            error=None if success else error,
-            timestamp=datetime.now().isoformat(),
+            task_id=task_id,  # 対象タスクのID
+            benchmark=benchmark,  # ベンチマーク種別("mbpp"または"swebench")
+            success=success,  # タスクが成功したかどうか
+            solution=solution_text,  # 最終的な解答文字列
+            iterations=len(steps),  # 実際に実行されたステップ数
+            total_requests=total_requests,  # LLMへの総リクエスト回数
+            total_input_tokens=total_input_tokens,  # 累積入力トークン数
+            total_output_tokens=total_output_tokens,  # 累積出力トークン数
+            total_time_seconds=time.monotonic() - start,  # 全体の実行時間(秒)
+            steps=steps,  # 各ステップの計測値一覧
+            system_prompt=self.system_prompt,  # 使用したシステムプロンプト
+            error=None if success else error,  # 成功時はNone、失敗時はエラーメッセージ
+            timestamp=datetime.now().isoformat(),  # 現在時刻をISO形式で記録
         )
