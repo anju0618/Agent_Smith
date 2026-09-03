@@ -1,248 +1,147 @@
-"""Docker container lifecycle for SWE-bench tasks (Section 4.4).
+"""SWE-benchタスク用のDockerコンテナのライフサイクル管理(Section 4.4)。
 
-Implements approach (b) from the subject: the sandbox itself (the Python
-interpreter that executes the LLM's generated code) stays on the host. What
-moves into the container is the *MCP tool server* - it is started there via
-`docker exec` so its filesystem/test/git operations run against the actual
-task environment, while the sandbox only ever talks to it over that exec'd
-stdio pipe. mcp_tools_swebench.py has no Docker-awareness of its own; this
-module is what decides *where* it runs.
+課題の方式(b)を実装している: サンドボックス自体(LLMが生成したコードを実行する
+Pythonインタプリタ)はホスト側に留まる。コンテナ内に移動するのは *MCPツール
+サーバー* であり、`docker exec` 経由で起動することで、そのファイルシステム/
+テスト/git操作が実際のタスク環境に対して実行される一方、サンドボックスは
+その exec されたstdioパイプ越しにしかそのサーバーと会話しない。
+mcp_tools_swebench.py自体はDockerについて何も知らない。このモジュールが
+「どこで実行するか」を決めている。
 
-Exercised end to end against three real `swebench/sweb.eval.x86_64.*` images
-(pull, container start, MCP dependency bootstrap, tool calls, `get_patch()`,
-cleanup) - see BENCHMARK_REPORT.md for the full run and for a real
-`docker cp`/UID-remapping bug this found and fixed (now avoided entirely via
-`_write_into_container`'s `docker exec` stdin redirection below).
+実際の `swebench/sweb.eval.x86_64.*` イメージ3つに対してエンドツーエンドで
+検証済み(pull、コンテナ起動、MCP依存関係のブートストラップ、ツール呼び出し、
+`get_patch()`、クリーンアップ) - 完全な実行結果と、これによって発見・修正された
+実際の `docker cp`/UIDリマッピングのバグについてはBENCHMARK_REPORT.mdを参照
+(下記の `_write_into_container` の `docker exec` 標準入力リダイレクトによって
+現在は完全に回避されている)。
 """
-# このファイルの役割を一言でいうと「1タスク分のDockerコンテナの一生
-# (起動→道具を仕込む→依存関係を整える→接続方法を教える→掃除する)を
-# 管理するクラスを1つ提供するだけ」のファイル。SWE-bench固有のロジック
-# (ファイル読み書きやgit diffの取り方)は一切ここには無い - それは
-# mcp_tools_swebench.py の役目で、このファイルは「それをどこで走らせるか」
-# だけを決める。
-from __future__ import annotations
+from __future__ import annotations  # 型注釈の評価を遅延させるためのfuture import
 
-import shlex
-import subprocess
-from pathlib import Path
-from typing import Any, Optional
+import shlex  # シェルコマンド文字列を安全にクォートするためのshlex
+import subprocess  # docker CLIをサブプロセスとして実行するためのsubprocess
+from pathlib import Path  # ファイルパスをオブジェクトとして扱うためのPath
+from typing import Any, Optional  # 型ヒント用のAnyとOptional
 
-import docker
+import docker  # docker-py(Docker Engine APIのPythonクライアント)
 
-# コンテナ内部でのパス。ホスト側のパスとは無関係の、コンテナの中だけで
-# 意味を持つ固定値。
-TESTBED_PATH_IN_CONTAINER = "/testbed"
-EVAL_SCRIPT_PATH_IN_CONTAINER = f"{TESTBED_PATH_IN_CONTAINER}/eval.sh"
-TOOLS_PATH_IN_CONTAINER = "/agent_smith_mcp_tools_swebench.py"
+TESTBED_PATH_IN_CONTAINER = "/testbed"  # コンテナ内でのリポジトリ(テストベッド)の配置パス
+EVAL_SCRIPT_PATH_IN_CONTAINER = f"{TESTBED_PATH_IN_CONTAINER}/eval.sh"  # コンテナ内での評価スクリプトの配置パス
+TOOLS_PATH_IN_CONTAINER = "/agent_smith_mcp_tools_swebench.py"  # コンテナ内でのMCPツールサーバースクリプトの配置パス
 
 
 class SweBenchContainer:
-    """Owns one running SWE-bench container for the lifetime of one task."""
-    # 1インスタンス = 1タスク分のコンテナのライフサイクルを表すクラス。
-    # agent_swebench.py の main() が1つだけ生成し、try/finallyで
-    # start()→(エージェント実行)→cleanup() の順に使う。
+    """1つのタスクの生存期間中、実行中のSWE-benchコンテナを1つ所有するクラス。"""
 
     def __init__(self, docker_image: str) -> None:
-        self.docker_image = docker_image
-        # docker.from_env() はホストのDockerデーモンに接続するクライアントを
-        # 環境変数(DOCKER_HOSTなど)から自動構成する、docker-pyの標準的な使い方。
-        self._client = docker.from_env()
-        # コンテナ本体への参照。start()が呼ばれるまではNoneのまま
-        # (「まだ何も起動していない」ことを型で表現している)。
-        self._container: Optional[Any] = None
+        self.docker_image = docker_image  # 使用するDockerイメージ名を保持
+        self._client = docker.from_env()  # 環境変数からDockerクライアントを初期化
+        self._container: Optional[Any] = None  # 起動したコンテナオブジェクト(開始前はNone)
 
     def start(self, eval_script: str, tools_file: Path) -> None:
-        """Pull the task's image, start a long-lived container, and copy in
-        the eval script + MCP tool server (Section 4.4: "(a) deploy the
-        sandbox inside the Docker container, or (b) run the sandbox on the
-        host with MCP tools bridging into Docker" - we implement (b))."""
-        # (1) タスク指定のDockerイメージを取得する。このイメージには
-        # 対象リポジトリのソースコードとバグ修正前の環境がまるごと
-        # 入っている(SWE-bench標準の評価用イメージ)。
-        self._client.images.pull(self.docker_image)
-        # (2) コンテナを起動する。command="tail -f /dev/null" は
-        # 「何もせず、ただ生き続けるだけ」のコマンド - このコンテナ自体は
-        # 何かを実行するためではなく、あとから docker exec で個別に
-        # コマンドを打ち込むための「土台」として存在する。detach=True で
-        # バックグラウンド実行し、run()自体はすぐにcontainerオブジェクトを
-        # 返す。
+        """タスクのイメージをpullし、長時間稼働するコンテナを起動し、評価スクリプトと
+        MCPツールサーバーをコピーする(Section 4.4: 「(a) サンドボックスをDocker
+        コンテナ内にデプロイする、または (b) サンドボックスをホスト上で実行し、
+        MCPツールでDockerへブリッジする」のうち、我々は(b)を実装している)。"""
+        self._client.images.pull(self.docker_image)  # 指定されたDockerイメージをpullする
         self._container = self._client.containers.run(
             self.docker_image, command="tail -f /dev/null", detach=True
-        )
+        )  # コンテナをバックグラウンドで起動する(tail -f /dev/nullで常駐させる)
 
-        # (3) タスク固有のeval.sh(正解判定用スクリプト)と、
-        # mcp_tools_swebench.py(このプロジェクト側が書いたMCPツール
-        # サーバーの実体)を、コンテナの中の決まった場所に書き込む。
-        # イメージ自体にはこれらのファイルは含まれていないので、
-        # 実行のたびにこちらから注入する必要がある。
-        self._write_into_container(eval_script, EVAL_SCRIPT_PATH_IN_CONTAINER)
-        self._write_into_container(tools_file.read_text(), TOOLS_PATH_IN_CONTAINER)
+        self._write_into_container(eval_script, EVAL_SCRIPT_PATH_IN_CONTAINER)  # 評価スクリプトをコンテナ内に書き込む
+        self._write_into_container(tools_file.read_text(), TOOLS_PATH_IN_CONTAINER)  # MCPツールサーバーのソースをコンテナ内に書き込む
 
-        # (4) mcp_tools_swebench.py を動かすのに必要なPythonパッケージ
-        # (mcp/pydantic)がコンテナ内に無ければインストールする。
-        self._bootstrap_dependencies()
+        self._bootstrap_dependencies()  # コンテナ内でMCPサーバーの依存パッケージをインストールする
 
     def _write_into_container(self, content: str, container_path: str) -> None:
-        """Write `content` to `container_path` inside the container.
+        """`content` をコンテナ内の `container_path` に書き込む。
 
-        Uses `docker exec` stdin redirection rather than `docker cp`: `docker
-        cp`'s tar-based copy tries to `lchown` the extracted file to match the
-        host UID, which fails with "invalid argument" on hosts where that UID
-        falls outside the container's user-namespace remapping range (hit live
-        against a real SWE-bench image in this environment - a shared host
-        with per-user subuid ranges). Piping through `docker exec` writes as
-        whatever user the container's own entrypoint runs as, sidestepping
-        that host-side UID mapping entirely.
+        `docker cp` ではなく `docker exec` の標準入力リダイレクトを使用している:
+        `docker cp` のtarベースのコピーは、展開したファイルをホストのUIDに
+        合わせて `lchown` しようとするが、そのUIDがコンテナのユーザー名前空間の
+        リマッピング範囲外にある場合(ユーザーごとのsubuid範囲を持つ共有ホストで
+        実際に本環境で発生した)「invalid argument」エラーで失敗する。
+        `docker exec` 経由でパイプすると、コンテナ自身のエントリポイントが
+        実行しているユーザーとして書き込まれるため、このホスト側のUID
+        マッピング問題を完全に回避できる。
 
-        This shells out to the `docker` CLI directly (for stdin piping)
-        rather than going through the docker-py client used elsewhere in this
-        class, so it doesn't inherit that client's default 60s per-call
-        timeout - bounded here explicitly instead, so a stuck/unresponsive
-        container fails this step with a clear TimeoutExpired rather than
-        hanging container.start() (and therefore the whole agent) with no
-        timeout at all until moulinette's own outer process kill.
+        このメソッドは(標準入力のパイピングのために)docker CLIを直接シェル
+        呼び出ししており、このクラスの他の箇所で使われているdocker-pyクライアント
+        経由ではない。そのため、そのクライアントのデフォルト60秒のタイムアウトを
+        継承しない - 代わりにここで明示的にタイムアウトを設定しているので、
+        応答のないコンテナがあった場合、moulinette自身の外側のプロセスkillまで
+        タイムアウトなしにcontainer.start()(ひいてはエージェント全体)がハングする
+        のではなく、この工程が明確なTimeoutExpiredで失敗するようになる。
         """
-        # ↑ 原文docstringの補足説明。要点を日本語でまとめると:
-        #
-        # 素朴には `docker cp` (docker-pyの client.containers.get(...).put_archive
-        # やCLIの `docker cp`)でファイルをコンテナへコピーすればよさそうに
-        # 見えるが、これはtarアーカイブとして展開する際にホスト側のUIDへ
-        # `lchown`しようとする。このプロジェクトが動いている環境のように、
-        # ユーザーごとに割り当てられたsubuid/subgidレンジでコンテナのUID
-        # リマッピングを行うホストでは、ホストユーザーのUIDがそのレンジ外に
-        # 落ちてしまい、`Error response from daemon: failed to Lchown ...:
-        # invalid argument` で失敗する。これは実際にこの開発環境で遭遇した
-        # 不具合で、moulinette自身の `validate swebench` コマンドも内部で
-        # 同じエラーを踏むことが確認されている(=このプロジェクト固有の
-        # バグではなく、環境依存の既知の問題)。
-        #
-        # 対策: `docker cp` を一切使わず、
-        #   docker exec -i <container_id> sh -c 'cat > <path>'
-        # という形で、標準入力(stdin)からファイルの中身をパイプで
-        # 流し込む方式にする。この書き込みは「コンテナのエントリポイントが
-        # 動いているユーザー」として行われるため、ホスト側のUIDマッピングの
-        # 影響を一切受けない。
-        #
-        # さらに、この `docker exec` 呼び出しは docker-py の
-        # クライアント(self._client)ではなく `subprocess.run(["docker", ...])`
-        # で**dockerのCLIを直接**呼んでいる。docker-pyクライアント経由だと
-        # デフォルトで60秒のタイムアウトが暗黙にかかるが、CLI呼び出しは
-        # それを継承しない。そこでtimeout=30を明示的に指定し、コンテナが
-        # 応答不能になった場合でも、このメソッド(延いてはstart()、延いては
-        # エージェント全体)が無期限にハングしないようにしている。
-        assert self._container is not None
+        assert self._container is not None  # コンテナが起動済みであることを前提とする
         subprocess.run(
-            # shlex.quote(container_path)で書き込み先パスをシェルエスケープし、
-            # パスにスペースなど特殊文字が含まれていてもコマンドインジェクション
-            # にならないようにしている。
             ["docker", "exec", "-i", self._container.id, "sh", "-c", f"cat > {shlex.quote(container_path)}"],
-            input=content,      # ← ここでcontentがstdin経由でsh -cに渡る
-            text=True,
-            check=True,          # 失敗(非ゼロ終了コード)なら例外を送出させる
-            timeout=30,
-        )
+            input=content,  # 標準入力として書き込みたい内容を渡す
+            text=True,  # 文字列としてやり取りする(バイト列にしない)
+            check=True,  # 非ゼロ終了コードなら例外を送出する
+            timeout=30,  # 30秒でタイムアウトさせる
+        )  # コンテナ内で "cat > パス" を実行し、標準入力の内容をファイルとして書き込む
 
     def _bootstrap_dependencies(self) -> None:
-        """Best-effort install of the MCP tool server's runtime deps inside the
-        container. If the container has no network access this fails cleanly -
-        the caller (agent_swebench.py) surfaces that as a graceful agent error
-        rather than crashing (General Rules: "all errors must be handled
-        gracefully")."""
-        # mcp_tools_swebench.py を実行するには mcp / pydantic パッケージが
-        # コンテナ内のPythonから import できる必要がある。しかしSWE-bench標準
-        # イメージにはそれらは入っていない前提なので、ここで確認・必要なら
-        # インストールする。
-        assert self._container is not None
-        container_id = self._container.id
+        """MCPツールサーバーの実行時依存関係をコンテナ内にベストエフォートでインストールする。
+        コンテナにネットワークアクセスがない場合、これはきれいに失敗する -
+        呼び出し元(agent_swebench.py)はこれをクラッシュではなく、エージェントの
+        穏当なエラーとして表面化させる(General Rules: 「全てのエラーは
+        gracefulに処理されなければならない」)。"""
+        assert self._container is not None  # コンテナが起動済みであることを前提とする
+        container_id = self._container.id  # コンテナIDを取得しておく
         try:
-            # まず `python3 -c "import mcp"` を試し、既に入っているかどうかを
-            # 確認する。check=False にしているのは、import失敗(returncode!=0)を
-            # 例外ではなく「まだ入っていない」という正常な分岐として扱うため。
             check = subprocess.run(
                 ["docker", "exec", container_id, "python3", "-c", "import mcp"],
-                capture_output=True,
-                timeout=30,
-                check=False,
-            )
-        except subprocess.TimeoutExpired as exc:
-            raise RuntimeError("Timed out checking MCP dependencies in the container") from exc
-        if check.returncode == 0:
-            # 既にimportできた = 追加インストール不要。ここで即return。
-            return
+                capture_output=True,  # 標準出力・標準エラーを取得する
+                timeout=30,  # 30秒でタイムアウト
+                check=False,  # 非ゼロ終了コードでも例外を投げず、自前で判定する
+            )  # コンテナ内でmcpパッケージが既にインポート可能かを確認する
+        except subprocess.TimeoutExpired as exc:  # タイムアウトした場合
+            raise RuntimeError("Timed out checking MCP dependencies in the container") from exc  # 明確なエラーに変換して送出
+        if check.returncode == 0:  # importが成功した(=既にmcpがインストール済み)なら
+            return  # これ以上何もせず終了
         try:
-            # pip install。--quiet で出力を抑制。timeout=300(5分)と、
-            # 単なるimportチェックより大幅に長い猶予を与えているのは、
-            # パッケージのダウンロード・ビルドには時間がかかりうるため。
             install = subprocess.run(
                 [
                     "docker", "exec", container_id, "pip", "install", "--quiet",
                     "mcp>=1.2.0,<2", "pydantic>=2",
                 ],
-                capture_output=True,
-                timeout=300,
-                check=False,
-            )
-        except subprocess.TimeoutExpired as exc:
-            raise RuntimeError("Timed out installing MCP dependencies in the container") from exc
-        if install.returncode != 0:
-            # ここに来るのは主に「イメージにネットワークアクセスが無く
-            # pip installそのものが失敗する」ケース。RuntimeErrorとして
-            # 投げることで、呼び出し元(agent_swebench.py)のtry/exceptが
-            # これを「エージェントのグレースフルな失敗」として拾い、
-            # クラッシュではなくerror_solution付きのsolution.jsonとして
-            # 正常に書き出す。
+                capture_output=True,  # 標準出力・標準エラーを取得する
+                timeout=300,  # インストールには時間がかかるため5分のタイムアウト
+                check=False,  # 非ゼロ終了コードでも例外を投げず、自前で判定する
+            )  # mcpとpydanticをコンテナ内にpip installする
+        except subprocess.TimeoutExpired as exc:  # インストールがタイムアウトした場合
+            raise RuntimeError("Timed out installing MCP dependencies in the container") from exc  # 明確なエラーに変換して送出
+        if install.returncode != 0:  # インストールが失敗した場合
             raise RuntimeError(
                 "Could not install the MCP server's dependencies inside the container "
                 f"(likely no network access in this image): "
                 f"{install.stderr.decode(errors='replace')}"
-            )
+            )  # インストール失敗の詳細を含めたエラーを送出する(ネットワークがない可能性が高い旨も明記)
 
     def mcp_stdio_command(self) -> str:
-        """Shell command that starts the MCP tool server inside this container,
-        for handing to MCPToolProxy(stdio_command=...)."""
-        # agent_swebench.py がこの戻り値を
-        # MCPToolProxy(stdio_command=container.mcp_stdio_command())
-        # へそのまま渡す。MCPToolProxy はこの文字列をシェルコマンドとして
-        # サブプロセス起動するだけで、その中身が実は「別プロセスをdocker exec
-        # 越しにコンテナの中で立ち上げるコマンドだ」ということは一切知らない
-        # ── これが「mcp_tools_swebench.py自体にはDocker固有のロジックが
-        # 無い」設計を成立させている、Docker側からの唯一の橋渡し。
-        assert self._container is not None
-        container_id: str = self._container.id
+        """このコンテナ内でMCPツールサーバーを起動するシェルコマンドを返す。
+        MCPToolProxy(stdio_command=...)に渡すためのもの。"""
+        assert self._container is not None  # コンテナが起動済みであることを前提とする
+        container_id: str = self._container.id  # コンテナIDを取得
         return (
             f"docker exec -i "
-            # -e TESTBED_PATH=... と -e AGENT_SMITH_EVAL_SCRIPT=... で、
-            # コンテナ内で起動するmcp_tools_swebench.pyプロセスに
-            # 環境変数を渡す。mcp_tools_swebench.py側の_testbed_root()と
-            # _eval_script_path()がこれを読み取る。
             f"-e TESTBED_PATH={TESTBED_PATH_IN_CONTAINER} "
             f"-e AGENT_SMITH_EVAL_SCRIPT={EVAL_SCRIPT_PATH_IN_CONTAINER} "
             f"{container_id} python3 {TOOLS_PATH_IN_CONTAINER}"
-        )
+        )  # コンテナ内でMCPツールサーバーを起動するための docker exec コマンド文字列を組み立てて返す
 
     def cleanup(self) -> None:
-        """Stop and remove the container - Section 4.4: "you are responsible
-        for cleaning it up after your program execution"."""
-        # このメソッドはagent_swebench.pyのfinallyブロックから呼ばれる、
-        # 「最後の砦」の後始末処理。したがって、途中で何が起きても
-        # (コンテナが既に死んでいる、Dockerデーモンが応答しないなど)、
-        # 例外を外へ投げてはいけない。
-        if self._container is None:
-            # そもそもstart()が呼ばれていない(=起動に失敗した等)なら
-            # 何もすることが無い。
-            return
+        """コンテナを停止・削除する - Section 4.4: 「プログラム実行後に
+        自分でクリーンアップする責任がある」に対応。"""
+        if self._container is None:  # そもそもコンテナが起動していなければ
+            return  # 何もせず終了
         try:
-            # timeout=5: SIGTERM相当の穏やかな停止要求を送り、5秒だけ待つ。
-            self._container.stop(timeout=5)
-        except Exception:
-            # stop()が失敗しても(既に停止している等)気にせず次へ進む -
-            # 後始末処理自体が例外で止まってしまう方が害が大きい。
-            pass
+            self._container.stop(timeout=5)  # コンテナを最大5秒待って停止する
+        except Exception:  # 停止に失敗しても
+            pass  # クリーンアップ処理自体は止めず続行する
         try:
-            # force=True: 停止していてもいなくても強制的に削除する。
-            self._container.remove(force=True)
-        except Exception:
-            pass
-        # 最後に参照をクリアしておく(二重cleanup呼び出しへの耐性にもなる:
-        # 次回呼ばれた際は self._container is None のガードで即returnする)。
-        self._container = None
+            self._container.remove(force=True)  # コンテナを強制削除する
+        except Exception:  # 削除に失敗しても
+            pass  # 例外を無視して処理を続ける(ベストエフォートのクリーンアップのため)
+        self._container = None  # 内部状態をリセットし、二重クリーンアップを防ぐ

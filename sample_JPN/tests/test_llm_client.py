@@ -1,41 +1,27 @@
-"""Tests for llm/client.py: token rotation, provider fallback, retries, usage tracking.
+"""llm/client.py のテスト: トークンローテーション、プロバイダのフォールバック、
+リトライ、使用量トラッキングを検証する。
 
-Network calls are replaced with a fake ChatProvider so these tests never touch
-a real API - see README.md for how to smoke-test against a real provider.
+ネットワーク呼び出しはフェイクのChatProviderに置き換えているため、これらの
+テストは実際のAPIには一切触れない。実プロバイダに対するスモークテストの
+方法はREADME.mdを参照。
 """
-# ============================================================================
-# 日本語解説: このファイルは llm/client.py の LLMClient
-# （1つの論理モデルを、複数プロバイダ・複数APIキーにわたるフォールバック
-# 付きで呼び出すクラス）をテストしています。
-#
-# 実際のネットワーク通信は一切行いません。_FakeProvider という「偽の
-# ChatProvider」を使い、本物のHTTPリクエストの代わりに、指定した回数だけ
-# 意図的に失敗させたり、決まったレスポンスを返したりできるようにして
-# います。これによりネットワークやAPIキーが無くても、
-# 「1つのキーがレート制限に当たったら別のキーに自動的に切り替わるか」
-# 「全キー・全プロバイダが尽きたときに正しくエラーになるか」
-# 「失敗した試行の回数もちゃんとカウントされるか」といった、
-# 本物のAPIを叩かないと再現しにくい状況を確実に再現してテストできます。
-# ============================================================================
-from typing import List, Optional
+from typing import List, Optional  # 型ヒントに使用
 
-import pytest
-import requests
+import pytest  # monkeypatch型ヒント・pytest.raisesに使用
+import requests  # ConnectionError(擬似的なネットワーク障害)に使用
 
-from config import ProviderSpec
-from llm import client as client_module
-from llm.provider import GenerationResult
+from config import ProviderSpec  # プロバイダ設定(URL・APIキー環境変数名など)
+from llm import client as client_module  # テスト対象のLLMClient本体を含むモジュール
+from llm.provider import GenerationResult  # chat()の戻り値型
 
 
 class _FakeProvider:
-    # 本物のChatProviderの代わりに使う偽物。fail_timesで指定した回数分だけ
-    # 意図的にConnectionErrorを発生させ、それ以降は固定のGenerationResultを
-    # 返す。seen_api_keysに呼び出しごとのapi_keyを記録しておくことで、
-    # 「本当にキーがローテーションされたか」を後からassertで確認できる。
+    """本物のChatProviderの代わりに使う、指定回数だけ失敗してから成功するフェイク実装。"""
+
     def __init__(self, fail_times: int = 0) -> None:
-        self.fail_times = fail_times
-        self.calls = 0
-        self.seen_api_keys: List[str] = []
+        self.fail_times = fail_times  # 最初に失敗させる回数
+        self.calls = 0  # 実際の呼び出し回数カウンタ
+        self.seen_api_keys: List[str] = []  # 呼び出しごとに渡されたAPIキーの記録
 
     def chat(
         self,
@@ -46,10 +32,12 @@ class _FakeProvider:
         max_output_tokens: int,
         timeout: float,
     ) -> GenerationResult:
-        self.calls += 1
-        self.seen_api_keys.append(api_key)
+        self.calls += 1  # 呼び出し回数をインクリメント
+        self.seen_api_keys.append(api_key)  # 使われたAPIキーを記録
         if self.calls <= self.fail_times:
+            # 指定回数までは擬似的なネットワーク障害を発生させる
             raise requests.ConnectionError("simulated network failure")
+        # それ以降は固定の成功レスポンスを返す
         return GenerationResult(
             text="Thought: ok",
             input_tokens=10,
@@ -61,39 +49,29 @@ class _FakeProvider:
 
 
 def _install_fake_provider(monkeypatch: pytest.MonkeyPatch, fake: _FakeProvider) -> None:
-    # llm/client.py内部で「実際のChatProviderを組み立てる関数」
-    # (_build_chat_provider)を、常に上のfakeを返すものに差し替える。
-    # これによりLLMClientの内部ロジック(ローテーション/リトライ/フォールバック)
-    # だけを、本物のHTTP層を経由せずにテストできる。
+    # LLMClient内部でプロバイダを構築する関数を、常にフェイクを返すよう差し替える
     monkeypatch.setattr(client_module, "_build_chat_provider", lambda spec: fake)
 
 
 def test_generate_succeeds_on_first_attempt(monkeypatch: pytest.MonkeyPatch) -> None:
-    # 最も基本的な正常系: 1回目の呼び出しでいきなり成功するケース。
-    # retries(リトライ回数)が0であること、usage統計(total_requests/
-    # total_input_tokens)が正しく積み上がることを確認する。
-    fake = _FakeProvider(fail_times=0)
+    # 1回目の呼び出しで成功する通常ケースを検証
+    fake = _FakeProvider(fail_times=0)  # 失敗しないフェイクプロバイダ
     _install_fake_provider(monkeypatch, fake)
-    monkeypatch.setenv("FAKE_API_KEY", "secret")
+    monkeypatch.setenv("FAKE_API_KEY", "secret")  # APIキー用の環境変数を設定
 
     spec = ProviderSpec("fake", "https://fake.example/v1", "FAKE_API_KEY")
     llm = client_module.LLMClient("fake-model", [spec], backoff_seconds=0)
     result = llm.generate([{"role": "user", "content": "hi"}])
 
-    assert result.retries == 0
-    assert result.text == "Thought: ok"
-    assert llm.usage.total_requests == 1
-    assert llm.usage.total_input_tokens == 10
+    assert result.retries == 0  # リトライは発生していないこと
+    assert result.text == "Thought: ok"  # フェイクの応答テキストがそのまま返ること
+    assert llm.usage.total_requests == 1  # リクエスト数が1回とカウントされること
+    assert llm.usage.total_input_tokens == 10  # 入力トークン数が積算されること
 
 
 def test_generate_retries_then_succeeds(monkeypatch: pytest.MonkeyPatch) -> None:
-    # 1回目は失敗し、2回目で成功するケース。fail_times=1なので
-    # 最初の呼び出しだけがConnectionErrorになり、LLMClientが自動的に
-    # リトライして2回目で成功結果を得られることを確認する。
-    # retries==1、total_requests==2（1回失敗+1回成功=2回のHTTPリクエスト）、
-    # total_retries==1という、それぞれ意味の異なる集計値がすべて
-    # 正しく反映されることを確認している。
-    fake = _FakeProvider(fail_times=1)
+    # 1回失敗した後にリトライして成功するケースを検証
+    fake = _FakeProvider(fail_times=1)  # 最初の1回だけ失敗するフェイクプロバイダ
     _install_fake_provider(monkeypatch, fake)
     monkeypatch.setenv("FAKE_API_KEY", "secret")
 
@@ -101,36 +79,30 @@ def test_generate_retries_then_succeeds(monkeypatch: pytest.MonkeyPatch) -> None
     llm = client_module.LLMClient("fake-model", [spec], backoff_seconds=0, max_retries_per_key=3)
     result = llm.generate([{"role": "user", "content": "hi"}])
 
-    assert fake.calls == 2
-    assert result.retries == 1
-    assert llm.usage.total_requests == 2
-    assert llm.usage.total_retries == 1
+    assert fake.calls == 2  # 失敗1回+成功1回で計2回呼ばれること
+    assert result.retries == 1  # リトライ回数が1と記録されること
+    assert llm.usage.total_requests == 2  # 総リクエスト数が2とカウントされること
+    assert llm.usage.total_retries == 1  # 総リトライ数が1とカウントされること
 
 
 def test_multiple_keys_rotate(monkeypatch: pytest.MonkeyPatch) -> None:
-    # 複数トークン管理のテスト。.envに FAKE_API_KEY と FAKE_API_KEY_2 の
-    # 2つのキーが設定されている状況を再現し、generate()を2回呼んだときに
-    # 実際に異なるキー（"key-one"→"key-two"）が順番に使われる
-    # （ラウンドロビン方式でローテーションされる）ことを確認する。
-    # 1つのキーがレート制限に達しても全体が止まらないようにするための機能。
+    # 複数のAPIキーが登録されている場合、呼び出しごとに順番にローテーションされることを検証
     fake = _FakeProvider(fail_times=0)
     _install_fake_provider(monkeypatch, fake)
-    monkeypatch.setenv("FAKE_API_KEY", "key-one")
-    monkeypatch.setenv("FAKE_API_KEY_2", "key-two")
+    monkeypatch.setenv("FAKE_API_KEY", "key-one")  # 1つ目のキー
+    monkeypatch.setenv("FAKE_API_KEY_2", "key-two")  # 2つ目のキー(連番の環境変数)
 
     spec = ProviderSpec("fake", "https://fake.example/v1", "FAKE_API_KEY")
     llm = client_module.LLMClient("fake-model", [spec], backoff_seconds=0)
-    llm.generate([{"role": "user", "content": "hi"}])
-    llm.generate([{"role": "user", "content": "hi"}])
+    llm.generate([{"role": "user", "content": "hi"}])  # 1回目の呼び出し
+    llm.generate([{"role": "user", "content": "hi"}])  # 2回目の呼び出し
 
-    assert fake.seen_api_keys == ["key-one", "key-two"]
+    assert fake.seen_api_keys == ["key-one", "key-two"]  # 1回目・2回目で異なるキーが使われること
 
 
 def test_all_providers_exhausted_raises(monkeypatch: pytest.MonkeyPatch) -> None:
-    # fail_times=999という、事実上「絶対に成功しない」設定にして、
-    # リトライを尽くしてもなお失敗し続けた場合に
-    # AllProvidersExhaustedError が最終的に送出されることを確認する。
-    fake = _FakeProvider(fail_times=999)
+    # 全てのプロバイダ/キーで失敗し続けた場合、AllProvidersExhaustedErrorが送出されることを検証
+    fake = _FakeProvider(fail_times=999)  # 常に失敗するフェイクプロバイダ
     _install_fake_provider(monkeypatch, fake)
     monkeypatch.setenv("FAKE_API_KEY", "secret")
 
@@ -142,19 +114,10 @@ def test_all_providers_exhausted_raises(monkeypatch: pytest.MonkeyPatch) -> None
 
 
 def test_all_providers_exhausted_reports_attempted_requests(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Every failed attempt was a real HTTP request; SolutionOutput.total_requests
-    (Section 5.1) must count them even though this call never succeeds."""
-    # 日本語解説: このテストがとても重要な理由。全滅した(一度も成功しなかった)
-    # 場合、StepMetricsは1つも作られない（成功パスを一度も通っていないので
-    # 作りようがない）。しかし、失敗したとはいえ実際にHTTPリクエストは
-    # 送信されているので、その回数(attempted_requests)は失われてはならない。
-    # AllProvidersExhaustedErrorの例外オブジェクト自身がその回数を
-    # attempted_requestsとして保持していて、Orchestrator側が
-    # total_requests += exc.attempted_requests として拾い上げる、
-    # という設計になっている。これが無いと「全滅した試行のtotal_requestsが
-    # 0のまま記録される」というバグになる(実際にBENCHMARK_REPORT.mdに
-    # 記録されている過去の不具合)。
-    fake = _FakeProvider(fail_times=999)
+    """失敗した試行のそれぞれが実際のHTTPリクエストだった。SolutionOutput.total_requests
+    (セクション5.1)は、この呼び出しが最終的に成功しなくても、それらを全てカウント
+    しなければならない。"""
+    fake = _FakeProvider(fail_times=999)  # 常に失敗するフェイクプロバイダ
     _install_fake_provider(monkeypatch, fake)
     monkeypatch.setenv("FAKE_API_KEY", "secret")
 
@@ -164,17 +127,14 @@ def test_all_providers_exhausted_reports_attempted_requests(monkeypatch: pytest.
     with pytest.raises(client_module.AllProvidersExhaustedError) as exc_info:
         llm.generate([{"role": "user", "content": "hi"}])
 
-    assert exc_info.value.attempted_requests == 3
-    assert llm.usage.total_requests == 3
-    assert llm.usage.total_retries == 3
+    assert exc_info.value.attempted_requests == 3  # 例外に試行回数3が記録されていること
+    assert llm.usage.total_requests == 3  # 使用量トラッキング側でも3回とカウントされること
+    assert llm.usage.total_retries == 3  # リトライ数も3とカウントされること
 
 
 def test_missing_api_key_raises_value_error(monkeypatch: pytest.MonkeyPatch) -> None:
-    # 環境変数にAPIキーが1つも設定されていない状態でLLMClientを組み立てようと
-    # すると、実際にリクエストを送る前の初期化段階でValueErrorになることを
-    # 確認する。「キーが無いまま実行を進めて後から分かりにくいエラーになる」
-    # のではなく、最初にはっきり失敗させるという設計判断。
-    monkeypatch.delenv("MISSING_API_KEY", raising=False)
+    # 指定された環境変数にAPIキーが存在しない場合、LLMClientの構築時点でValueErrorになることを検証
+    monkeypatch.delenv("MISSING_API_KEY", raising=False)  # 該当の環境変数が存在しないことを保証
     spec = ProviderSpec("fake", "https://fake.example/v1", "MISSING_API_KEY")
 
     with pytest.raises(ValueError):

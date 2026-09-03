@@ -1,255 +1,158 @@
-"""Autonomous MBPP agent CLI (Section 4.3.1).
+"""自律型MBPPエージェントのCLI(セクション4.3.1)。
 
     uv run python -m agent_mbpp --task-file task.json --output solution.json \\
         --model-name "model/name" --provider-url "https://provider.api/v1"
 """
-# このファイルは「MBPP（短いアルゴリズム問題）を解くエージェント」のコマンドライン
-# エントリポイント。中身の役割はただ1つ: タスクを読み込み、必要な部品
-# （サンドボックス・MCPツール・LLMクライアント・Orchestrator）を組み立てて
-# Orchestrator に丸投げし、結果を solution.json として書き出すこと。
-# エージェントの「考える」ロジックそのもの（Thought→Code→Observationループ）は
-# 一切ここには無く、すべて orchestrator.py 側にある。ここは "配線" だけを担当する。
-from __future__ import annotations
+from __future__ import annotations  # 型注釈を文字列として遅延評価する(将来のアノテーション構文をサポート)
 
-import argparse
-import json
-import signal
-import sys
-from datetime import datetime
-from pathlib import Path
-from typing import Optional
+import argparse  # コマンドライン引数のパース用
+import json  # タスクファイルの読み込みや結果の書き出しに使うJSON処理
+import signal  # SIGTERMハンドラを登録するために使用
+import sys  # 実行ファイルパスや終了コード制御に使用
+from datetime import datetime  # 結果に付与するタイムスタンプ生成用
+from pathlib import Path  # ファイルパス操作用
+from typing import Optional  # Optional型注釈のため
 
-from llm.client import LLMClient
-from models import MBPPTaskInput, SandboxConfig, SolutionOutput
-from orchestrator import Orchestrator, OrchestratorConfig, ShutdownRequested
-from prompts import build_system_prompt
-from sandbox.executor import DEFAULT_AUTHORIZED_IMPORTS, Sandbox
-from sandbox.mcp_client import MCPToolProxy
+from llm.client import LLMClient  # LLMプロバイダへの問い合わせを行うクライアント
+from models import MBPPTaskInput, SandboxConfig, SolutionOutput  # タスク入力・サンドボックス設定・出力結果のデータモデル
+from orchestrator import Orchestrator, OrchestratorConfig, ShutdownRequested  # 思考→コード→観測ループの本体と設定、中断例外
+from prompts import build_system_prompt  # ベンチマークごとのシステムプロンプトを組み立てる関数
+from sandbox.executor import DEFAULT_AUTHORIZED_IMPORTS, Sandbox  # サンドボックス実行環境と許可インポート一覧
+from sandbox.mcp_client import MCPToolProxy  # MCPツールサーバへの接続プロキシ
 
-# このファイル自身の場所（sample/ ディレクトリ）を基準に、MCPツールサーバーの
-# スクリプトパスを組み立てる。相対パスに頼らないことで、どのディレクトリから
-# 起動されても正しく `mcp_tools_mbpp.py` を見つけられるようにしている。
-REPO_ROOT = Path(__file__).resolve().parent
-MCP_TOOLS_SCRIPT = REPO_ROOT / "mcp_tools_mbpp.py"
-# エージェントが実行中に書き込める唯一のディレクトリ。SandboxConfig.allowed_directories
-# としてそのまま使われる（後述）。/tmp 配下なので、プロセス終了後も残るがOS再起動で消える。
-SCRATCH_DIR = Path("/tmp/agent")
+REPO_ROOT = Path(__file__).resolve().parent  # このファイルが置かれているリポジトリのルートパス
+MCP_TOOLS_SCRIPT = REPO_ROOT / "mcp_tools_mbpp.py"  # MBPP用MCPツールサーバのスクリプトパス
+SCRATCH_DIR = Path("/tmp/agent")  # エージェントが使う一時作業ディレクトリ
 
-# MBPP用の予算。SWE-bench（agent_swebench.py）と比べて全体的に小さい値になっているのは、
-# MBPPが「短い関数を1つ書いて公開テストに通す」だけの軽量なタスクだから。
-MAX_ITERATIONS = 10
-MAX_INPUT_TOKENS = 6_000
-MAX_OUTPUT_TOKENS = 1_500
-TIMEOUT_SECONDS = 120
+MAX_ITERATIONS = 10  # デフォルトの最大反復回数(Thought->Code->Observationループの上限)
+MAX_INPUT_TOKENS = 6_000  # 累積入力トークン数の上限
+MAX_OUTPUT_TOKENS = 1_500  # 累積出力トークン数の上限
+TIMEOUT_SECONDS = 120  # エージェント全体の実行時間の上限(秒)
 
 
 def build_task_prompt(task: MBPPTaskInput) -> str:
-    # moulinette から渡された MBPPTaskInput（Section 4/models.py参照）を、
-    # LLMへの最初のユーザーメッセージ（自然言語のタスク説明）に変換する関数。
-    # ここで作られる文字列が orchestrator.py の messages[1]["content"] になる。
-    tests_preview = "\n".join(task.test_list) if task.test_list else "(no public tests provided)"
+    # MBPPタスクの内容からLLMに渡すユーザープロンプト文字列を組み立てる関数
+    tests_preview = "\n".join(task.test_list) if task.test_list else "(no public tests provided)"  # 公開テスト一覧を改行区切りで表示用に整形(なければその旨を表示)
     imports_note = (
-        # test_imports が指定されているタスクでは、「run_tests() がこのimportを
-        # 自動的に前置してくれるので、あなたの解答コード自身に書く必要はない」と
-        # LLMに明示的に伝える。これが無いと、LLMは「なぜかテストでNameErrorになる」
-        # ことに戸惑い、無駄なイテレーションを消費しかねない。
         f"\n\nrun_tests() automatically makes these imports available to the assertions "
         f"above, so you don't need to add them yourself just for the tests to run: "
         f"{'; '.join(task.test_imports)}"
         if task.test_imports
         else ""
-    )
+    )  # テストに必要な追加importがある場合、その旨をLLMに伝える補足文を作成
     return (
         f"Task: {task.task_definition}\n\n"
         f"Function signature: {task.function_definition}\n\n"
         f"Public tests your solution must pass (there may also be hidden tests):\n{tests_preview}"
         f"{imports_note}\n\n"
-        # 「隠しテストもあるかもしれない」と明記することで、LLMが公開テストだけに
-        # 過適合した安易な解法（ハードコードなど）に逃げるのを牽制している。
         "Use run_tests(code, test_list) to check your solution against these assertions "
         "before submitting. Submit with final_answer(your_function_code) once confident."
-    )
+    )  # タスク定義・関数シグネチャ・公開テスト・提出方法の指示をまとめたプロンプトを返す
 
 
 def error_solution(task_id: str, message: str) -> SolutionOutput:
-    # 起動時のタスク読み込み失敗や、実行中の予期しないクラッシュなど、
-    # 「正常にOrchestratorが回らなかった」ケース全般で使う、空っぽの失敗用
-    # SolutionOutput を組み立てるヘルパー。moulinette 側の契約
-    # （models.py の SolutionOutput）は success/solution/steps などの
-    # フィールドがすべて必須なので、失敗時でも「型として正しい」JSONを
-    # 必ず書き出せるようにするための存在。
+    # エラー発生時に返す空のSolutionOutputを組み立てるヘルパー関数
     return SolutionOutput(
-        task_id=task_id,
-        benchmark="mbpp",
-        success=False,
-        solution="",
-        iterations=0,
-        total_requests=0,
-        total_input_tokens=0,
-        total_output_tokens=0,
-        total_time_seconds=0.0,
-        steps=[],
-        system_prompt="",
-        error=message,
-        timestamp=datetime.now().isoformat(),
+        task_id=task_id,  # 対象タスクのID
+        benchmark="mbpp",  # ベンチマーク種別を固定でmbppとする
+        success=False,  # 失敗として記録
+        solution="",  # 解答は空文字列
+        iterations=0,  # 反復回数は0
+        total_requests=0,  # LLMへのリクエスト回数は0
+        total_input_tokens=0,  # 入力トークン数は0
+        total_output_tokens=0,  # 出力トークン数は0
+        total_time_seconds=0.0,  # 実行時間は0秒
+        steps=[],  # ステップの記録は空リスト
+        system_prompt="",  # システムプロンプトは空
+        error=message,  # エラーメッセージを格納
+        timestamp=datetime.now().isoformat(),  # 現在時刻をISO形式で記録
     )
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Agent Smith - MBPP agent")
-    parser.add_argument("--task-file", required=True)
-    parser.add_argument("--output", required=True)
-    parser.add_argument("--model-name", required=True)
-    parser.add_argument("--provider-url", required=True)
-    parser.add_argument("--max-iterations", type=int, default=MAX_ITERATIONS)
-    args = parser.parse_args()
+    # エントリーポイント: 引数解析、タスク読み込み、オーケストレータ実行、結果出力までを行う
+    parser = argparse.ArgumentParser(description="Agent Smith - MBPP agent")  # 引数パーサを作成
+    parser.add_argument("--task-file", required=True)  # 入力タスクファイルのパス(必須)
+    parser.add_argument("--output", required=True)  # 結果出力先ファイルのパス(必須)
+    parser.add_argument("--model-name", required=True)  # 使用するモデル名(必須)
+    parser.add_argument("--provider-url", required=True)  # LLMプロバイダのURL(必須)
+    parser.add_argument("--max-iterations", type=int, default=MAX_ITERATIONS)  # 最大反復回数(省略時はデフォルト値)
+    args = parser.parse_args()  # 実際にコマンドライン引数を解析
 
     try:
-        # --task-file に指定されたJSONファイルを読み、Pydanticモデル
-        # MBPPTaskInput（models.py）でバリデーションする。ここで失敗するのは
-        # 「JSONとして壊れている」「必須フィールドが無い」といったケースで、
-        # まだ Orchestrator も Sandbox も一切生成していない段階なので、
-        # 後始末すべきリソースは何も無い。即座にエラー用の solution.json を
-        # 書いて sys.exit(1) する。
-        task_data = json.loads(Path(args.task_file).read_text())
-        task = MBPPTaskInput.model_validate(task_data)
+        task_data = json.loads(Path(args.task_file).read_text())  # タスクファイルを読み込みJSONとしてパース
+        task = MBPPTaskInput.model_validate(task_data)  # pydanticモデルとしてバリデーション・変換
     except Exception as exc:
-        solution = error_solution("unknown", f"Failed to load task file: {type(exc).__name__}: {exc}")
-        Path(args.output).write_text(solution.model_dump_json(indent=2))
-        sys.exit(1)
+        # タスクファイルの読み込み・検証に失敗した場合はエラー用の解答を書き出して異常終了する
+        solution = error_solution("unknown", f"Failed to load task file: {type(exc).__name__}: {exc}")  # タスクID不明としてエラー結果を作成
+        Path(args.output).write_text(solution.model_dump_json(indent=2))  # 結果をJSONとして出力ファイルに書き込む
+        sys.exit(1)  # 異常終了コードでプロセスを終了
 
-    # orchestrator 変数はこの時点では None。SIGTERMハンドラのクロージャが
-    # この変数を後から参照する（Pythonのクロージャは変数を「name」で捕捉するので、
-    # 後で再代入されればハンドラ側からもその新しい値が見える）。
-    orchestrator: Optional[Orchestrator] = None
+    orchestrator: Optional[Orchestrator] = None  # オーケストレータのインスタンス(SIGTERMハンドラから参照するため先に宣言)
 
     def handle_sigterm(signum: int, frame: object) -> None:
-        # OSからSIGTERMが届いたときに呼ばれるハンドラ。
-        # まだ Orchestrator が存在しない段階（Sandbox構築中など）でSIGTERMが
-        # 来た場合は、自分で直接 ShutdownRequested を投げて、外側の
-        # try/except/finally に後始末をさせる。
-        # Orchestrator が既にあれば、request_stop() に委譲する
-        # （orchestrator.py側で _stop_requested フラグを立てつつ、同じく
-        #  ShutdownRequested を即座に送出する）。
+        # SIGTERM受信時のハンドラ: オーケストレータが未生成なら即座に例外を送出し、生成済みなら停止要求を伝える
         if orchestrator is None:
-            raise ShutdownRequested("shutdown requested (e.g. SIGTERM)")
-        orchestrator.request_stop()
+            raise ShutdownRequested("shutdown requested (e.g. SIGTERM)")  # まだループ開始前なのでここで直接中断させる
+        orchestrator.request_stop()  # 実行中のオーケストレータに停止を要求する
 
-    # ここでOS側にハンドラを登録する。以降このプロセスがSIGTERMを受け取ると、
-    # デフォルトの「即終了」ではなく上のhandle_sigtermが呼ばれるようになる。
-    signal.signal(signal.SIGTERM, handle_sigterm)
+    signal.signal(signal.SIGTERM, handle_sigterm)  # SIGTERMシグナルに上記ハンドラを登録
 
-    mcp_proxy = None
-    sandbox: Optional[Sandbox] = None
+    mcp_proxy = None  # MCPツールプロキシの参照(finally節でクローズするため先に宣言)
+    sandbox: Optional[Sandbox] = None  # サンドボックスの参照(finally節でクローズするため先に宣言)
     try:
-        # /tmp/agent をスクラッチ領域として用意。exist_ok=True なので
-        # 既に存在していてもエラーにならない（複数回実行されるケースへの配慮）。
-        SCRATCH_DIR.mkdir(parents=True, exist_ok=True)
-        # Some MBPP tasks' test assertions need an import (e.g. math.isclose)
-        # that the candidate solution itself has no reason to include - passed
-        # to mcp_tools_mbpp.py so run_tests() can prepend it itself rather
-        # than relying on the LLM to guess it's needed (see mcp_tools_mbpp.py).
-        # ↑ 上のコメントは元のコードにあったもの。日本語で補足すると:
-        # task.test_imports（例: ["import math"]）をJSON文字列にして環境変数
-        # AGENT_SMITH_TEST_IMPORTS に詰め、これから起動するMCPツールサーバー
-        # （別プロセス）の環境として渡す。mcp_tools_mbpp.py 側の
-        # _test_imports() がこの環境変数を読み取り、run_tests() の中で
-        # 候補コードの前に自動的に前置する。
-        tool_env = {"AGENT_SMITH_TEST_IMPORTS": json.dumps(task.test_imports)}
-        # MCPToolProxy を stdio モードで起動: 実体は
-        # `python mcp_tools_mbpp.py` を子プロセスとしてサブプロセス起動し、
-        # 標準入出力パイプ越しにMCPプロトコルで通信する。env=tool_env で
-        # 上で作った環境変数を子プロセスにだけ渡す（親プロセスの環境は汚さない）。
-        mcp_proxy = MCPToolProxy(stdio_command=f"{sys.executable} {MCP_TOOLS_SCRIPT}", env=tool_env)
+        SCRATCH_DIR.mkdir(parents=True, exist_ok=True)  # 一時作業ディレクトリを作成(既に存在してもエラーにしない)
+        # MBPPタスクの中には、候補解答自体には不要だがテストのassertion側で
+        # 必要となるimport(例: math.isclose)があるため、それをmcp_tools_mbpp.pyに
+        # 渡してrun_tests()側で自動的に先頭に追加させる(LLMが自力で気づくことに
+        # 依存しないようにする、詳細はmcp_tools_mbpp.py参照)。
+        tool_env = {"AGENT_SMITH_TEST_IMPORTS": json.dumps(task.test_imports)}  # テストに必要な追加importを環境変数として渡す準備
+        mcp_proxy = MCPToolProxy(stdio_command=f"{sys.executable} {MCP_TOOLS_SCRIPT}", env=tool_env)  # MCPツールサーバをサブプロセスとして起動しstdio経由で接続
 
         sandbox_config = SandboxConfig(
-            authorized_imports=DEFAULT_AUTHORIZED_IMPORTS,
-            # MBPPでは、エージェントが読み書きしていいディレクトリはスクラッチ
-            # 領域だけ。SWE-benchのように実リポジトリ(/testbed)を触る必要が
-            # 無いため、アクセス範囲を最小限に絞っている。
-            allowed_directories=[str(SCRATCH_DIR)],
-            # Must stay comfortably above mcp_tools_mbpp.py's own internal 10s
-            # run_tests() subprocess timeout, or the outer sandbox alarm can fire
-            # first on a legitimate (slow but correct) test run - found via a live
-            # smoke test against a real provider, see README.md.
-            # ↑ このタイムアウト値(20秒)は、mcp_tools_mbpp.py 内部で
-            # run_tests() が使っている「使い捨てサンドボックスの10秒タイムアウト」
-            # よりも確実に長く設定しなければならない。もし外側(このSandbox)の
-            # タイムアウトの方が短い、あるいは同じだと、正しいが少し遅い
-            # テスト実行を外側のアラームが先に殺してしまい、本来なら合格するはずの
-            # 解答を誤ってタイムアウト扱いにしてしまう。実際に本番相当のLLM
-            # プロバイダに対するスモークテストで発見された不具合。
-            max_execution_time_seconds=20,
-            max_memory_mb=256,
+            authorized_imports=DEFAULT_AUTHORIZED_IMPORTS,  # サンドボックス内で許可するimportの一覧
+            allowed_directories=[str(SCRATCH_DIR)],  # サンドボックスからアクセスを許可するディレクトリ
+            # mcp_tools_mbpp.py内部のrun_tests()サブプロセスタイムアウト(10秒)よりも
+            # 十分大きくしておく必要がある。そうしないと、正常だが遅いテスト実行に対して
+            # 外側のサンドボックスのアラームが先に発火してしまう
+            # (実際のプロバイダに対するライブスモークテストで判明した既知の問題、README.md参照)。
+            max_execution_time_seconds=20,  # サンドボックス全体の実行時間上限(秒)
+            max_memory_mb=256,  # サンドボックスに割り当てるメモリ上限(MB)
         )
-        # extra_namespace=mcp_proxy.build_namespace() で、MCPサーバーが
-        # 公開しているツール(run_tests)を、サンドボックス内のPython名前空間に
-        # 「ただの関数」として注入する。LLMが書くコードからは
-        # `run_tests(code=..., test_list=...)` という普通の関数呼び出しに
-        # 見えるが、実体は裏でMCPプロトコル越しに別プロセスへ委譲されている。
-        sandbox = Sandbox(sandbox_config, extra_namespace=mcp_proxy.build_namespace())
-        # システムプロンプトを組み立てる。"mbpp" を渡すことでMBPP用の
-        # final_answer説明文・worked exampleが選ばれる(prompts.py参照)。
-        # mcp_proxy.manual_text() が「今つながっているMCPサーバーのツール一覧」を
-        # 動的に生成するので、ここでどんなツールがあるかをこのファイルは
-        # 一切ハードコードしていない。
-        system_prompt = build_system_prompt("mbpp", mcp_proxy.manual_text())
+        sandbox = Sandbox(sandbox_config, extra_namespace=mcp_proxy.build_namespace())  # サンドボックスを生成し、MCPツールを名前空間に追加する
+        system_prompt = build_system_prompt("mbpp", mcp_proxy.manual_text())  # MBPP用のシステムプロンプトをツールの説明文付きで生成
 
-        # --model-name と --provider-url から、キーのローテーション・
-        # プロバイダのフォールバックまで面倒を見てくれる LLMClient を作る
-        # (config.py の resolve_provider() 経由で未知のプロバイダURLにも対応)。
-        llm_client = LLMClient.from_provider_url(args.model_name, args.provider_url)
-        # ここでようやく Orchestrator を生成する。この代入が終わった瞬間から、
-        # 上で定義した handle_sigterm はこの orchestrator インスタンスの
-        # request_stop() を呼べるようになる。
+        llm_client = LLMClient.from_provider_url(args.model_name, args.provider_url)  # 指定されたモデル・プロバイダURLからLLMクライアントを生成
         orchestrator = Orchestrator(
-            llm_client,
-            sandbox,
-            system_prompt,
+            llm_client,  # 使用するLLMクライアント
+            sandbox,  # 使用するサンドボックス
+            system_prompt,  # システムプロンプト
             OrchestratorConfig(
-                max_iterations=args.max_iterations,
-                max_input_tokens=MAX_INPUT_TOKENS,
-                max_output_tokens=MAX_OUTPUT_TOKENS,
-                # 全体のタイムアウト(120秒)から10秒を引いた110秒だけを
-                # Orchestratorに与える。残りの10秒は、ループを抜けたあとの
-                # sandbox.close()/mcp_proxy.close() などの後始末に使う余白。
-                max_time_seconds=TIMEOUT_SECONDS - 10,
-                max_tokens_per_request=400,
+                max_iterations=args.max_iterations,  # 最大反復回数(コマンドライン引数から)
+                max_input_tokens=MAX_INPUT_TOKENS,  # 入力トークン数上限
+                max_output_tokens=MAX_OUTPUT_TOKENS,  # 出力トークン数上限
+                max_time_seconds=TIMEOUT_SECONDS - 10,  # 全体タイムアウトから後片付け余裕分の10秒を引いた値
+                max_tokens_per_request=400,  # 1リクエストあたりの最大出力トークン数
             ),
-        )
+        )  # オーケストレータを生成しループ実行の準備をする
 
-        task_prompt = build_task_prompt(task)
-        # ここが実際にエージェントループが走る箇所。Thought→Code→Observationを
-        # 繰り返し、成功・失敗いずれの場合も SolutionOutput を返してくる
-        # (Section5/orchestrator.py参照)。この1行の中に、このプロジェクトの
-        # 本体ロジックがすべて詰まっている。
-        solution = orchestrator.run(str(task.task_id), "mbpp", task_prompt)
+        task_prompt = build_task_prompt(task)  # タスク情報からユーザープロンプトを構築
+        solution = orchestrator.run(str(task.task_id), "mbpp", task_prompt)  # Thought->Code->Observationループを実行し結果を取得
 
     except ShutdownRequested as exc:
-        # SIGTERMによってループが中断された場合。ここまでに積まれた steps は
-        # 失われる(Orchestrator.run内で例外により関数を抜けているため)が、
-        # 「なぜ止まったか」を説明する solution.json だけは必ず書き出す。
-        solution = error_solution(str(task.task_id), f"stopped: {exc}")
+        # SIGTERMなどによる中断要求を受けた場合、その旨を記録したエラー解答を作る
+        solution = error_solution(str(task.task_id), f"stopped: {exc}")  # 停止理由を含むエラー結果を生成
     except Exception as exc:
-        # 予期しないあらゆる例外(バグ、ネットワーク障害など)をここで拾い、
-        # プロセスをクラッシュさせるのではなく、必ず solution.json を
-        # 書き出してから終了する。"General Rules" の「エラーは必ず
-        # グレースフルに処理する」という要求を満たすための最後の砦。
-        solution = error_solution(str(task.task_id), f"Agent crashed: {type(exc).__name__}: {exc}")
+        # 想定外の例外が発生した場合、クラッシュとして記録する
+        solution = error_solution(str(task.task_id), f"Agent crashed: {type(exc).__name__}: {exc}")  # 例外の型とメッセージを含むエラー結果を生成
     finally:
-        # try節のどこで抜けても(正常終了・SIGTERM・クラッシュいずれでも)
-        # 必ずここを通る。生成済みのリソースだけを安全に閉じる
-        # (Noneチェックしているのは、途中で例外が起きて一部しか
-        #  生成されていない場合に備えるため)。
         if sandbox is not None:
-            sandbox.close()
+            sandbox.close()  # サンドボックスのリソースを確実に解放する
         if mcp_proxy is not None:
-            mcp_proxy.close()
+            mcp_proxy.close()  # MCPツールプロキシ(サブプロセス)を確実に終了させる
 
-    # 成功でも失敗でも、最後に必ず1回だけ solution.json を書き出す。
-    # これが moulinette が読みにいく最終成果物。
-    Path(args.output).write_text(solution.model_dump_json(indent=2))
+    Path(args.output).write_text(solution.model_dump_json(indent=2))  # 最終的な解答結果をJSON形式で出力ファイルに書き込む
 
 
 if __name__ == "__main__":
-    main()
+    main()  # スクリプトとして直接実行された場合にmain()を呼び出す

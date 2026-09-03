@@ -1,103 +1,62 @@
-# ============================================================================
-# 【日本語解説】llm/provider.py — LLMプロバイダの「共通インターフェース」を定義するファイル
-#
-# このプロジェクトは OpenRouter / Groq / Together / Fireworks / Google AI Studio
-# など複数のLLMプロバイダに対応する必要がある。しかし各プロバイダはAPIのワイヤ形式
-# （リクエストの組み立て方・レスポンスの読み方）がバラバラ。
-# そこで「プロバイダが何であっても、呼び出し側（llm/client.py）から見れば
-# 同じインターフェースで叩ける」ようにするための"契約"をこのファイルで定義している。
-#
-# ポイントは、単に「生成されたテキスト」だけを返せば良いわけではないということ。
-# 課題要件（requirements.md）が明示的に指摘しているのは、「generate()はテキストだけでなく
-# トークン数・応答時間・APIのURL・モデル名・リトライ回数まで返さなければならない」という点。
-# なぜなら、これらの値がすべて models.py の StepMetrics（1ステップごとの計測記録）を
-# 埋めるために必須だから。もしテキストしか返さなければ、後段の Orchestrator が
-# 「このステップで何トークン使ったか」を一切知りようがなくなってしまう。
-# ============================================================================
-"""Abstract LLM provider interface and usage-tracking types.
+"""抽象LLMプロバイダインターフェースと、使用量トラッキング用の各種型。
 
-Requirements.md flags an implementation gap for this exact spot: `generate()`
-must return enough metadata to populate StepMetrics (tokens, timing, api_url,
-model_name, retries), not just raw text. GenerationResult below is that
-contract; every concrete provider (openai_compatible.py, gemini.py) returns one.
+Requirements.mdはまさにこの箇所を実装ギャップとして指摘している: `generate()`は
+単なる生テキストだけではなく、StepMetricsを埋めるために十分なメタデータ
+(トークン数、時間、api_url、model_name、retries)を返さなければならない。
+以下のGenerationResultがその契約であり、全ての具体的プロバイダ
+(openai_compatible.py、gemini.py)はこれを返す。
 """
-from __future__ import annotations
+from __future__ import annotations  # 型注釈の評価を遅延させるためのfuture import
 
-from dataclasses import dataclass, field
-from typing import List, Optional, Protocol
+from dataclasses import dataclass, field  # データクラス定義と可変デフォルト値用のfield
+from typing import List, Optional, Protocol  # 型ヒント用のList、Optional、構造的部分型のProtocol
 
 
 @dataclass
 class GenerationResult:
-    """Everything one agent step needs to populate StepMetrics (models.py)."""
-    # 【日本語解説】
-    # LLMに1回問い合わせた結果をまるごと表すデータクラス。
-    # openai_compatible.py / gemini.py という「中身が全く違う2つの実装」が、
-    # どちらも最終的にこの同じ型を組み立てて返すことで、呼び出し側（llm/client.py の
-    # LLMClient や orchestrator.py）はプロバイダの違いを一切気にしなくてよくなる。
-    # フィールドはそのまま models.py の StepMetrics の対応フィールドに流し込まれる
-    # （orchestrator.py で gen.text → llm_output、gen.input_tokens → input_tokens、
-    #   というように1対1で対応している）。
+    """1回のエージェントステップがStepMetrics(models.py)を埋めるために必要な全情報。"""
 
-    text: str              # LLMが生成した生のテキスト（Thought+Codeの全文、加工前）
-    input_tokens: int      # このリクエストで消費した入力トークン数
-    output_tokens: int     # このリクエストで生成された出力トークン数
-    request_time_ms: float  # このAPIコール1回にかかった時間（ミリ秒、壁時計時間）
-    api_url: str            # 実際に叩いたAPIのベースURL（どのプロバイダを使ったか後から追跡できるように）
-    model_name: str          # 実際に使われたモデル識別子
-    retries: int = 0          # このリクエストが成功するまでに何回リトライしたか（デフォルトは0=一発成功）
+    text: str  # LLMが生成したテキスト本文
+    input_tokens: int  # 入力(プロンプト)側のトークン数
+    output_tokens: int  # 出力(生成結果)側のトークン数
+    request_time_ms: float  # このリクエストにかかった実時間(ミリ秒)
+    api_url: str  # リクエストを送信したAPIのベースURL
+    model_name: str  # 使用したモデル名
+    retries: int = 0  # 成功するまでにかかったリトライ回数(デフォルトは0)
 
 
 class ChatProvider(Protocol):
-    """A provider knows how to turn (messages, model, api_key, ...) into a GenerationResult."""
-    # 【日本語解説】
-    # Python の typing.Protocol を使った「構造的部分型（ダックタイピングの静的版）」。
-    # 継承を強制せず、「chat()という同じシグネチャのメソッドさえ持っていれば、
-    # どんなクラスでもChatProviderとして扱ってよい」というインターフェース定義。
-    # 実際にこのプロトコルを満たすクラスは openai_compatible.py の
-    # OpenAICompatibleProvider と gemini.py の GeminiProvider の2つ。
+    """プロバイダは (messages, model, api_key, ...) をGenerationResultに変換する方法を知っている。"""
 
     def chat(
         self,
-        messages: List[dict],           # 会話履歴（{"role": "system"/"user"/"assistant", "content": "..."}のリスト）
-        model: str,                      # 呼び出すモデル名
-        api_key: str,                     # 認証に使うAPIキー（1回の呼び出しにつき1本、呼び出し側でローテーション済み）
-        stop: Optional[List[str]],         # 生成を打ち切るstop sequence（例: ["<end_code>"]）
-        max_output_tokens: int,             # 出力トークン数の上限
-        timeout: float,                      # HTTPリクエストのタイムアウト秒数
+        messages: List[dict],  # 会話履歴(role/contentの辞書のリスト)
+        model: str,  # 使用するモデル名
+        api_key: str,  # 認証に使うAPIキー
+        stop: Optional[List[str]],  # 生成を止めるストップシーケンス(任意)
+        max_output_tokens: int,  # 生成する最大トークン数
+        timeout: float,  # リクエストのタイムアウト秒数
     ) -> GenerationResult:
-        ...  # pragma: no cover - Protocol
-        # 【日本語解説】本体を持たない（Protocolなので実装は各サブクラス側にある）
+        ...  # pragma: no cover - Protocolのため実装本体はここには存在しない
 
 
 @dataclass
 class UsageStats:
-    """Aggregate usage tracking across a whole agent run (Section 4.2 - Technical
-    Constraints: "you must implement usage tracking: tokens, retries, latency,
-    requests")."""
-    # 【日本語解説】
-    # 1回のLLM呼び出し分ではなく、「エージェントが1タスクを解く間ずっと」の
-    # 累積使用量を集計するためのクラス。LLMClient（llm/client.py）が1個だけ保持し、
-    # generate()が呼ばれるたびに record() で加算していく。
-    # 課題要件「トークン数・リトライ回数・レイテンシ・リクエスト数の使用量トラッキングを
-    # 実装しなければならない」に対応する実体がこれ。
+    """エージェント実行全体を通じた使用量の集計(Section 4.2 - 技術的制約:
+    「トークン数、リトライ回数、レイテンシ、リクエスト数の使用量トラッキングを
+    実装しなければならない」への対応)。"""
 
-    total_requests: int = 0      # これまでの累積HTTPリクエスト数（成功・失敗問わず、リトライも1件として数える）
-    total_retries: int = 0        # 累積リトライ回数
-    total_input_tokens: int = 0    # 累積入力トークン数
-    total_output_tokens: int = 0    # 累積出力トークン数
-    total_latency_ms: float = 0.0    # 累積レイテンシ（ミリ秒）
-    errors: List[str] = field(default_factory=list)  # 発生したエラーメッセージの履歴（プロバイダ名付き）
+    total_requests: int = 0  # 送信したリクエストの総数(リトライ含む)
+    total_retries: int = 0  # リトライの総回数
+    total_input_tokens: int = 0  # 入力トークンの総数
+    total_output_tokens: int = 0  # 出力トークンの総数
+    total_latency_ms: float = 0.0  # 累積のレイテンシ(ミリ秒)
+    errors: List[str] = field(default_factory=list)  # 発生したエラーメッセージの一覧(可変なのでdefault_factoryで初期化)
 
     def record(self, gen: GenerationResult) -> None:
-        # 【日本語解説】
-        # 1回の成功したLLM呼び出し結果（GenerationResult）を受け取り、
-        # 各累積カウンタに加算する。「+= 1 + gen.retries」がポイント:
-        # 例えばリトライが2回あって3回目で成功した場合、実際に送られたHTTPリクエストは
-        # 3本（失敗2回＋成功1回）なので、「1（成功分）+ retries（失敗分）」で
-        # 正しくリクエスト総数をカウントできる。
-        self.total_requests += 1 + gen.retries
-        self.total_retries += gen.retries
-        self.total_input_tokens += gen.input_tokens
-        self.total_output_tokens += gen.output_tokens
-        self.total_latency_ms += gen.request_time_ms
+        # 1回の成功した生成結果を受け取り、その分の集計を各カウンタに加算するメソッド
+        self.total_requests += 1 + gen.retries  # 今回の成功リクエスト1回 + それまでの失敗(リトライ)回数を加算
+        self.total_retries += gen.retries  # リトライ回数を累積に加算
+        self.total_input_tokens += gen.input_tokens  # 入力トークン数を累積に加算
+        self.total_output_tokens += gen.output_tokens  # 出力トークン数を累積に加算
+        self.total_latency_ms += gen.request_time_ms  # レイテンシを累積に加算

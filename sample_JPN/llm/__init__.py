@@ -1,1 +1,1 @@
-"""Multi-provider LLM client abstraction (Section 4.6)."""
+"""マルチプロバイダ対応のLLMクライアント抽象化レイヤー(Section 4.6)。"""

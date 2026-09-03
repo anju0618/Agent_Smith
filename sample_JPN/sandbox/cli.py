@@ -1,156 +1,118 @@
-"""Sandbox CLI (Section 4.2): interactive REPL, optionally wired to an MCP server.
+"""サンドボックスCLI(仕様書 4.2節): 対話式REPLで、任意でMCPサーバーと接続できる。
 
-    uv run sandbox                                          # interactive, defaults
-    uv run sandbox sandbox_template.json                    # custom config
+    uv run sandbox                                          # 対話モード、デフォルト設定
+    uv run sandbox sandbox_template.json                    # 独自の設定ファイルを指定
     uv run sandbox --mcp-stdio "python mcp_tools_mbpp.py" sandbox_template.json
     uv run sandbox --mcp-server http://localhost:8000/mcp
-
-# ============================================================================
-# 【日本語解説】このファイルの立ち位置
-# ============================================================================
-# `uv run sandbox` というコマンドの実体がこのファイルの main() です
-# （pyproject.tomlの[project.scripts]でsandbox.cli:mainとして登録されて
-# いる）。役割は2つ:
-#   1. Sandbox と MCPToolProxy を実際に動かして手元で試すための、
-#      人間向けの対話的REPL（Read-Eval-Print Loop）を提供する。
-#   2. このプロジェクトの中で「SandboxとMCPToolProxyをどう組み合わせて
-#      使うか」の**最小のリファレンス実装**として機能する ──
-#      agent_mbpp.py/agent_swebench.pyを読む前に、まずこの小さな
-#      main()を読むと全体の使い方がイメージしやすい。
-# ============================================================================
 """
 from __future__ import annotations
 
-import argparse
-import json
-import sys
-from pathlib import Path
-from typing import Optional
+import argparse  # コマンドライン引数のパース用
+import json  # 設定ファイル(JSON)の読み込み用
+import sys  # 標準エラー出力・終了コード制御用
+from pathlib import Path  # 設定ファイルパスの操作用
+from typing import Optional  # 省略可能な型ヒント用
 
-from models import SandboxConfig
+from models import SandboxConfig  # サンドボックス設定を表すPydanticモデル
+# デフォルトの許可import一覧・許可ディレクトリ一覧、FinalAnswer例外、Sandbox本体をexecutorから取得
 from sandbox.executor import DEFAULT_ALLOWED_DIRECTORIES, DEFAULT_AUTHORIZED_IMPORTS, FinalAnswer, Sandbox
-from sandbox.mcp_client import MCPToolProxy
+from sandbox.mcp_client import MCPToolProxy  # MCPサーバーへの同期的クライアントラッパー
 
 
 def load_config(path: Optional[str]) -> SandboxConfig:
-    """Load a SandboxConfig from a JSON file, or fall back to the project defaults."""
-    # 【日本語解説】
-    # パス未指定ならプロジェクトのデフォルト設定
-    # （DEFAULT_AUTHORIZED_IMPORTS / DEFAULT_ALLOWED_DIRECTORIES、
-    # executor.py参照）を使う。パスが指定されていれば、そのJSONファイル
-    # （例: sandbox_template.json、Section 14参照）を読み込み、
-    # SandboxConfig.model_validate()でPydanticのバリデーションを
-    # 通してから使う。
+    """JSONファイルからSandboxConfigを読み込む。pathがNoneならプロジェクトのデフォルト設定を使う。"""
     if path is None:
+        # 設定ファイル未指定時は、デフォルトの許可import・許可ディレクトリでSandboxConfigを構築
         return SandboxConfig(
             authorized_imports=DEFAULT_AUTHORIZED_IMPORTS,
             allowed_directories=DEFAULT_ALLOWED_DIRECTORIES,
         )
-    config_path = Path(path)
-    with config_path.open("r", encoding="utf-8") as file:
-        data = json.load(file)
-    return SandboxConfig.model_validate(data)
+    config_path = Path(path)  # 文字列パスをPathオブジェクトに変換
+    with config_path.open("r", encoding="utf-8") as file:  # 設定ファイルをUTF-8で開く
+        data = json.load(file)  # JSONをPythonの辞書として読み込む
+    return SandboxConfig.model_validate(data)  # 辞書をバリデーションしてモデル化
 
 
 def _connect_mcp(mcp_stdio: Optional[str], mcp_server: Optional[str]) -> Optional[MCPToolProxy]:
-    # 【日本語解説】
-    # --mcp-stdio と --mcp-server はどちらも省略可能（両方省略すれば
-    # ツール無しの素のサンドボックスとして動く）。指定があれば
-    # MCPToolProxy（sandbox/mcp_client.py、Section 8.3）をその
-    # トランスポート方式で接続する。
+    # stdio経由のMCPサーバー起動コマンドが指定されていれば、そちらを優先して接続
     if mcp_stdio:
         print(f"Connecting to MCP server over stdio: {mcp_stdio}")
         return MCPToolProxy(stdio_command=mcp_stdio)
+    # HTTP経由のMCPサーバーURLが指定されていればそちらに接続
     if mcp_server:
         print(f"Connecting to MCP server over streamable HTTP: {mcp_server}")
         return MCPToolProxy(http_url=mcp_server)
-    return None
+    return None  # どちらも指定がなければMCP接続なし
 
 
 def repl(sandbox: Sandbox) -> None:
-    """REPL-style CLI mode (Section 4.2): reads code, a blank line runs the
-    accumulated block, 'exit' or EOF (Ctrl+D) quits cleanly."""
-    # ------------------------------------------------------------------
-    # 【日本語解説】対話ループの中身
-    # ------------------------------------------------------------------
-    # 1行ずつinput()で読み込み、空行が来るまで1つのコードブロックとして
-    # 蓄積する。空行が来たらそのブロックをsandbox.run()に渡して実行し、
-    # 結果を表示してまた最初から繰り返す。'exit'とCtrl+D(EOFError)の
-    # どちらでも正常に抜けられるようにしている。
+    """REPL形式のCLIモード(仕様書 4.2節): コードを読み取り、空行で溜まったブロックを実行する。
+    'exit'入力またはEOF(Ctrl+D)できれいに終了する。"""
     print("Agent Smith interactive sandbox. Blank line runs the block, 'exit' or Ctrl+D quits.")
     while True:
-        lines: list = []
+        lines: list = []  # 入力された行を溜めるバッファ
         try:
-            first_line = input(">>> ")
+            first_line = input(">>> ")  # 最初の行を読み取る(プロンプトは">>> "を模倣)
         except EOFError:
-            print()
+            print()  # Ctrl+DでEOFになったら改行してから終了
             return
-        if first_line.strip() == "exit":
+        if first_line.strip() == "exit":  # 'exit'と入力されたらREPLを終了
             return
         if first_line != "":
-            lines.append(first_line)
+            lines.append(first_line)  # 空行でなければバッファに追加
             while True:
                 try:
-                    line = input("... ")
+                    line = input("... ")  # 継続行を読み取る(継続プロンプト"... ")
                 except EOFError:
-                    print()
+                    print()  # 継続入力中にEOFなら改行して終了
                     return
                 if line == "":
-                    break
-                lines.append(line)
+                    break  # 空行が来たらブロックの入力終了とみなす
+                lines.append(line)  # 継続行をバッファに追加
 
-        code = "\n".join(lines)
+        code = "\n".join(lines)  # バッファ内の行を改行で連結して1つのコード文字列にする
         if not code.strip():
-            continue
+            continue  # 空コードなら何もせず次のループへ
         try:
-            result = sandbox.run(code)
+            result = sandbox.run(code)  # サンドボックス内でコードを実行
         except FinalAnswer as fa:
-            # 【日本語解説】
-            # REPLでも final_answer(...) を呼べば、通常のエージェント
-            # ループと同じようにFinalAnswer例外として飛んでくる。
-            # ここではエージェントを終了させるのではなく、申告内容を
-            # 表示してREPLを続けるだけの、動作確認用の扱いにしている。
+            # final_answer()が呼ばれたら、その回答を表示して次の入力へ(REPLは終了しない)
             print(f"[final_answer submitted] {fa.answer!r}")
             continue
-        print(result)
+        print(result)  # 実行結果(標準出力またはエラーメッセージ)を表示
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Agent Smith sandbox")
+    parser = argparse.ArgumentParser(description="Agent Smith sandbox")  # CLI引数パーサーを作成
+    # 位置引数: サンドボックス設定JSONファイルへのパス(省略可、省略時はNone)
     parser.add_argument("config", nargs="?", default=None, help="Path to sandbox configuration JSON file")
+    # オプション引数: stdio経由でMCPサーバーを起動するコマンド
     parser.add_argument("--mcp-stdio", default=None, help="Command used to launch an MCP server over stdio")
+    # オプション引数: streamable HTTPのMCPサーバーのURL
     parser.add_argument("--mcp-server", default=None, help="URL of a streamable HTTP MCP server")
-    args = parser.parse_args()
+    args = parser.parse_args()  # コマンドライン引数を実際にパース
 
     try:
-        config = load_config(args.config)
+        config = load_config(args.config)  # 設定ファイルを読み込む(失敗時は例外)
     except (OSError, json.JSONDecodeError, ValueError) as exc:
+        # ファイルI/Oエラー・JSON構文エラー・バリデーションエラーをまとめて捕捉
         print(f"Failed to load sandbox config: {exc}", file=sys.stderr)
-        sys.exit(1)
+        sys.exit(1)  # 設定読み込み失敗時は終了コード1で異常終了
 
-    mcp_proxy = None
-    sandbox = None
+    mcp_proxy = None  # MCPプロキシ(未接続なら None のまま)
+    sandbox = None  # サンドボックスインスタンス(生成前は None)
     try:
-        # 【日本語解説】
-        # ここが「Sandbox + MCPToolProxy」の最小の組み合わせ方の見本。
-        # 1. MCPサーバーに接続する（指定されていれば）
-        # 2. mcp_proxy.build_namespace() でツールをPython関数の辞書に変換
-        # 3. その辞書を Sandbox の extra_namespace としてそのまま渡す
-        # これと全く同じパターンが agent_mbpp.py / agent_swebench.py でも
-        # 使われている（Section 11参照）。
-        mcp_proxy = _connect_mcp(args.mcp_stdio, args.mcp_server)
+        mcp_proxy = _connect_mcp(args.mcp_stdio, args.mcp_server)  # 指定があればMCPサーバーに接続
+        # MCPツールをサンドボックスの名前空間に追加するための辞書を構築(未接続なら空辞書)
         extra_namespace = mcp_proxy.build_namespace() if mcp_proxy else {}
         if mcp_proxy:
+            # 接続成功時は利用可能なツール数と説明文(マニュアル)を表示
             print(f"Connected. {len(mcp_proxy.tools)} tool(s) available:\n{mcp_proxy.manual_text()}\n")
 
-        sandbox = Sandbox(config, extra_namespace=extra_namespace)
-        repl(sandbox)
+        sandbox = Sandbox(config, extra_namespace=extra_namespace)  # サンドボックス本体を生成
+        repl(sandbox)  # 対話ループを開始
     finally:
-        # 【日本語解説】
-        # どんな終わり方をしても（正常終了、例外、Ctrl+C）、
-        # Sandboxの隔離ワーカープロセスとMCP接続を必ず後片付けする。
-        # agent_mbpp.py/agent_swebench.pyのfinallyブロックと同じ
-        # パターン。
+        # 正常終了・例外発生いずれの場合も、後始末としてサンドボックスとMCP接続を必ず閉じる
         if sandbox:
             sandbox.close()
         if mcp_proxy:
@@ -158,4 +120,4 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    main()  # スクリプトとして直接実行された場合のエントリーポイント

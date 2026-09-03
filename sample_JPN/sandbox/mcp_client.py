@@ -1,89 +1,49 @@
-"""Synchronous facade over the official `mcp` SDK's async client (Section 4.2).
+"""公式`mcp` SDKの非同期クライアントに対する、同期的なファサード(仕様書 4.2節)。
 
-The sandbox needs plain, synchronous Python functions in its exec() namespace
-- `result = search_code("foo")` - but the `mcp` package's ClientSession is
-asyncio-based. This runs one persistent event loop in a background thread and
-bridges every call across it with run_coroutine_threadsafe, so the rest of the
-codebase never has to think about asyncio.
+サンドボックスのexec()名前空間には`result = search_code("foo")`のような
+普通の同期的なPython関数が必要だが、`mcp`パッケージのClientSessionは
+asyncioベースで作られている。このモジュールはバックグラウンドスレッドで
+1つの永続的なイベントループを動かし、run_coroutine_threadsafeを使って
+すべての呼び出しをそのループへ橋渡しすることで、コードベースの他の部分が
+asyncioを意識しなくて済むようにしている。
 
-Supports both required transports (Section 4.2): stdio (spawns the MCP server
-as a subprocess) and streamable HTTP (connects to an already-running server).
-
-# ============================================================================
-# 【日本語解説】このファイルの立ち位置 ── なぜこんなに複雑なのか
-# ============================================================================
-# MCPプロトコル（ツール発見・呼び出し）の公式SDK(`mcp`パッケージ)は
-# asyncioベースで作られています。しかしサンドボックス側
-# (sandbox/executor.py)のexec()名前空間には、`result = search_code("foo")`
-# のような**ただの同期関数呼び出し**が必要です。LLMが生成するコードに
-# `await`や`async def`を書かせるわけにはいきません。
-#
-# そのギャップを埋めるのがこの MCPToolProxy クラスです。やっていることを
-# 一言でいうと「非同期のMCPクライアントを、専用のバックグラウンドスレッド
-# の中に閉じ込め、そのスレッドとメインスレッドの間を
-# asyncio.run_coroutine_threadsafe() で橋渡しすることで、外から見ると
-# 完全に同期的なAPIに見せかける」というテクニックです。
-#
-# これにより、このファイルより外側のコード（executor.py、
-# isolated_worker.py、agent_mbpp.py等）は asyncio を一切意識せずに
-# 済みます。
-# ============================================================================
+仕様書4.2節が要求する両方のトランスポートに対応する: stdio(MCPサーバーを
+サブプロセスとして起動する方式)と streamable HTTP(既に起動済みのサーバーに
+接続する方式)。
 """
 from __future__ import annotations
 
-import asyncio
-import concurrent.futures
-import shlex
-import threading
-from contextlib import AsyncExitStack
+import asyncio  # 非同期I/O(MCPクライアントの実体)を扱うため
+import concurrent.futures  # スレッド間でのFuture結果取得・タイムアウト処理用
+import shlex  # stdio起動コマンド文字列をシェル的に安全に分割するため
+import threading  # イベントループを動かす専用バックグラウンドスレッド用
+from contextlib import AsyncExitStack  # 複数の非同期コンテキストマネージャをまとめて管理するため
 from typing import Any, Callable, Dict, List, Optional
 
-from mcp import ClientSession
-from mcp.client.stdio import StdioServerParameters, stdio_client
-from mcp.client.streamable_http import streamablehttp_client
-from mcp.types import Tool
+from mcp import ClientSession  # MCPサーバーとの1セッションを表すクライアント
+from mcp.client.stdio import StdioServerParameters, stdio_client  # stdioトランスポート用
+from mcp.client.streamable_http import streamablehttp_client  # streamable HTTPトランスポート用
+from mcp.types import Tool  # MCPツールのスキーマ情報を表す型
 
-# Generous but finite: a legitimate tool call can run a whole test suite
-# (mcp_tools_swebench.py's run_tests()) or a long shell command, but an MCP
-# server that has died or deadlocked must not be able to hang the sandbox
-# (and, in turn, agent_mbpp.py/agent_swebench.py's cleanup/solution.json
-# write) forever. Connection establishment and shutdown have shorter bounds so
-# a dead server cannot block startup or container cleanup indefinitely.
-# ----------------------------------------------------------------------------
-# 【日本語解説】3種類のタイムアウトが用意されている理由
-# ----------------------------------------------------------------------------
-# - CONNECT_TIMEOUT_SECONDS (30秒): MCPサーバーへの接続確立に許す時間。
-#   サブプロセス起動やHTTP接続開始が異常に遅い場合、ここで見切りをつける。
-# - CALL_TOOL_TIMEOUT_SECONDS (300秒=5分): 1回のツール呼び出しに許す時間。
-#   SWE-benchのrun_tests()がテストスイート全体を回すこともあるため長め。
-#   ただし無限ではない ── サーバーが死んでいたりデッドロックしていたら、
-#   ここで打ち切ってエラーメッセージに変換する。
-# - CLOSE_TIMEOUT_SECONDS (10秒): 後片付け(close)に許す時間。
-#   agent_swebench.pyのfinallyブロックでは、この直後に
-#   container.cleanup()が控えているため、closeがここで無期限に
-#   ハングするとDockerコンテナの後始末まで巻き添えで止まってしまう。
-# どの境界にも必ず「有限の」タイムアウトが設定されている、という
-# 一貫した設計方針が見える。
-# ----------------------------------------------------------------------------
-CONNECT_TIMEOUT_SECONDS = 30.0
-CALL_TOOL_TIMEOUT_SECONDS = 300.0
-CLOSE_TIMEOUT_SECONDS = 10.0
+# 十分に長いが有限: 正当なツール呼び出しはテストスイート全体を実行することもあれば
+# (mcp_tools_swebench.pyのrun_tests())、長時間かかるシェルコマンドのこともある。
+# しかし、死んだり・デッドロックしたりしたMCPサーバーがサンドボックス
+# (ひいてはagent_mbpp.py/agent_swebench.pyのクリーンアップ処理やsolution.json
+# の書き込み)を永遠にハングさせてしまうことがあってはならない。接続確立と
+# 切断についてはより短い上限を設けており、死んだサーバーが起動処理や
+# コンテナのクリーンアップを無期限にブロックしないようにしている。
+CONNECT_TIMEOUT_SECONDS = 30.0  # MCPサーバーへの接続確立を待つ最大秒数
+CALL_TOOL_TIMEOUT_SECONDS = 300.0  # 1回のツール呼び出しを待つ最大秒数
+CLOSE_TIMEOUT_SECONDS = 10.0  # 切断処理を待つ最大秒数
 
 
 class MCPToolProxy:
-    """Connects to one MCP server and exposes its tools as synchronous callables.
+    """1つのMCPサーバーに接続し、そのツール群を同期的に呼び出せる関数として公開するクラス。
 
-    Section 4.2: "the system will be tested with an unknown MCP server" - this
-    proxy never hardcodes tool names, it discovers them from list_tools() and
-    builds wrappers dynamically, so it works with any compliant MCP server.
+    仕様書4.2節: 「システムは未知のMCPサーバーでテストされる」 - このプロキシは
+    ツール名を一切ハードコードせず、list_tools()から動的に発見しラッパーを
+    構築するため、仕様に準拠したどのMCPサーバーとでも動作する。
     """
-    # 【日本語解説】
-    # クラスdocstringにある通り、このクラスはツール名を一切
-    # ハードコードしません。接続後にlist_tools()を呼んで初めて
-    # 「このMCPサーバーにはどんなツールがあるか」を知り、そこから
-    # 動的にラッパー関数を生成します（build_namespace参照）。これが
-    # 「未知のMCPサーバーに繋いでテストされる」という課題要件への
-    # 直接的な対応です。
 
     def __init__(
         self,
@@ -92,239 +52,147 @@ class MCPToolProxy:
         env: Optional[Dict[str, str]] = None,
         connect_timeout: float = CONNECT_TIMEOUT_SECONDS,
     ) -> None:
-        # 【日本語解説】
-        # stdio_command（サブプロセスとして起動するコマンド文字列）か
-        # http_url（既に起動済みのHTTPサーバーのURL）のどちらか
-        # "ちょうど1つ"だけを受け取る。bool(a) == bool(b) は
-        # 「両方Noneでない」または「両方None」のどちらかならTrueになる
-        # ため、XOR的に「ちょうど片方だけ指定」を強制するイディオム。
+        # stdio_commandとhttp_urlはどちらか一方だけを指定する必要がある(XOR)
         if bool(stdio_command) == bool(http_url):
             raise ValueError("Provide exactly one of stdio_command or http_url")
         if connect_timeout <= 0:
             raise ValueError("connect_timeout must be positive")
 
-        # ------------------------------------------------------------------
-        # 【日本語解説】専用イベントループとバックグラウンドスレッドの準備
-        # ------------------------------------------------------------------
-        # asyncio.new_event_loop() で、メインスレッドのイベントループとは
-        # 完全に独立した専用のイベントループを作る。これを別スレッド
-        # (self._thread)の中で self._run_event_loop() として動かす。
-        # 以降、MCP関連の非同期処理はすべてこのループの上で実行される。
-        self._loop = asyncio.new_event_loop()
+        self._loop = asyncio.new_event_loop()  # このプロキシ専用の新しいイベントループを作成
         self._thread = threading.Thread(
-            target=self._run_event_loop,
+            target=self._run_event_loop,  # このスレッドの実体はイベントループを回し続ける関数
             name="agent-smith-mcp-loop",
-            daemon=True,
+            daemon=True,  # メインプロセス終了時にこのスレッドが道連れで終了できるようにする
         )
-        # 【日本語解説】
-        # スレッド間の同期に使う各種Event。
-        #   _connection_ready: 接続確立(成功/失敗どちらか確定)を知らせる
-        #   _owner_stopped: _connection_owner()コルーチンが終了したことを知らせる
-        #   _close_requested: 「正常にcloseしてほしい」という要求
-        #   _cancel_requested: 「強制的にキャンセルしてほしい」という要求
-        self._connection_ready = threading.Event()
-        self._owner_stopped = threading.Event()
-        self._close_requested = threading.Event()
-        self._cancel_requested = threading.Event()
-        self._connection_error: Optional[BaseException] = None
-        self._owner_task: Optional[asyncio.Task[Any]] = None
-        self._connection_args = (stdio_command, http_url, env)
-        self._closed = False
-        self.session: Optional[ClientSession] = None
-        self.tools: List[Tool] = []
-        self._thread.start()
+        self._connection_ready = threading.Event()  # 接続確立(成功/失敗問わず)完了を知らせるイベント
+        self._owner_stopped = threading.Event()  # 接続所有タスク(_connection_owner)が終了したことを知らせる
+        self._close_requested = threading.Event()  # 正常な切断を要求されたことを示すフラグ
+        self._cancel_requested = threading.Event()  # 強制キャンセルを要求されたことを示すフラグ
+        self._connection_error: Optional[BaseException] = None  # 接続確立中に発生したエラーを保持
+        self._owner_task: Optional[asyncio.Task[Any]] = None  # 接続を所有し続けるasyncioタスク
+        self._connection_args = (stdio_command, http_url, env)  # 接続確立に必要な引数一式
+        self._closed = False  # 既にclose()済みかどうか
+        self.session: Optional[ClientSession] = None  # 接続済みのMCPクライアントセッション
+        self.tools: List[Tool] = []  # 接続先サーバーから発見されたツール一覧
+        self._thread.start()  # バックグラウンドでイベントループスレッドを起動
 
-        # 【日本語解説】
-        # __init__自体は同期関数として呼ばれるので、ここでバックグラウンド
-        # スレッドが接続を確立する（またはタイムアウト/失敗する）まで、
-        # メインスレッド側は_connection_ready.wait()でブロックして待つ。
         try:
-            ready = self._connection_ready.wait(timeout=connect_timeout)
+            ready = self._connection_ready.wait(timeout=connect_timeout)  # 接続完了(または失敗)を待つ
         except BaseException:
-            # 待機中にKeyboardInterruptなどが飛んできても、バックグラウンド
-            # スレッドを放置せず後片付けしてから再送出する。
+            # 待機中に(例えばKeyboardInterrupt等で)割り込まれた場合も、
+            # バックグラウンドスレッドを確実に停止させてから再送出する
             self._stop_owner(graceful=False)
             raise
 
         if not ready:
+            # タイムアウトした場合は接続所有タスクを止めてから例外化する
             self._stop_owner(graceful=False)
             raise TimeoutError(f"MCP connection timed out after {connect_timeout}s")
         if self._connection_error is not None:
-            # 接続中にエラーが起きていた場合、そのままそのエラーを
-            # 呼び出し元に伝播させる。
+            # 接続処理中に例外が起きていた場合、それをこの呼び出し元スレッドで再送出する
             error = self._connection_error
             self._stop_owner(graceful=False)
             raise error
 
     def _run_event_loop(self) -> None:
-        # 【日本語解説】
-        # バックグラウンドスレッドのエントリポイント。このスレッドに
-        # 専用のイベントループを紐付け(asyncio.set_event_loop)、
-        # _connection_owner()コルーチンをタスクとしてスケジュールしてから
-        # run_forever()で無期限にイベントループを回し続ける。
-        # （run_forever自体は_owner_completedがloop.stop()するまで
-        #  ブロックし続ける ＝ このスレッドの生存期間そのもの）
+        # バックグラウンドスレッドのエントリーポイント: このスレッドにイベントループを紐付け、
+        # 接続所有タスクを開始してから、run_forever()でループを回し続ける。
         asyncio.set_event_loop(self._loop)
         self._owner_task = self._loop.create_task(
             self._connection_owner(*self._connection_args)
         )
-        self._owner_task.add_done_callback(self._owner_completed)
-        self._loop.run_forever()
+        self._owner_task.add_done_callback(self._owner_completed)  # タスク終了時にコールバックを呼ぶよう登録
+        self._loop.run_forever()  # loop.stop()が呼ばれるまでイベントループを回し続ける
 
     def _owner_completed(self, task: asyncio.Task[Any]) -> None:
-        # 【日本語解説】
-        # _connection_owner()タスクが完了（正常終了・例外・キャンセル
-        # いずれか）した際に呼ばれるコールバック。
+        # _connection_ownerタスクが終了した際に呼ばれるコールバック
         try:
-            task.result()  # 例外があればここで再送出される
+            task.result()  # タスク内で例外が起きていればここで再送出される
         except BaseException as exc:
-            # 【日本語解説】
-            # まだ接続完了(ready)を通知していない段階で owner タスクが
-            # 死んだ場合（＝接続確立に失敗した場合）、そのエラーを
-            # _connection_errorに記録してから_connection_readyを立てる。
-            # これにより__init__側の待機が「エラーとともに」解除される。
             if not self._connection_ready.is_set():
+                # まだ接続完了イベントがセットされていなければ、これは起動時の
+                # 失敗なのでエラーとして記録し、待機中のコンストラクタに知らせる
                 self._connection_error = exc
                 self._connection_ready.set()
         finally:
-            self._owner_stopped.set()
-            self._loop.stop()  # run_forever()を終了させる ＝ スレッドが終わる
+            self._owner_stopped.set()  # 所有タスクが終了したことを通知
+            self._loop.stop()  # イベントループ自体も止める
 
     def _run(self, coro: Any, timeout: Optional[float] = None) -> Any:
-        # ------------------------------------------------------------------
-        # 【日本語解説】このクラスの心臓部 ── 同期↔非同期の橋渡し1行
-        # ------------------------------------------------------------------
-        # asyncio.run_coroutine_threadsafe(coro, self._loop) が、
-        # 「別スレッドで動いているイベントループに、コルーチンの実行を
-        # スレッドセーフに投げ込む」標準ライブラリの仕組み。戻り値は
-        # concurrent.futures.Future（asyncioのFutureではなく、通常の
-        # スレッド間で使えるFuture）で、future.result(timeout=...)は
-        # 普通の同期呼び出しとしてブロックして結果を待てる。
-        # これが「呼び出し元(メインスレッド)からは同期関数に見える」
-        # 仕組みの正体そのもの。
-        future = asyncio.run_coroutine_threadsafe(coro, self._loop)
+        # 呼び出し元スレッド(通常はメインスレッド)から、バックグラウンドの
+        # イベントループ上でコルーチンを実行し、その結果を同期的に待って返す。
+        future = asyncio.run_coroutine_threadsafe(coro, self._loop)  # スレッドセーフにコルーチンをスケジュール
         try:
-            return future.result(timeout=timeout)
+            return future.result(timeout=timeout)  # 結果が出るまで(タイムアウト付きで)待つ
         except concurrent.futures.TimeoutError:
-            # タイムアウトした場合、投げっぱなしにせずfuture.cancel()で
-            # 実行中のコルーチンにもキャンセルを伝える。
-            future.cancel()
+            future.cancel()  # タイムアウトしたら対応するタスクのキャンセルを試みる
             raise
 
     async def _connection_owner(
         self, stdio_command: Optional[str], http_url: Optional[str], env: Optional[Dict[str, str]]
     ) -> None:
-        """Own all transport contexts in one task until close().
+        """close()されるまで、全てのトランスポートコンテキストを1つのタスクの中で所有し続ける。
 
-        AnyIO transport contexts contain task-group cancel scopes which must be
-        exited by the same task that entered them. Keeping this owner coroutine
-        alive avoids cross-task AsyncExitStack teardown failures.
+        AnyIOのトランスポートコンテキストは、それに入ったのと同じタスクが
+        exitしなければならないタスクグループのキャンセルスコープを内部に持つ。
+        この所有者コルーチンを生かし続けることで、タスクをまたいだ
+        AsyncExitStackの後始末が失敗する問題を避けている。
         """
-        # ----------------------------------------------------------------------
-        # 【日本語解説】「1つのオーナーコルーチンが全トランスポートを所有する」設計
-        # ----------------------------------------------------------------------
-        # docstringにある通り、AnyIO（stdio_client/streamablehttp_clientの
-        # 内部実装が使うライブラリ）のトランスポートコンテキストは、
-        # 「enter したのと同じタスク（コルーチン）が exit しなければ
-        # ならない」という制約を持っています。もし接続処理と切断処理を
-        # 別々のタスク・別々の呼び出しから行おうとすると、内部の
-        # キャンセルスコープが壊れてエラーになります。
-        #
-        # そこでこのプロジェクトは、接続確立(enter_async_context)から
-        # close要求を待つ間(while ... sleep)、そして最終的な後始末
-        # (AsyncExitStackのexit)までを**1つの長寿命コルーチン**として
-        # 実装しています。呼び出し元（他のスレッド）は、このコルーチンに
-        # 対して「閉じてほしい」という"要求"（Eventのセット）を送るだけで、
-        # 実際にexitを呼ぶのは常にこのコルーチン自身、という設計です。
-        # ----------------------------------------------------------------------
-        owner_task = asyncio.current_task()
+        owner_task = asyncio.current_task()  # 自分自身(このコルーチンのタスク)への参照を保持
 
         async def cancel_when_requested() -> None:
-            # 【日本語解説】
-            # _cancel_requested Eventがセットされるのを0.05秒間隔で
-            # ポーリングし、セットされたらowner_task自身をキャンセルする
-            # 監視用の別タスク。「強制終了」経路(graceful=False)で使われる。
+            # _cancel_requestedフラグが立つのを監視し、立ったら所有タスクをキャンセルする補助コルーチン
             while not self._cancel_requested.is_set():
-                await asyncio.sleep(0.05)
+                await asyncio.sleep(0.05)  # ポーリング間隔(0.05秒)
             if owner_task is not None:
                 owner_task.cancel()
 
-        cancel_monitor = asyncio.create_task(cancel_when_requested())
+        cancel_monitor = asyncio.create_task(cancel_when_requested())  # キャンセル監視タスクを起動
         try:
             try:
-                async with AsyncExitStack() as exit_stack:
-                    # 【日本語解説】
-                    # stdio_commandが指定されていれば、そのコマンドを
-                    # shlex.splitで分割してサブプロセスとしてMCPサーバーを
-                    # 起動する(stdio_client)。http_urlならストリーミング
-                    # HTTP接続(streamablehttp_client)を張る。どちらの経路も
-                    # 最終的に read/write の非同期ストリームペアを得る点は
-                    # 共通で、この後のClientSessionは輸送方式の違いを
-                    # 意識しない。
+                async with AsyncExitStack() as exit_stack:  # 複数の非同期コンテキストをまとめて後始末する
                     if stdio_command:
+                        # stdioトランスポート: コマンド文字列をシェル的に分割し、サブプロセスとして起動
                         parts = shlex.split(stdio_command)
                         params = StdioServerParameters(command=parts[0], args=parts[1:], env=env)
                         read, write = await exit_stack.enter_async_context(stdio_client(params))
                     else:
+                        # streamable HTTPトランスポート: 既に起動済みのサーバーURLに接続
                         assert http_url is not None
                         read, write, _ = await exit_stack.enter_async_context(
                             streamablehttp_client(http_url)
                         )
 
+                    # 読み書きストリームからMCPクライアントセッションを構築し、初期化ハンドシェイクを行う
                     self.session = await exit_stack.enter_async_context(ClientSession(read, write))
                     await self.session.initialize()
-                    # 【日本語解説】
-                    # ここがツール名ハードコード無しの核心 ──
-                    # list_tools()を呼んで、接続先のMCPサーバーが実際に
-                    # 公開しているツールの一覧(スキーマ付き)を取得する。
-                    result = await self.session.list_tools()
+                    result = await self.session.list_tools()  # サーバーが提供するツール一覧を取得
                     self.tools = list(result.tools)
-                    # 接続とツール発見が完了したので、__init__側の
-                    # 待機を解除する。
-                    self._connection_ready.set()
-                    # 【日本語解説】
-                    # ここが「接続を維持し続ける」部分。close要求
-                    # (_close_requested)が来るまで、ただ0.05秒間隔で
-                    # スリープし続けるだけのループ。この間、
-                    # ClientSessionは生きたままなので、他のスレッドから
-                    # call_tool()経由で何度でもツールを呼べる。
+                    self._connection_ready.set()  # 接続完了(成功)をコンストラクタ側に通知
                     while not self._close_requested.is_set():
+                        # close()が要求されるまで、このコルーチン(=接続の所有者)を
+                        # 生かし続けることでコンテキストを維持する
                         await asyncio.sleep(0.05)
             except BaseException as exc:
                 if not self._connection_ready.is_set():
-                    # まだ準備完了を通知していない段階で例外が起きた
-                    # （＝接続確立自体に失敗した）場合は、エラーとして
-                    # 記録して待機を解除する。
+                    # 接続確立中に例外が起きた場合は、それを記録してコンストラクタ側の待機を解除する
                     self._connection_error = exc
                     self._connection_ready.set()
         finally:
-            # 【日本語解説】
-            # async with AsyncExitStack() ブロックを抜けると
-            # （正常終了・close要求・例外いずれの経路でも）、
-            # 自動的にenter_async_contextで入ったコンテキスト
-            # （ClientSession、stdio_client/streamablehttp_client）が
-            # 逆順にexitされる。これが「同じタスクの中でenter/exitが
-            # 完結する」ことの実現方法。
-            cancel_monitor.cancel()
+            cancel_monitor.cancel()  # キャンセル監視タスクはもう不要なので止める
             try:
                 await cancel_monitor
             except asyncio.CancelledError:
-                pass
-            self.session = None
+                pass  # キャンセルによる例外は正常なので無視する
+            self.session = None  # セッションはもう有効ではないのでクリア
             if not self._connection_ready.is_set():
+                # ここまでにまだイベントがセットされていない異常系(想定外の早期終了等)でも
+                # 呼び出し元をブロックしたままにしないよう、必ずセットしておく
                 self._connection_ready.set()
 
     def _stop_owner(self, graceful: bool) -> None:
-        # ------------------------------------------------------------------
-        # 【日本語解説】オーナーコルーチンを止める2つの経路
-        # ------------------------------------------------------------------
-        # graceful=True（通常のclose()経路）: _close_requestedを立てて、
-        #   _connection_owner()内のwhileループが自然に抜けるのを待つ
-        #   （＝ClientSessionを正しい手順で閉じる、丁寧な終了）。
-        # graceful=False（接続失敗時やタイムアウト時の緊急停止）:
-        #   _cancel_requestedを立てて、cancel_when_requested()経由で
-        #   owner_taskを強制キャンセルする（＝多少手荒でも即座に止める）。
-        # ------------------------------------------------------------------
+        # 接続所有タスクとバックグラウンドのイベントループを停止させる。
+        # graceful=Trueなら「閉じてよい」という穏やかな要求、Falseなら強制キャンセル。
         if graceful:
             self._close_requested.set()
         else:
@@ -332,179 +200,119 @@ class MCPToolProxy:
 
         wait_timeout = CLOSE_TIMEOUT_SECONDS if graceful else 1.0
         if not self._owner_stopped.wait(timeout=wait_timeout):
-            # 【日本語解説】
-            # graceful要求のはずが時間内に終わらなかった場合の保険。
-            # 待っていても終わらないなら、強制キャンセルに切り替える
-            # （loop.call_soon_threadsafeで、別スレッドのイベントループに
-            #  安全にキャンセル要求を注入する）。
+            # 穏やかな要求で時間内に終わらなければ、強制キャンセルに切り替える
             self._cancel_requested.set()
             if self._owner_task is not None and self._loop.is_running():
                 self._loop.call_soon_threadsafe(self._owner_task.cancel)
-            self._owner_stopped.wait(timeout=1.0)
+            self._owner_stopped.wait(timeout=1.0)  # 強制キャンセル後の終了を短時間だけ待つ
 
         if self._thread.is_alive() and self._loop.is_running():
-            # イベントループ自体にもrun_forever()を止めるよう指示する。
-            self._loop.call_soon_threadsafe(self._loop.stop)
-        self._thread.join(timeout=5.0)
+            self._loop.call_soon_threadsafe(self._loop.stop)  # イベントループ自体を止める
+        self._thread.join(timeout=5.0)  # バックグラウンドスレッドの終了を待つ
         if not self._thread.is_alive() and not self._loop.is_closed():
-            self._loop.close()
+            self._loop.close()  # スレッドが終わっていればイベントループのリソースを解放する
 
     def call_tool(self, name: str, arguments: Dict[str, Any]) -> str:
-        """Synchronously invoke one MCP tool and return its text content.
+        """1つのMCPツールを同期的に呼び出し、そのテキスト内容を返す。
 
-        Bounded by CALL_TOOL_TIMEOUT_SECONDS so a dead/hung MCP server becomes
-        an explicit Observation instead of blocking the sandbox (and the
-        agent loop) indefinitely - defense in depth alongside the sandbox's
-        own SIGALRM-based execution timeout, which this call normally runs
-        under too, but which this module cannot assume will always interrupt
-        a thread-lock wait the same way it interrupts pure-Python code.
+        CALL_TOOL_TIMEOUT_SECONDSで上限を設けており、死んだ・ハングした
+        MCPサーバーがあっても、サンドボックス(ひいてはエージェントループ)を
+        無期限にブロックするのではなく、明示的なObservationとして返せる
+        ようにしている - これはサンドボックス自身のSIGALRMベースの実行
+        タイムアウトと並ぶ多層防御である。この呼び出しは通常そのSIGALRM
+        タイムアウトの管理下でも実行されるが、このモジュールは、それが
+        純粋なPythonコードを中断させるのと全く同じようにスレッドロックの
+        待機を必ず中断させてくれるとは想定できないため、独自の上限も設けている。
         """
-        # 【日本語解説】
-        # このメソッドが、生成されたラッパー関数(_make_wrapper参照)から
-        # 実際に呼ばれる「本体」。self._run()で非同期のsession.call_tool()
-        # をバックグラウンドループに投げ、CALL_TOOL_TIMEOUT_SECONDS
-        # （5分）でタイムアウトさせる。docstringの但し書きが重要:
-        # executor.py側のsignal.alarm()によるタイムアウトは「純粋な
-        # Pythonコードの実行」には効くが、スレッド間のロック待ちのような
-        # 状況では必ずしも同じように割り込めるとは限らないため、
-        # この関数自身も独立したタイムアウトを持っている（多層防御）。
         session = self.session
         if session is None:
-            return "[Error] MCP session is not connected"
+            return "[Error] MCP session is not connected"  # まだ接続されていない/既に切断済み
         try:
+            # イベントループ上でcall_toolコルーチンを実行し、タイムアウト付きで結果を待つ
             result = self._run(session.call_tool(name, arguments), timeout=CALL_TOOL_TIMEOUT_SECONDS)
         except concurrent.futures.TimeoutError:
             return f"[Error] tool '{name}' timed out after {CALL_TOOL_TIMEOUT_SECONDS}s"
-        # 【日本語解説】
-        # MCPツールの戻り値(result.content)は、テキスト以外の型
-        # （画像など）も含みうる汎用的な構造。ここではtext属性がある
-        # ものはそのテキストを、無ければstr()化したものを使い、
-        # 複数パートを改行で連結して1つの文字列に正規化する
-        # （サンドボックスの名前空間に置く関数はすべて「文字列を返す」
-        # という単純な契約に統一している）。
         parts = []
         for item in result.content:
+            # 応答内容の各パートからテキストを抽出する(テキストでなければ文字列表現にフォールバック)
             text = getattr(item, "text", None)
             parts.append(text if text is not None else str(item))
-        text_result = "\n".join(parts)
+        text_result = "\n".join(parts)  # 複数パートは改行で連結
         if getattr(result, "isError", False):
+            # MCPサーバー自身がエラー応答を返した場合、それとわかる形で返す
             return f"[Error] tool '{name}' failed: {text_result}"
         return text_result
 
     def build_namespace(self) -> Dict[str, Callable[..., str]]:
-        """One synchronous wrapper function per discovered tool, ready to drop
-        straight into the sandbox's exec() namespace (Section 4.2)."""
-        # 【日本語解説】
-        # list_tools()で発見した各ツールについて、_make_wrapper()で
-        # 同期ラッパー関数を1つずつ作り、{ツール名: ラッパー関数}の辞書に
-        # まとめる。これがそのまま Sandbox(config, extra_namespace=...)
-        # の extra_namespace 引数として渡される（agent_mbpp.py /
-        # agent_swebench.py参照）。
+        """発見した各ツールにつき1つずつ、同期的なラッパー関数を用意し、
+        サンドボックスのexec()名前空間にそのまま組み込めるようにする(仕様書 4.2節)。"""
         namespace: Dict[str, Callable[..., str]] = {}
         for tool in self.tools:
-            namespace[tool.name] = self._make_wrapper(tool)
+            namespace[tool.name] = self._make_wrapper(tool)  # ツールごとにラッパー関数を生成して登録
         return namespace
 
     def _make_wrapper(self, tool: Tool) -> Callable[..., str]:
-        """Build a wrapper that accepts a tool's arguments either positionally
-        or by keyword, like a normal Python function - the subject's own
-        example (Section 3.1) calls tools positionally
-        (``result = search_code("validate_email")``), and our system prompt's
-        "always use keyword arguments" guidance is advice to the LLM, not a
-        constraint an LLM is guaranteed to follow. Positional arguments are
-        mapped to parameter names using the MCP tool schema's declared
-        property order, which matches the underlying function's real
-        parameter order for a FastMCP-based server (ours and, in practice,
-        any other compliant one)."""
-        # ----------------------------------------------------------------------
-        # 【日本語解説】位置引数もキーワード引数も受け付ける理由（実際のバグ経緯）
-        # ----------------------------------------------------------------------
-        # prompts.py（Section 7参照）のシステムプロンプトは「必ず
-        # キーワード引数で呼べ」とLLMに指示しています。しかしこれは
-        # あくまで**助言**であって、LLMが必ず守る保証はありません。
-        # 実際、課題自身のワークドイグザンプルにすら
-        # `result = search_code("validate_email")` という**位置引数**の
-        # 呼び出しが登場します。
-        #
-        # もしラッパー関数がキーワード引数しか受け付けない実装だったら、
-        # LLMがこのお手本通りに書いただけで
-        # `wrapper() takes 0 positional arguments but 1 was given`
-        # のような実行時エラーになってしまいます（実際にこのバグが
-        # 起きたことがBENCHMARK_REPORT.mdに記録されています）。
-        #
-        # 対策として、MCPツールのJSON Schemaが持つ`properties`の
-        # **宣言順**を「実引数の並び順」とみなし、位置引数をその順番で
-        # パラメータ名にマッピングしてから、キーワード引数とマージする、
-        # という実装になっています。
-        # ----------------------------------------------------------------------
-        name = tool.name
+        """通常のPython関数のように、位置引数でもキーワード引数でも受け取れる
+        ラッパーを構築する - 課題自体のサンプル(仕様書3.1節)ではツールを
+        位置引数で呼んでおり(``result = search_code("validate_email")``)、
+        こちらのシステムプロンプトの「常にキーワード引数を使うこと」という
+        指示はLLMへの助言に過ぎず、LLMが必ず従うという保証にはならない。
+        位置引数は、MCPツールスキーマで宣言されたプロパティの並び順を使って
+        パラメータ名にマッピングされる。この並び順は、FastMCPベースの
+        サーバー(このプロジェクトのもの、および実質的に他の準拠実装)では、
+        元の関数の実際の引数順と一致する。"""
+        name = tool.name  # ツール名(生成する関数の名前にもなる)
+        # 入力スキーマのproperties(引数定義)のキー順を、位置引数→パラメータ名の対応付けに使う
         param_names = list((tool.inputSchema or {}).get("properties", {}).keys())
 
         def wrapper(*args: Any, **kwargs: Any) -> str:
             if len(args) > len(param_names):
+                # 定義されているパラメータ数より多い位置引数が渡された場合はエラー文字列を返す
                 return (
                     f"[Error] {name}() takes at most {len(param_names)} positional "
                     f"arguments but {len(args)} were given"
                 )
-            # 【日本語解説】
-            # zip(param_names, args) で「パラメータ名の順番」と
-            # 「渡された位置引数」を対応付ける。例えば
-            # search_code(pattern, file_pattern) というツールに対して
-            # search_code("foo") と呼ばれたら {"pattern": "foo"} になる。
-            arguments = dict(zip(param_names, args))
-            duplicates = arguments.keys() & kwargs.keys()
+            arguments = dict(zip(param_names, args))  # 位置引数をパラメータ名にマッピング
+            duplicates = arguments.keys() & kwargs.keys()  # 位置引数とキーワード引数で重複した名前を検出
             if duplicates:
-                # 位置引数とキーワード引数の両方で同じパラメータを
-                # 指定してしまった場合（普通のPython関数と同じエラー
-                # 挙動）を検出する。
                 return f"[Error] {name}() got multiple values for {sorted(duplicates)}"
-            arguments.update(kwargs)
-            return self.call_tool(name, arguments)
+            arguments.update(kwargs)  # キーワード引数をマージ
+            return self.call_tool(name, arguments)  # 実際のMCPツール呼び出しに委譲
 
-        wrapper.__name__ = name  # デバッグ時にwrapper.__name__ではなくツール名が見えるように
+        wrapper.__name__ = name  # デバッグ表示等のためラッパーの関数名をツール名に合わせる
         return wrapper
 
     def manual_text(self) -> str:
-        """Render the connected server's tools as documentation for the system
-        prompt (Section 4.2 - the sandbox manual must be generated dynamically
-        from the connected MCP server's tool schemas)."""
-        # 【日本語解説】
-        # prompts.py の build_system_prompt() に埋め込まれる、
-        # 「使えるツール一覧」のドキュメント文字列をここで動的に生成する。
-        # ツール名・パラメータ名・型・必須かどうか(?マーク)・説明文を
-        # JSON Schemaから自動整形するので、prompts.py側は接続先の
-        # MCPサーバーが何であるかを一切知らなくてよい。
+        """接続中のサーバーが提供するツール群を、システムプロンプト用の
+        ドキュメントとして整形して返す(仕様書 4.2節 - サンドボックスの
+        マニュアルは、接続されたMCPサーバーのツールスキーマから動的に
+        生成されなければならない)。"""
         if not self.tools:
-            return "(no MCP tools are currently connected)"
+            return "(no MCP tools are currently connected)"  # ツールが1つもなければその旨を返す
         lines = []
         for tool in self.tools:
             schema = tool.inputSchema or {}
             properties = schema.get("properties", {})
-            required = set(schema.get("required", []))
+            required = set(schema.get("required", []))  # 必須パラメータの集合
             params = []
             for pname, pschema in properties.items():
-                ptype = pschema.get("type", "any")
-                marker = "" if pname in required else "?"  # 必須でないパラメータには"?"を付けて可読に示す
+                ptype = pschema.get("type", "any")  # パラメータの型(スキーマになければ"any")
+                marker = "" if pname in required else "?"  # 任意パラメータには"?"を付けて表示
                 params.append(f"{pname}{marker}: {ptype}")
-            signature = ", ".join(params)
-            description = (tool.description or "").strip()
+            signature = ", ".join(params)  # 関数シグネチャ風の文字列に整形
+            description = (tool.description or "").strip()  # ツールの説明文(なければ空文字列)
             lines.append(f"- {tool.name}({signature})\n    {description}")
         return "\n".join(lines)
 
     def close(self) -> None:
-        """Best-effort shutdown, bounded by CLOSE_TIMEOUT_SECONDS - callers
-        (agent_mbpp.py/agent_swebench.py's `finally` blocks) rely on this
-        returning promptly even if the MCP server already died or is stuck,
-        since agent_swebench.py's `container.cleanup()` is the very next
-        line after this call and must not be starved by it."""
-        # 【日本語解説】
-        # 二重closeを防ぐガードのあと、_stop_owner(graceful=True)で
-        # 「丁寧な」終了を試みる。docstringにある通り、
-        # agent_swebench.pyではこの直後にcontainer.cleanup()が続くため、
-        # ここが無期限にハングするとDockerコンテナの後片付けまで
-        # 巻き添えで止まってしまう ── だからこそCLOSE_TIMEOUT_SECONDSで
-        # 必ず有限時間内に処理が戻ることが保証されている。
+        """CLOSE_TIMEOUT_SECONDSで上限を設けた、ベストエフォートなシャットダウン処理
+        - 呼び出し元(agent_mbpp.py/agent_swebench.pyの`finally`ブロック)は、
+        たとえMCPサーバーが既に死んでいたりスタックしていたりしても、この
+        呼び出しが速やかに返ることに依存している。というのも、
+        agent_swebench.pyでは、この呼び出しの直後の行が
+        `container.cleanup()`であり、それがこの呼び出しによって
+        飢餓状態(スタベーション)にされてはならないからである。"""
         if self._closed:
-            return
+            return  # 既にクローズ済みなら何もしない(冪等性の確保)
         self._closed = True
-        self._stop_owner(graceful=True)
+        self._stop_owner(graceful=True)  # 穏やかな切断を試みる

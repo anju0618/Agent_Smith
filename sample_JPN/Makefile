@@ -3,16 +3,12 @@
 install:
 	uv sync
 
-# No single canonical entry point (this project exposes agent_mbpp, agent_swebench,
-# and the sandbox CLI) - `run` demonstrates the MBPP agent's CLI; see README.md for
-# the full dump -> run -> validate workflow against a real task.
 run:
 	uv run python -m agent_mbpp --help
 
 debug:
 	uv run python -m pdb -m agent_mbpp --help
 
-# `uv run sandbox` - interactive REPL, exit / EOF (Ctrl+D) to quit.
 sandbox:
 	uv run sandbox
 

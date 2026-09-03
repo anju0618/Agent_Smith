@@ -1,177 +1,109 @@
-"""MCP server exposing the MBPP tools (Section 4.3.2) over stdio or streamable HTTP.
+"""MBPP用ツール(セクション4.3.2)をstdioまたはstreamable HTTP経由で公開するMCPサーバ。
 
-    python mcp_tools_mbpp.py            # stdio transport (default)
-    python mcp_tools_mbpp.py --http 8000  # streamable HTTP transport on port 8000
+    python mcp_tools_mbpp.py            # stdioトランスポート(デフォルト)
+    python mcp_tools_mbpp.py --http 8000  # ポート8000でstreamable HTTPトランスポート
 
-Kept at the repository root per Section 4.2's requirement for MCP tool files.
+セクション4.2の「MCPツールファイルはリポジトリのルートに置くこと」という要件に従い
+ルート直下に配置している。
 """
-# このファイルはエージェント本体(agent_mbpp.py)とは**別プロセス**として起動される
-# MCPサーバー。役割はただ1つ、`run_tests(code, test_list)` というツールを1個だけ
-# 公開すること。エージェント側のサンドボックス内からは、これがまるで普通の
-# Python関数のように `run_tests(code=..., test_list=...)` と呼び出せる
-# (sandbox/mcp_client.py の MCPToolProxy が橋渡しする)。
-#
-# 注意: @mcp.tool() が付いた関数のdocstringは、FastMCPによって自動的に
-# MCPツールのスキーマ説明文として抽出され、それが sandbox/mcp_client.py の
-# manual_text() 経由でシステムプロンプトに埋め込まれ、実際にLLMへ送信される。
-# つまりこのdocstringは「ただのコード内コメント」ではなく「LLMへの説明書」
-# そのものであり、意味を変えると挙動が変わってしまう。そのため元の英語の
-# docstringは一切変更せず、日本語の解説はその外側(関数の前、あるいは
-# docstringの外)にコメントとして追加している。
-from __future__ import annotations
+from __future__ import annotations  # 型注釈を文字列として遅延評価する(将来のアノテーション構文をサポート)
 
-import argparse
-import json
-import os
-import secrets
-from typing import List
+import argparse  # コマンドライン引数のパース用
+import json  # テスト結果や環境変数のJSONエンコード/デコードに使用
+import os  # 環境変数の読み取りに使用
+import secrets  # 実行成功を検出するためのランダムなマーカー文字列生成に使用
+from typing import List  # 型注釈のため
 
-from mcp.server.fastmcp import FastMCP
-from models import SandboxConfig
-from sandbox.executor import DEFAULT_AUTHORIZED_IMPORTS, FinalAnswer, Sandbox
+from mcp.server.fastmcp import FastMCP  # MCPサーバを構築するためのフレームワーク
+from models import SandboxConfig  # サンドボックスの設定を表すデータモデル
+from sandbox.executor import DEFAULT_AUTHORIZED_IMPORTS, FinalAnswer, Sandbox  # サンドボックス実行環境・許可インポート一覧・final_answer例外
 
-# FastMCPインスタンスを1つ作る。以降 @mcp.tool() でデコレートした関数が
-# 自動的にこのサーバーの公開ツールとして登録されていく。
-mcp = FastMCP("agent-smith-mbpp-tools")
+mcp = FastMCP("agent-smith-mbpp-tools")  # MBPP用MCPサーバのインスタンスを作成
 
 
 def _test_imports() -> List[str]:
-    """Imports the task's test_list needs but the candidate solution has no
-    reason to include itself (e.g. `math` for `math.isclose(...)` assertions
-    on a task whose own solution never touches `math`). agent_mbpp.py passes
-    these through MBPPTaskInput.test_imports via this env var so run_tests()
-    can guarantee they're present, rather than leaving it to chance whether
-    the LLM's own code happens to need (and therefore import) the same
-    module - which silently NameErrors on tasks where it doesn't."""
-    # 環境変数 AGENT_SMITH_TEST_IMPORTS は agent_mbpp.py が
-    # MCPToolProxy(..., env=tool_env) 経由でこのプロセス(子プロセス)にだけ
-    # 渡した、JSON文字列化されたimport文のリスト。
-    raw = os.environ.get("AGENT_SMITH_TEST_IMPORTS")
+    """タスクのtest_listが必要とするが、候補解答自体には含める理由がないimportの一覧を返す
+    (例: 候補解答が`math`を一切使わないタスクで、`math.isclose(...)`というassertionが
+    必要とする`math`)。agent_mbpp.pyがMBPPTaskInput.test_importsをこの環境変数経由で
+    渡すことで、LLM自身のコードがたまたま同じモジュールを必要としてimportしているかどうかに
+    運任せにするのではなく、run_tests()側でこれらのimportが確実に存在するようにできる
+    - importに任せると、必要としないタスクでは静かにNameErrorになってしまう。"""
+    raw = os.environ.get("AGENT_SMITH_TEST_IMPORTS")  # 環境変数からJSON文字列を取得(未設定ならNone)
     if not raw:
-        # 環境変数が無い/空文字列 = このタスクには追加importが不要。
-        return []
+        return []  # 環境変数が未設定または空文字列なら空リストを返す
     try:
-        imports = json.loads(raw)
+        imports = json.loads(raw)  # JSON文字列をパースしてPythonのリストに変換
     except json.JSONDecodeError:
-        # 万が一JSONとして壊れていても、ここで例外を投げてサーバー全体を
-        # 落とすようなことはせず、単に「追加importなし」として静かに続行する。
-        return []
-    # 文字列以外の要素が紛れ込んでいた場合に備えたフィルタ(型の安全性確保)。
-    return [line for line in imports if isinstance(line, str)]
+        return []  # パースに失敗した場合は安全側に倒して空リストを返す
+    return [line for line in imports if isinstance(line, str)]  # 文字列型の要素のみを残してフィルタする
 
 
 @mcp.tool()
 def run_tests(code: str, test_list: List[str]) -> str:
-    """Run a candidate MBPP solution against the given test assertions.
+    """MBPPの候補解答を、与えられたテストのassertionに対して実行する。
 
-    Args:
-        code: The candidate Python solution (a full function definition).
-        test_list: Assertion strings to execute against `code`.
+    引数:
+        code: 候補となるPythonの解答(完全な関数定義)。
+        test_list: `code`に対して実行するassertion文字列のリスト。
 
-    Returns:
-        A JSON string {"success": bool, "output": str} - success is True only
-        if every assertion passed. Candidate code runs in the same hardened,
-        OS-isolated sandbox used by the agents, so it cannot access the MCP
-        server's host filesystem or network.
+    戻り値:
+        JSON文字列 {"success": bool, "output": str} - successは全てのassertionが
+        通った場合のみTrueになる。候補コードはエージェント自身が使うものと同じ、
+        OSレベルで隔離されたハード化済みサンドボックス内で実行されるため、
+        MCPサーバが動くホストのファイルシステムやネットワークにはアクセスできない。
     """
-    # ここから下が実装本体。日本語での要点解説:
-    #
-    # このツールがやっていることは「LLMが書いた候補コードを、テストの
-    # assert文と一緒に1本のPythonスクリプトに連結し、それを**もう一段
-    # 別のサンドボックス**で実行して、全部のassertが通ったかどうかを
-    # 判定する」こと。エージェント本体が使っているサンドボックスとは
-    # 別の、使い捨てのSandboxインスタンスをここで新規に作る点に注意。
-    imports_prefix = "\n".join(_test_imports())
-    # secrets.token_hex(16) は暗号論的に安全な乱数から16バイト(32桁の16進数)
-    # の文字列を生成する。この値を候補コードの実行のたびに新しく作り、
-    # 実行スクリプトの一番最後に print(marker) として仕込む。これにより
-    # 「候補コードが自力で正解を装って print("成功しました") のような
-    # 固定文字列を出力してごまかす」ことが事実上不可能になる - マーカーは
-    # 毎回変わり、かつ候補コード自身はその値を知りようがないため。
-    marker = f"__AGENT_SMITH_MBPP_PASS_{secrets.token_hex(16)}__"
+    imports_prefix = "\n".join(_test_imports())  # テストに必要な追加importを改行区切りの文字列にまとめる
+    marker = f"__AGENT_SMITH_MBPP_PASS_{secrets.token_hex(16)}__"  # 全assertionが通過したことを検出するためのランダムなマーカー文字列を生成
     full_code = (
-        # (1) test_importsで指定された前置import(あれば)
-        (imports_prefix + "\n" if imports_prefix else "")
-        # (2) 候補コード本体(関数定義)
-        + code
+        (imports_prefix + "\n" if imports_prefix else "")  # 追加importがあれば先頭に付加
+        + code  # 候補解答のコード本体
         + "\n"
-        # (3) 公開テストのassert文を全部連結
-        + "\n".join(test_list)
-        # (4) 最後にマーカーをprint。ここまで例外なく実行が到達すれば
-        #     「全assertが通過した」ことの証拠になる。
-        + f"\nprint({marker!r})"
-    )
+        + "\n".join(test_list)  # 各テストassertionを改行区切りで追加
+        + f"\nprint({marker!r})"  # 最後にマーカーを出力する行を追加(ここまで到達すれば全assertionが例外を出さずに通った証拠)
+    )  # 候補解答+追加import+テスト+マーカー出力を1つのスクリプトに連結する
 
-    sandbox = None
+    sandbox = None  # サンドボックスの参照(finally節でクローズするため先に宣言)
     try:
         sandbox = Sandbox(
             SandboxConfig(
-                authorized_imports=DEFAULT_AUTHORIZED_IMPORTS,
-                # allowed_directories=[] - ファイルアクセスを一切許可しない。
-                # 候補コードはただの計算をするだけで、ファイルを読み書きする
-                # 正当な理由が無いため、最も厳しい設定にしている。
-                allowed_directories=[],
-                # このMCPサーバー内部でのタイムアウトは10秒。
-                # agent_mbpp.py側のSandboxConfig(外側)のタイムアウトは
-                # 20秒に設定されており、常にこちらより長い - 内側が先に
-                # 確実にタイムアウトするようにするための意図的な余裕。
-                max_execution_time_seconds=10,
-                max_memory_mb=256,
+                authorized_imports=DEFAULT_AUTHORIZED_IMPORTS,  # サンドボックス内で許可するimportの一覧
+                allowed_directories=[],  # ファイルシステムへのアクセスは許可しない
+                max_execution_time_seconds=10,  # 実行時間の上限(秒)
+                max_memory_mb=256,  # メモリ使用量の上限(MB)
             )
-        )
+        )  # テスト実行専用の使い捨てサンドボックスを生成
         try:
-            output = sandbox.run(full_code)
+            output = sandbox.run(full_code)  # 連結したスクリプトをサンドボックス内で実行
         except (FinalAnswer, KeyboardInterrupt, SystemExit) as exc:
-            # 万が一候補コードの中に final_answer(...) が紛れ込んでいたり
-            # (通常起きないはずだが、LLMの出力は信頼できない前提)、
-            # KeyboardInterrupt/SystemExitが飛んできても、ここで捕まえて
-            # ただのエラーメッセージ文字列に変換する。run_tests()は
-            # MCPツールとして常にJSON文字列を返す契約なので、例外を
-            # そのまま外へ伝播させるわけにはいかない。
-            output = f"[Error] {type(exc).__name__}: {exc}"
-    except Exception as exc:  # noqa: BLE001 - MCP tool must return JSON on setup errors
-        # Sandbox自体の生成に失敗した場合(通常はまず起きないが)も同様に
-        # 文字列化してJSON応答の一部にする。
-        output = f"[Error] {type(exc).__name__}: {exc}"
+            output = f"[Error] {type(exc).__name__}: {exc}"  # 候補コードが誤ってfinal_answer()等を呼んだ場合はエラーとして記録
+    except Exception as exc:  # noqa: BLE001 - MCPツールはセットアップ時のエラーでもJSONを返す必要がある
+        output = f"[Error] {type(exc).__name__}: {exc}"  # サンドボックス生成自体に失敗した場合もエラーメッセージとして記録
     finally:
-        # 使い捨てサンドボックスなので、成功・失敗にかかわらず必ず閉じる。
         if sandbox is not None:
-            sandbox.close()
+            sandbox.close()  # サンドボックスのリソースを確実に解放する
 
     if output.startswith("[Timeout]") and "timed out" not in output:
-        # Sandbox.run()が返すタイムアウトメッセージの文言を、LLMにとって
-        # より分かりやすい表現に軽く言い換えている(表示上の調整であり、
-        # ロジックには影響しない)。
-        output = output.replace("Execution exceeded 10s", "Execution timed out after 10s", 1)
-    # マーカー文字列が出力に含まれているかどうかだけで成否を判定する -
-    # これが「全assertを最後まで通過できたか」の唯一かつ確実な判定方法。
-    success = marker in output
+        output = output.replace("Execution exceeded 10s", "Execution timed out after 10s", 1)  # タイムアウトメッセージの文言をより分かりやすい表現に置き換える
+    success = marker in output  # 出力にマーカーが含まれていれば全assertionが通過したとみなす
     if success:
-        # 成功時は出力からマーカー自体を取り除いてから返す。LLMに
-        # 「このランダムな文字列は何だろう」と余計な混乱を与えないため。
-        output = output.replace(marker, "").rstrip()
-    return json.dumps({"success": success, "output": output})
+        output = output.replace(marker, "").rstrip()  # 成功時は出力からマーカー文字列を除去し、末尾の空白を整える
+    return json.dumps({"success": success, "output": output})  # 成否と出力内容をJSON文字列として返す
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="MBPP MCP tool server")
+    # エントリーポイント: コマンドライン引数を解析し、stdioまたはHTTPでMCPサーバを起動する
+    parser = argparse.ArgumentParser(description="MBPP MCP tool server")  # 引数パーサを作成
     parser.add_argument(
         "--http", type=int, default=None, help="Serve over streamable HTTP on this port instead of stdio"
-    )
-    args = parser.parse_args()
+    )  # HTTPで待ち受けるポート番号(指定しなければstdioモード)
+    args = parser.parse_args()  # 実際にコマンドライン引数を解析
 
     if args.http:
-        # --http 8000 のように指定されればHTTPサーバーとして待ち受ける
-        # (このプロジェクトの主経路では使われないが、未知のMCPクライアントが
-        # HTTP経由で接続してくるケースへの対応)。
-        mcp.settings.port = args.http
-        mcp.run(transport="streamable-http")
+        mcp.settings.port = args.http  # 指定されたポート番号をサーバ設定に反映
+        mcp.run(transport="streamable-http")  # streamable HTTPトランスポートでサーバを起動
     else:
-        # デフォルトはstdio - 親プロセス(agent_mbpp.py)から
-        # サブプロセスとして起動され、標準入出力パイプでMCPプロトコルの
-        # やり取りをする、このプロジェクトでの主要な起動形態。
-        mcp.run(transport="stdio")
+        mcp.run(transport="stdio")  # デフォルトのstdioトランスポートでサーバを起動
 
 
 if __name__ == "__main__":
-    main()
+    main()  # スクリプトとして直接実行された場合にmain()を呼び出す

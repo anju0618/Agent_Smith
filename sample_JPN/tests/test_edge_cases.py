@@ -1,51 +1,36 @@
-"""Boundary and malformed-input tests shared across the sample components."""
-# ============================================================================
-# 日本語解説: このファイルは特定の1モジュールに専念するのではなく、
-# code_extraction.py / config.py / models.py / sandbox/executor.py という
-# 複数のコンポーネントにまたがる「境界値・エッジケース」を集めた
-# テストファイルです。空文字列、壊れたJSON、必須フィールドの欠落、
-# 歯抜けの環境変数番号など、「普通の正常系テストでは通らないような
-# 半端な入力」に対して、各コンポーネントが暗黙に何かを推測して
-# 動くのではなく、常に一貫した明示的な挙動を返すことを確認しています。
-# ============================================================================
-import json
+"""サンプルとなる各コンポーネントに共通する、境界値・不正入力のテスト。"""
+import json  # JSONのシリアライズ確認に使用
 
-import pytest
+import pytest  # pytest.raisesや型ヒントに使用
 
-from code_extraction import extract_code
-from config import ProviderSpec, _env_var_from_url, resolve_provider
-from models import MBPPTaskInput, SandboxConfig, SWEBenchTaskInput
-from sandbox.executor import Sandbox
+from code_extraction import extract_code  # コード抽出関数
+from config import ProviderSpec, _env_var_from_url, resolve_provider  # プロバイダ設定関連
+from models import MBPPTaskInput, SandboxConfig, SWEBenchTaskInput  # データモデル
+from sandbox.executor import Sandbox  # サンドボックス実行環境
 
 
 def test_extraction_handles_empty_and_whitespace_only_output() -> None:
-    # LLMが空文字列や空白だけを返してきた場合、extract_code()が
-    # 例外を投げたりcrashしたりせず、code=Noneと[NoCodeBlock]という
-    # 明示的な結果を一貫して返すことを確認する。
+    # 空文字列や空白のみの文字列を渡した場合、コードなしとして扱われることを検証
     for value in ("", "   \n\t"):
         result = extract_code(value)
-        assert result.code is None
-        assert "[NoCodeBlock]" in result.note
+        assert result.code is None  # コードは抽出されない
+        assert "[NoCodeBlock]" in result.note  # コードブロックなしという注記が付くこと
 
 
 def test_extraction_rejects_malformed_alternate_formats() -> None:
-    # 3種類の壊れた入力を確認する:
-    #   1. JSON自体が壊れている<tool_call>{bad}</tool_call> → code=None
-    #   2. ReAct形式のAction Inputが壊れたJSON({"bad"}) → JSONとして
-    #      パースできないので、文字列全体をvalue引数として扱う
-    #      フォールバックに落ちる（'{"bad"}'という文字列そのものが
-    #      value=として渡される）
-    #   3. XML <invoke>タグが閉じられていない場合 → code=None
+    # 各種の代替フォーマット(tool_call/Action/invoke)が壊れている場合の挙動を検証
+    # 壊れたJSONのtool_callはコード抽出に失敗する
     assert extract_code("<tool_call>{bad}</tool_call>").code is None
+    # ReAct形式のAction Inputが不正なJSONでも、文字列としてそのまま扱われフォールバックする
     result = extract_code('Action: search_code\nAction Input: {"bad"}')
-    assert result.code is not None
-    assert 'value=\'{"bad"}\'' in result.code
+    assert result.code is not None  # コード自体は生成される(フォールバック)
+    assert 'value=\'{"bad"}\'' in result.code  # 元の不正な文字列がそのまま値として渡される
+    # 閉じタグのない不完全なinvoke/parameterはコード抽出に失敗する
     assert extract_code('<invoke name="x"><parameter name="a">').code is None
 
 
 def test_extraction_preserves_json_null_boolean_and_numbers() -> None:
-    # JSON/Hermes形式で渡された値の型(null, true, 数値)が、
-    # Pythonの等価な値(None, True, 1)に正しく変換されることを確認する。
+    # JSONのnull/true/数値がPythonのNone/True/intに正しく変換されることを検証
     result = extract_code(
         '<tool_call>{"name":"tool","arguments":{"a":null,"b":true,"c":1}}</tool_call>'
     )
@@ -53,47 +38,33 @@ def test_extraction_preserves_json_null_boolean_and_numbers() -> None:
 
 
 def test_provider_url_normalization_and_environment_name() -> None:
-    # resolve_provider()が末尾のスラッシュを正規化して既知プロバイダ
-    # (groq)を正しく認識できること、そして_env_var_from_url()が
-    # ポート番号込みのURL(example.com:8443)からでも、大文字・アンダー
-    # スコア区切りの妥当な環境変数名(EXAMPLE_COM_8443_API_KEY)を
-    # 機械的に生成できることを確認する。
+    # プロバイダURLの末尾スラッシュ有無を吸収して正規化されること、
+    # URLから環境変数名が正しく生成されることを検証
     assert resolve_provider("https://api.groq.com/openai/v1/").name == "groq"
     assert _env_var_from_url("https://example.com:8443/api") == "EXAMPLE_COM_8443_API_KEY"
 
 
 def test_provider_key_collection_stops_at_first_missing_key(monkeypatch: pytest.MonkeyPatch) -> None:
-    # EDGE_KEY(1個目)とEDGE_KEY_3(3個目)だけが設定されていて、
-    # EDGE_KEY_2(2個目)が歯抜けになっている状況を確認する。
-    # collect_api_keys()は連番を順にチェックしていくため、2番目が
-    # 見つからなかった時点でそこで収集を打ち切り、EDGE_KEY_3は
-    # 拾われない（["one"]だけが返る）ことを確認する。これは
-    # 「歯抜けの番号は末尾切り捨て」という単純な仕様の裏付け。
-    monkeypatch.setenv("EDGE_KEY", "one")
-    monkeypatch.setenv("EDGE_KEY_3", "three")
+    # APIキーは連番の環境変数(EDGE_KEY, EDGE_KEY_2, EDGE_KEY_3, ...)から集められるが、
+    # 途中の番号(EDGE_KEY_2)が欠けていたらそこで収集を打ち切ることを検証
+    monkeypatch.setenv("EDGE_KEY", "one")  # 1つ目のキーは設定
+    monkeypatch.setenv("EDGE_KEY_3", "three")  # 2つ目を飛ばして3つ目だけ設定(無視されるはず)
     assert ProviderSpec("edge", "https://example.invalid", "EDGE_KEY").collect_api_keys() == ["one"]
 
 
 def test_sandbox_empty_code_and_missing_name_are_explicit() -> None:
-    # サンドボックスに空白だけのコードを渡すと[NoCodeBlock]、
-    # 定義されていない変数(missing_name)を参照するコードを渡すと
-    # 通常のPythonと同じくNameErrorになる(サンドボックスが変な
-    # エラーメッセージにすり替えたりせず、素直にPythonの例外情報を
-    # 伝えている)ことを確認する。
+    # サンドボックスに空コードや未定義変数参照を渡した場合、
+    # 明示的なエラーメッセージが返されることを検証
     sandbox = Sandbox(
         SandboxConfig(authorized_imports=[], allowed_directories=[]),
         apply_process_memory_limit=False,
     )
-    assert "[NoCodeBlock]" in sandbox.run("   ")
-    assert "NameError" in sandbox.run("print(missing_name)")
+    assert "[NoCodeBlock]" in sandbox.run("   ")  # 空白のみのコードは「コードなし」エラー
+    assert "NameError" in sandbox.run("print(missing_name)")  # 未定義変数はNameError
 
 
 def test_sandbox_default_getattr_is_honored() -> None:
-    # getattr(obj, 'missing', None)のように「見つからなかった場合の
-    # デフォルト値」を指定するgetattrの3引数形式が、制限付きgetattrに
-    # 差し替えられた後でも正しく機能する(Noneが返る)ことを確認する。
-    # セキュリティ対策としてgetattrを差し替えていても、Pythonの
-    # 標準的な使い方まで壊していないかという回帰確認。
+    # サンドボックス内でも組み込みgetattr()にデフォルト値引数が正しく機能することを検証
     sandbox = Sandbox(
         SandboxConfig(authorized_imports=[], allowed_directories=[]),
         apply_process_memory_limit=False,
@@ -102,12 +73,7 @@ def test_sandbox_default_getattr_is_honored() -> None:
 
 
 def test_models_reject_missing_required_fields() -> None:
-    # MBPPTaskInput/SWEBenchTaskInputはPydanticモデルなので、必須
-    # フィールド(...で指定されたフィールド)が1つも無い空の辞書を
-    # 渡すと、Pydanticがバリデーションエラーを送出することを確認する。
-    # moulinetteから壊れたタスク定義が来た場合に、後段の処理まで
-    # 進んでから訳の分からないエラーになるのではなく、入力の時点で
-    # はっきり失敗させるための仕組み。
+    # 必須フィールドが欠けたデータでモデルをバリデーションすると例外が発生することを検証
     with pytest.raises(Exception):
         MBPPTaskInput.model_validate({})
     with pytest.raises(Exception):
@@ -115,17 +81,14 @@ def test_models_reject_missing_required_fields() -> None:
 
 
 def test_models_round_trip_unicode_and_empty_optional_fields() -> None:
-    # task_id=0（0という値はfalsyだが、Noneや未設定ではなく正当な値
-    # として扱われるべき）や、日本語のようなUnicode文字列、空の
-    # test_listリストといった「境界値」を持つデータでも、モデルへの
-    # 読み込みとJSONへの書き出し(model_dump_json)が正しく往復できる
-    # ことを確認する。
+    # Unicode文字列(日本語相当の文字)や空のオプションフィールドを含むデータが、
+    # モデルへの変換・JSONへのダンプを通じて問題なく往復できることを検証
     task = MBPPTaskInput.model_validate(
         {
             "task_id": 0,
-            "task_definition": "文字列を処理する",
+            "task_definition": "文字列を処理する",  # Unicode文字列を含むタスク定義
             "function_definition": "def solve(x):",
-            "test_list": [],
+            "test_list": [],  # 空のテストリスト(オプション相当)
         }
     )
-    assert json.loads(task.model_dump_json())["task_id"] == 0
+    assert json.loads(task.model_dump_json())["task_id"] == 0  # JSON化しても値が保持されること

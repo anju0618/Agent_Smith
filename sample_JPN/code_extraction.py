@@ -1,280 +1,175 @@
-"""Normalizes any LLM tool-call format into a Python code string for the sandbox.
+"""LLMのツール呼び出し形式が何であれ、それをサンドボックス用のPythonコード文字列に正規化する。
 
-Section 4.1: different LLMs are trained on different tool-calling conventions.
-This layer converts formats (b) XML tool calls, (c) JSON/Hermes tool calls, and
-(d) ReAct into equivalent Python function calls, so the sandbox itself stays
-format-agnostic and only ever sees Python code. Format (a), a fenced
-```python block, is the primary format and needs no conversion.
+Section 4.1: LLMごとに学習されているツール呼び出しの慣習が異なる。
+このレイヤーは (b) XMLツール呼び出し、(c) JSON/Hermes形式のツール呼び出し、
+(d) ReAct形式を、それぞれ同等のPython関数呼び出しに変換する。これにより、
+サンドボックス自体は形式に依存せず、常にPythonコードだけを見ればよくなる。
+形式(a)である ```python フェンスブロックが標準形式であり、変換は不要。
 """
-# ============================================================================
-# 【日本語解説】このファイルの役割
-# ============================================================================
-# LLMごとにツール呼び出しの書き方の癖が異なる（```python フェンス派、
-# XML <invoke> 派、JSON <tool_call> 派、ReAct Action/Action Input 派、など）。
-# このモジュールは、あらゆる形式を「サンドボックスが実行できる等価な Python
-# コード文字列」に変換してから渡す。これによりサンドボックス自体は完全に
-# フォーマット非依存でいられる。
-#
-# extract_code() が上から順に7段階のフォールバックを試し、最初にヒットした
-# 形式を使う（詳細は各関数のコメントを参照）。
-# ============================================================================
-from __future__ import annotations
+from __future__ import annotations  # 型注釈の評価を遅延させるためのfuture import
 
-import json
-import re
-from dataclasses import dataclass
-from typing import Optional
+import json  # JSON形式のツール呼び出しをパースするためのjsonモジュール
+import re  # 各種テキストパターンを検出するための正規表現モジュール
+from dataclasses import dataclass  # 結果を保持するデータクラスを定義するため
+from typing import Optional  # 型ヒント用のOptional
 
-# ----------------------------------------------------------------------------
-# 【日本語解説】正規表現パターン一覧（優先順位そのままの定義順）
-# ----------------------------------------------------------------------------
-# _PYTHON_FENCE_RE が (?:```|<end_code>) の「どちらでも」閉じられるのが
-# ポイント: モデルが <end_code> を書き忘れて ``` だけで閉じても、逆に ```
-# を忘れて <end_code> だけ書いても、どちらも正常系として拾える。
-# ----------------------------------------------------------------------------
+# 正しく閉じられた ```python ... ``` または <end_code> で終わるコードフェンスにマッチする正規表現
 _PYTHON_FENCE_RE = re.compile(r"```python\s*\n(.*?)(?:```|<end_code>)", re.DOTALL)
-# 正しく閉じられた ```python ... ``` (または <end_code> 終端) ブロックにマッチ。
-# これがプライマリ形式で、変換不要でそのまま抽出できる。
+# 言語指定の有無を問わない、任意の閉じたコードフェンスにマッチする正規表現(最後の手段用)
 _GENERIC_FENCE_RE = re.compile(r"```(?:\w+)?\s*\n(.*?)```", re.DOTALL)
-# 言語指定の無い、または python 以外の言語タグが付いたフェンスブロックにマッチ。
-# すべての形式を試して失敗したときの、最後の保険として使われる。
+# 閉じタグがないまま文末まで続く ```python フェンスにマッチする正規表現(救済用)
 _UNCLOSED_FENCE_RE = re.compile(r"```python\s*\n(.*)$", re.DOTALL)
-# ```python は開いているが閉じフェンス（``` や <end_code>）が無いまま応答が
-# 終わってしまった場合の救済用。残りテキスト全部をコードとみなす。
 
+# XML形式の <invoke name="...">...</invoke> ツール呼び出しにマッチする正規表現
 _XML_INVOKE_RE = re.compile(r'<invoke\s+name="([^"]+)">(.*?)</invoke>', re.DOTALL)
-# <invoke name="ツール名">...</invoke> 形式（Claude系でよく見る形式）にマッチ。
+# XML形式の <parameter name="...">...</parameter> パラメータにマッチする正規表現
 _XML_PARAM_RE = re.compile(r'<parameter(?:\s+name="([^"]+)")?>(.*?)</parameter>', re.DOTALL)
-# <invoke> の中身から <parameter name="キー">値</parameter> を1つずつ拾う。
-# name属性が省略されている場合は後段で arg0, arg1, ... という仮名を振る。
 
+# JSON/Hermes形式の <tool_call>{...}</tool_call> にマッチする正規表現
 _JSON_TOOLCALL_RE = re.compile(r"<tool_call>\s*(\{.*?\})\s*</tool_call>", re.DOTALL)
-# <tool_call>{"name": ..., "arguments": {...}}</tool_call> 形式（Hermes系モデル
-# でよく見る形式）にマッチ。
 
+# ReAct形式の "Action: ...\nAction Input: ..." にマッチする正規表現
 _REACT_RE = re.compile(r"Action:\s*(\S+)\s*\nAction Input:\s*(\{.*?\}|\S.*)", re.DOTALL)
-# 古典的な ReAct プロンプティング形式 "Action: ツール名\nAction Input: {...}"
-# にマッチ。
 
 
 @dataclass
 class ExtractionResult:
-    """`code` is the Python snippet to execute (None if nothing usable was found).
+    """抽出結果を保持するデータクラス。
 
-    `note` explains what the extraction layer did, so the orchestrator can
-    prepend it to the Observation the LLM sees next - the mandatory "no code
-    block found" / "malformed but interpreted anyway (explain how)" feedback
-    from Section 4.1.
+    `code` は実行すべきPythonスニペット(何も見つからなかった場合はNone)。
+
+    `note` は抽出レイヤーが何を行ったかを説明する文字列で、オーケストレーターが
+    次にLLMへ見せるObservationの先頭に付加できるようにする - Section 4.1で
+    義務付けられている「コードブロックが見つからなかった」/「不正な形式だが
+    解釈して実行した(その方法を説明する)」というフィードバックのこと。
     """
-    # -------------------------------------------------------------------
-    # 【日本語解説】ExtractionResult = extract_code() の戻り値
-    # -------------------------------------------------------------------
-    # code: 実行すべきPythonコード文字列。何も見つからなければ None。
-    # note: 抽出処理が「何をしたか」の説明文。正常系（プライマリ形式が
-    #       そのまま見つかった場合）は空文字列。それ以外（救済策やフォー
-    #       マット変換、抽出失敗）の場合は、次のObservationの先頭に付加
-    #       される「何が起きたか」の明示的な説明になる。
-    #       ── これは「暗黙に何かをしたら、必ずそれをLLMに伝える」という
-    #       このプロジェクト全体の一貫した設計方針の一部。
-    # -------------------------------------------------------------------
 
-    code: Optional[str]
-    note: str
+    code: Optional[str]  # 実行すべきPythonコード文字列。抽出失敗時はNone
+    note: str  # 抽出処理の説明・注記(空文字列の場合もある)
 
 
 def _py_literal(value: str) -> str:
-    """Render a raw string value as a Python literal, preferring its JSON/number reading."""
-    # ---------------------------------------------------------------
-    # 【日本語解説】XMLの<parameter>の中身をPythonリテラルに変換する
-    # ---------------------------------------------------------------
-    # XML/ReAct形式では値は常に「文字列」として渡ってくる（例: "true", "3",
-    # "hello"）。しかしそれを json.loads() で読めるなら、Pythonの True/3
-    # のような本来の型として埋め込みたい（"true" のまま渡すと Python コード
-    # 上では文字列"true"になってしまい、ツール側が bool を期待していると
-    # 壊れる）。json.loads に失敗する（普通の自然言語文字列など）場合は、
-    # ただの文字列として repr() する。
-    # ---------------------------------------------------------------
-    stripped = value.strip()
+    """生の文字列値を、可能ならJSON/数値としての解釈を優先してPythonリテラルとして表現する。"""
+    stripped = value.strip()  # 前後の空白を除去
     try:
-        return repr(json.loads(stripped))
-    except (json.JSONDecodeError, TypeError):
-        return repr(value)
+        return repr(json.loads(stripped))  # JSONとしてパースできればその値のPython表現(repr)を返す
+    except (json.JSONDecodeError, TypeError):  # JSONとして解釈できない場合
+        return repr(value)  # 元の文字列そのもののPython表現(repr)を返す
 
 
 def _call_from_kwargs(name: str, kwargs: dict, parse_string_literals: bool = False) -> str:
-    # ---------------------------------------------------------------
-    # 【日本語解説】ツール名+引数辞書 → 等価なPythonコード文字列への変換
-    # ---------------------------------------------------------------
-    # XML/JSON/ReAct のどの形式から来た呼び出しも、最終的にはこの関数を通って
-    #     result = ツール名(key1=value1, key2=value2, ...)
-    #     print(result)
-    # という、サンドボックスがそのまま exec() できる2行のPythonコードに
-    # 変換される。print(result) を必ず付けるのは、ツールの戻り値をLLMに
-    # 見せる（Observationとして反映させる）ため——print しなければ、結果は
-    # サンドボックスの標準出力に現れず、LLMには何も見えないまま次のターンに
-    # 進んでしまう（BENCHMARK_REPORT.md のアブレーション実験で、worked
-    # exampleが無いとこの print 忘れパターンが実際に起きたと記録されている）。
-    #
-    # parse_string_literals=True の場合だけ _py_literal() で型を推測する
-    # （XML由来の呼び出しのみ。JSON/ReActは既にJSONとしてパース済みで、
-    # 値の型が最初から分かっているので不要）。
-    # ---------------------------------------------------------------
+    # 関数呼び出しの引数部分の文字列表現を溜めるリスト
     parts = []
-    for key, value in kwargs.items():
-        if parse_string_literals and isinstance(value, str):
-            parts.append(f"{key}={_py_literal(value)}")
-        else:
-            parts.append(f"{key}={value!r}")
+    for key, value in kwargs.items():  # 各キーワード引数について
+        if parse_string_literals and isinstance(value, str):  # 文字列値をJSON解釈で変換するモードかつ実際に文字列の場合
+            parts.append(f"{key}={_py_literal(value)}")  # JSON/数値解釈を試みたPythonリテラルとして追加
+        else:  # それ以外(すでにPythonの値、または変換不要)の場合
+            parts.append(f"{key}={value!r}")  # 値をそのままreprで文字列化して追加
+    # "result = 関数名(引数...)" とその結果をprintするコードを組み立てて返す
     return f"result = {name}({', '.join(parts)})\nprint(result)"
 
 
 def _extract_xml_invoke(text: str) -> Optional[str]:
-    # ---------------------------------------------------------------
-    # 【日本語解説】XML <invoke> 形式の変換
-    # ---------------------------------------------------------------
-    # 例:
-    #   <invoke name="search_code">
-    #     <parameter name="pattern">is_valid_email</parameter>
-    #   </invoke>
-    # は
-    #   result = search_code(pattern='is_valid_email')
-    #   print(result)
-    # に変換される。<parameter> に name 属性が無い場合は "arg0", "arg1", ...
-    # という仮の引数名を振る（enumerate の index を使用）。
-    # ---------------------------------------------------------------
+    # テキスト中からXML形式のinvokeタグを検索する
     match = _XML_INVOKE_RE.search(text)
-    if not match:
-        return None
-    name, body = match.group(1), match.group(2)
-    kwargs: dict = {}
-    for index, param_match in enumerate(_XML_PARAM_RE.finditer(body)):
-        key = param_match.group(1) or f"arg{index}"
-        kwargs[key] = param_match.group(2).strip()
+    if not match:  # 見つからなければ
+        return None  # 抽出失敗としてNoneを返す
+    name, body = match.group(1), match.group(2)  # 関数名とinvokeタグの中身(パラメータ部分)を取り出す
+    kwargs: dict = {}  # パラメータ名と値を格納する辞書
+    for index, param_match in enumerate(_XML_PARAM_RE.finditer(body)):  # invoke内の各parameterタグについて
+        key = param_match.group(1) or f"arg{index}"  # name属性がなければ位置に基づく仮の名前(arg0, arg1, ...)を使う
+        kwargs[key] = param_match.group(2).strip()  # パラメータの値(前後の空白を除去)を辞書に格納
+    # 抽出した関数名と引数からPython呼び出しコードを生成して返す(文字列値はJSON解釈を試みる)
     return _call_from_kwargs(name, kwargs, parse_string_literals=True)
 
 
 def _extract_json_tool_call(text: str) -> Optional[str]:
-    # ---------------------------------------------------------------
-    # 【日本語解説】JSON/Hermes <tool_call> 形式の変換
-    # ---------------------------------------------------------------
-    # 例: <tool_call>{"name": "search_code", "arguments": {"pattern": "foo"}}</tool_call>
-    # payload.get("name") が無い、または arguments が dict でない、または
-    # JSONとして壊れている場合は None を返し、呼び出し元 extract_code() が
-    # 次の形式（ReAct）へフォールバックする。
-    # ---------------------------------------------------------------
+    # テキスト中からJSON/Hermes形式のtool_callタグを検索する
     match = _JSON_TOOLCALL_RE.search(text)
-    if not match:
-        return None
+    if not match:  # 見つからなければ
+        return None  # 抽出失敗としてNoneを返す
     try:
-        payload = json.loads(match.group(1))
-    except json.JSONDecodeError:
-        return None
-    name = payload.get("name")
-    arguments = payload.get("arguments", {})
-    if not name or not isinstance(arguments, dict):
-        return None
-    return _call_from_kwargs(name, arguments)
+        payload = json.loads(match.group(1))  # tool_callタグの中身をJSONとしてパース
+    except json.JSONDecodeError:  # JSONとして不正な場合
+        return None  # 抽出失敗としてNoneを返す
+    name = payload.get("name")  # 呼び出す関数名を取得
+    arguments = payload.get("arguments", {})  # 引数辞書を取得(なければ空辞書)
+    if not name or not isinstance(arguments, dict):  # 関数名がない、または引数がdict型でない場合
+        return None  # 不正な形式として抽出失敗を返す
+    return _call_from_kwargs(name, arguments)  # Python呼び出しコードを生成して返す
 
 
 def _extract_react(text: str) -> Optional[str]:
-    # ---------------------------------------------------------------
-    # 【日本語解説】ReAct "Action: name\nAction Input: {...}" 形式の変換
-    # ---------------------------------------------------------------
-    # Action Input が正当なJSON辞書ならそのまま kwargs として使う。
-    # JSON辞書でない場合（例えば Action Input: "some raw string"）は
-    # {"value": raw_input} という1引数の呼び出しとして扱うフォールバックも
-    # 用意されている——形式が曖昧でも、可能な限り何かのPython呼び出しに
-    # 変換しようとする「best-effort」の姿勢がここにも表れている。
-    # ---------------------------------------------------------------
+    # テキスト中からReAct形式の Action/Action Input を検索する
     match = _REACT_RE.search(text)
-    if not match:
-        return None
-    name, raw_input = match.group(1).strip(), match.group(2).strip()
+    if not match:  # 見つからなければ
+        return None  # 抽出失敗としてNoneを返す
+    name, raw_input = match.group(1).strip(), match.group(2).strip()  # 関数名(Action)と入力(Action Input)を取り出す
     try:
-        arguments = json.loads(raw_input)
-        if not isinstance(arguments, dict):
-            arguments = {"value": arguments}
-    except json.JSONDecodeError:
-        arguments = {"value": raw_input}
-    return _call_from_kwargs(name, arguments)
+        arguments = json.loads(raw_input)  # Action Inputの内容をJSONとしてパースを試みる
+        if not isinstance(arguments, dict):  # JSONとしては解釈できたがdict型でない場合(数値や文字列など)
+            arguments = {"value": arguments}  # "value"という単一キーの辞書に包む
+    except json.JSONDecodeError:  # JSONとして解釈できない場合
+        arguments = {"value": raw_input}  # 生の文字列をそのまま"value"キーに入れる
+    return _call_from_kwargs(name, arguments)  # Python呼び出しコードを生成して返す
 
 
 def extract_code(llm_output: str) -> ExtractionResult:
-    """Best-effort extraction of a Python snippet from one LLM response.
+    """1回分のLLM応答からPythonスニペットをベストエフォートで抽出する。
 
-    Tries, in order: a properly closed ```python fence, an unclosed-but-salvageable
-    ```python fence, the three alternate tool-call formats from Section 4.1, then a
-    bare generic fenced block as a last resort.
+    以下の順で試みる: 正しく閉じられた ```python フェンス、閉じタグがないが
+    救済可能な ```python フェンス、Section 4.1にある3種類の代替ツール呼び出し形式、
+    そして最後の手段として言語指定なしの一般的なフェンスブロック。
     """
-    # =====================================================================
-    # 【日本語解説】extract_code() 全体のフロー — 7段階のフォールバック
-    # =====================================================================
-    # orchestrator.py の Orchestrator.run() が、LLMの生応答 (gen.text) を
-    # 毎ターンこの関数に渡す。上から順に試し、最初にヒットした形式の結果を
-    # 即座に返す（後段は一切試さない）。
-    # =====================================================================
-
-    # --- 1. 正しく閉じた ```python ... ``` フェンス（プライマリ形式） -----
+    # まず最優先の形式: 正しく閉じられた ```python フェンスを探す
     match = _PYTHON_FENCE_RE.search(llm_output)
-    if match:
-        # note="" — 何も特別なことは起きていない、変換なしの正常系。
-        return ExtractionResult(code=match.group(1).strip(), note="")
+    if match:  # 見つかった場合
+        return ExtractionResult(code=match.group(1).strip(), note="")  # 前後の空白を除いたコードを返す(注記なし)
 
-    # --- 2. 閉じられていない ```python フェンス（救済策） -----------------
+    # 次に、閉じタグのない```pythonフェンス(応答が途中で切れた場合など)を探す
     unclosed = _UNCLOSED_FENCE_RE.search(llm_output)
-    if unclosed:
-        # 閉じフェンスを忘れていても、残りのテキスト全部をコードとして
-        # 救済する。ただし「本当は正しくない形式だった」ことを note で
-        # LLMに伝え、次のターンで直させる。
+    if unclosed:  # 見つかった場合
         return ExtractionResult(
-            code=unclosed.group(1).strip(),
+            code=unclosed.group(1).strip(),  # フェンス以降の残り全部をコードとして採用する
             note=(
                 "[MalformedCodeBlock] The ```python fence was never closed with ``` or "
                 "<end_code>; the rest of the response was used as the code anyway."
-            ),
+            ),  # 閉じられていなかったことをLLMへのフィードバックとして注記する
         )
 
-    # --- 3〜5. 代替のツール呼び出し形式（XML / JSON / ReAct）を順に試す ----
+    # 続いて、XML/JSON/ReActの3種類の代替ツール呼び出し形式を順に試す
     for extractor, format_name in (
-        (_extract_xml_invoke, "XML <invoke> tool call"),
-        (_extract_json_tool_call, "JSON/Hermes <tool_call>"),
-        (_extract_react, "ReAct Action / Action Input"),
+        (_extract_xml_invoke, "XML <invoke> tool call"),  # XML形式の抽出関数と表示名
+        (_extract_json_tool_call, "JSON/Hermes <tool_call>"),  # JSON形式の抽出関数と表示名
+        (_extract_react, "ReAct Action / Action Input"),  # ReAct形式の抽出関数と表示名
     ):
-        code = extractor(llm_output)
-        if code:
-            # どの形式が使われたかを note に明示することで、LLMに「あなたの
-            # 応答は変換された」ことを気づかせる（本来期待している
-            # ```python フェンス形式への誘導にもなる）。
+        code = extractor(llm_output)  # 各形式の抽出を試みる
+        if code:  # 抽出に成功したら
             return ExtractionResult(
-                code=code,
+                code=code,  # 変換済みのPythonコードを返す
                 note=(
                     f"[FormatConverted] Response used a {format_name} format; "
                     "converted to an equivalent Python call before execution."
-                ),
+                ),  # どの形式から変換したかをLLMへのフィードバックとして注記する
             )
 
-    # --- 6. 最後の保険: 言語タグの無い/違う汎用フェンスブロック -----------
+    # どの専用形式にも一致しなければ、最後の手段として言語指定なしの一般的なフェンスを探す
     generic = _GENERIC_FENCE_RE.search(llm_output)
-    if generic:
+    if generic:  # 見つかった場合
         return ExtractionResult(
-            code=generic.group(1).strip(),
+            code=generic.group(1).strip(),  # フェンス内の中身をコードとして採用する
             note=(
                 "[MalformedCodeBlock] No ```python fence found; "
                 "used the first generic fenced block instead."
-            ),
+            ),  # ```pythonフェンスがなかったことを注記する
         )
 
-    # --- 7. それでも何も見つからなければ、諦めて明示的なフィードバックを返す ---
-    # code=None が返ると、orchestrator.py はサンドボックス実行そのものを
-    # スキップし、この note をそのまま次のObservationとしてLLMに渡す。
-    # ループが「たぶんこう直せばいいだろう」と勝手に推測して何かを実行する
-    # ことは絶対にない——常に「何が起きたか／何を直すべきか」を明示的に
-    # LLMへ返す、という一貫した設計方針がここにも表れている。
+    # ここまでの全ての方式で何も見つからなかった場合は、抽出失敗として扱う
     return ExtractionResult(
-        code=None,
+        code=None,  # 実行可能なコードはなし
         note=(
             "[NoCodeBlock] No valid Python code block or recognized tool-call format "
             "(```python fence, <invoke>, <tool_call>, or Action/Action Input) was found "
             "in the model's response. Reply with a ```python ... ``` block ending in <end_code>."
-        ),
+        ),  # 有効なコードブロックが全く見つからなかったことをLLMへのフィードバックとして注記する
     )
