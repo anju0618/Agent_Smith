@@ -1,561 +1,411 @@
-"""MCP server exposing the mandatory SWE-bench tools (Section 4.5).
+"""SWE-bench向けの必須ツール(セクション4.5)を公開するMCPサーバ。
 
-Reads the repository root from the TESTBED_PATH environment variable, exactly
-as moulinette sets it before starting this server for independent tool
-testing. Every tool is a plain filesystem/subprocess operation rooted there -
-this file has no Docker-specific logic, so the same code works whether
-TESTBED_PATH points at a bare host checkout or at a path inside a container
-this process happens to be running in (see docker_runner.py for how our own
-agent_swebench.py pipeline wires that up, per approach (b) of Section 4.4).
+moulinetteが独立したツールテストのためにこのサーバを起動する際に設定するのと全く同じ方法で、
+TESTBED_PATH環境変数からリポジトリのルートを読み取る。各ツールは単純なファイルシステム/
+サブプロセス操作であり、このファイル自体にはDocker固有のロジックは一切ない - そのため、
+TESTBED_PATHがベアなホスト上のチェックアウトを指していても、このプロセス自身が動いている
+コンテナ内のパスを指していても同じコードで動作する(私たち自身のagent_swebench.pyパイプラインが
+セクション4.4のアプローチ(b)に従ってこれをどう配線しているかはdocker_runner.py参照)。
 
-    python mcp_tools_swebench.py            # stdio transport (default)
-    python mcp_tools_swebench.py --http 8000  # streamable HTTP transport
+    python mcp_tools_swebench.py            # stdioトランスポート(デフォルト)
+    python mcp_tools_swebench.py --http 8000  # streamable HTTPトランスポート
 """
-# このファイルはSWE-bench用の必須9ツールをすべて実装するMCPサーバー。
-# mcp_tools_mbpp.pyと同じく、agent_swebench.pyとは別プロセスとして動く。
-# 決定的に重要な設計方針: このファイルは「TESTBED_PATH環境変数が指す
-# ディレクトリ」を根っこにしたファイルシステム/subprocess操作しか行わず、
-# Dockerを意識するコードは一行も無い。だからこそ、同じこのファイルが
-# (1) docker_runner.pyによってコンテナの中で`docker exec`起動される場合と、
-# (2) moulinette自身がホスト上のベアなチェックアウトに対して直接テストする
-#     場合の、両方でまったく同じように動作できる。
-#
-# @mcp.tool() が付いた各関数のdocstringは、mcp_tools_mbpp.pyと同様に
-# 実際にLLMへ送られるツール説明文の一部になるため、英語のまま変更していない。
-from __future__ import annotations
+from __future__ import annotations  # 型注釈を文字列として遅延評価する(将来のアノテーション構文をサポート)
 
-import argparse
-import os
-import re
-import shlex
-import signal
-import subprocess
-from pathlib import Path
-from typing import Optional
+import argparse  # コマンドライン引数のパース用
+import os  # 環境変数の読み取りに使用
+import re  # 正規表現による検索用
+import shlex  # シェルコマンド用の文字列を安全にクォートするために使用
+import signal  # サブプロセスへのシグナル送信に使用
+import subprocess  # 外部コマンド・スクリプトの実行に使用
+from pathlib import Path  # ファイルパス操作用
+from typing import Optional  # Optional型注釈のため
 
-from mcp.server.fastmcp import FastMCP
+from mcp.server.fastmcp import FastMCP  # MCPサーバを構築するためのフレームワーク
 
-mcp = FastMCP("agent-smith-swebench-tools")
+mcp = FastMCP("agent-smith-swebench-tools")  # SWE-bench用MCPサーバのインスタンスを作成
 
 
 def _testbed_root() -> Path:
-    # 全ツール共通の「作業対象リポジトリのルート」を取得するヘルパー。
-    # TESTBED_PATHは docker_runner.py の mcp_stdio_command() が
-    # -e TESTBED_PATH=/testbed として渡す(コンテナ内で動く場合)か、
-    # moulinetteが独立テスト時にホスト上のパスとして直接設定する。
-    root = os.environ.get("TESTBED_PATH")
+    # TESTBED_PATH環境変数からリポジトリのルートパスを取得するヘルパー関数
+    root = os.environ.get("TESTBED_PATH")  # 環境変数の値を取得(未設定ならNone)
     if not root:
-        # 環境変数が無ければ即座に例外 - fail-closed(サイレントに
-        # 何もしないのではなく、はっきりエラーにする)方針がここにも表れている。
         raise RuntimeError(
             "TESTBED_PATH is not set. moulinette sets this to the repository root "
             "before starting this MCP server; set it yourself when testing standalone."
-        )
-    # .resolve() でシンボリックリンクなどを解決した正規化済み絶対パスにする。
-    # これが後述の「パス脱出防止チェック」の基準点になる。
-    return Path(root).resolve()
+        )  # 未設定の場合は分かりやすいメッセージ付きで例外を送出する
+    return Path(root).resolve()  # 絶対パスに正規化して返す
 
 
 def _eval_script_path() -> Path:
-    # 評価スクリプトの場所。AGENT_SMITH_EVAL_SCRIPT環境変数で上書きできるが
-    # (docker_runner.pyが -e AGENT_SMITH_EVAL_SCRIPT=... で渡す)、
-    # 指定が無ければ規約通り "<testbed>/eval.sh" を見に行く。
-    override = os.environ.get("AGENT_SMITH_EVAL_SCRIPT")
+    # 評価スクリプトのパスを決定するヘルパー関数(環境変数での上書きに対応)
+    override = os.environ.get("AGENT_SMITH_EVAL_SCRIPT")  # 評価スクリプトパスの上書き指定を取得
     if override:
-        return _resolve_within_testbed(override)
-    return _testbed_root() / "eval.sh"
+        return _resolve_within_testbed(override)  # 上書き指定があればそれをTESTBED_PATH配下として解決する
+    return _testbed_root() / "eval.sh"  # 上書きがなければリポジトリルート直下のeval.shをデフォルトとする
 
 
-# ツール出力の上限文字数。SandboxConfig.max_output_charsのデフォルト値と
-# 同じ桁数に揃えてある(意図的な整合)。
-TOOL_OUTPUT_LIMIT_CHARS = 20_000  # same scale as SandboxConfig.max_output_chars's default
+TOOL_OUTPUT_LIMIT_CHARS = 20_000  # SandboxConfig.max_output_charsのデフォルトと同程度のスケール
 
 
 def _cap_output(text: str) -> str:
-    """Cap exploratory tool output before it becomes an Observation.
+    """探索系ツールの出力がObservationになる前に長さの上限を設ける。
 
-    Without this, a single search_code() over a huge codebase, read_file()
-    on a huge file, or run_command()/run_tests() invoking a verbose test
-    suite could return a response large enough to eat most of the 300,000
-    cumulative input-token budget (Section 6.1.2) in one step, or balloon
-    memory relaying it through the MCP transport. Not applied to
-    get_patch(): that return value can be the literal argument to
-    final_answer(get_patch()), and truncating it would silently corrupt a
-    real patch into an invalid diff - a genuine "minimal fix" patch is
-    realistically small anyway, and printing it for inspection along the way
-    is still bounded by the sandbox's own stdout truncation
-    (sandbox/executor.py's [TruncatedOutput]).
+    これがないと、巨大なコードベースに対するsearch_code()単発呼び出し、巨大ファイルへの
+    read_file()、あるいは冗長なテストスイートを呼び出すrun_command()/run_tests()が、
+    1ステップで累積300,000トークンの入力予算(セクション6.1.2)の大部分を食いつぶすほど
+    大きな応答を返したり、MCPトランスポート経由で中継する際にメモリを膨張させたりする
+    恐れがある。get_patch()には適用していない: その戻り値はfinal_answer(get_patch())の
+    引数そのものになりうるため、これを切り詰めると本物のパッチが不正なdiffへと静かに
+    壊されてしまう - 本当に「最小限の修正」であるパッチは現実的には十分小さいはずであり、
+    途中経過を確認するために出力する場合でも、サンドボックス自体のstdout切り詰め
+    (sandbox/executor.pyの[TruncatedOutput])によって既に制限されている。
     """
-    # 探索系ツール(read_file/list_files/search_code/run_command/run_tests)の
-    # 戻り値をここに必ず通すことで、「1回のツール呼び出しでトークン予算の
-    # 大半を溶かしてしまう」事故を防ぐ。get_patch()だけは意図的にこの関数を
-    # 通さない(下のget_patch()のdocstring参照) - パッチを切り詰めると
-    # git applyできない壊れたdiffになってしまうため。
     if len(text) <= TOOL_OUTPUT_LIMIT_CHARS:
-        return text
-    omitted = len(text) - TOOL_OUTPUT_LIMIT_CHARS
+        return text  # 上限以内であればそのまま返す
+    omitted = len(text) - TOOL_OUTPUT_LIMIT_CHARS  # 切り詰めによって省略される文字数を計算
     return (
-        text[:TOOL_OUTPUT_LIMIT_CHARS]
-        # 何文字省略したかを明示的にLLMへ伝える。「なぜか出力が
-        # 途中で切れている」と黙って見せるのではなく、必ず理由を添える
-        # という、このプロジェクト全体で一貫した「暗黙の動作を作らない」
-        # 方針がここにも現れている。
+        text[:TOOL_OUTPUT_LIMIT_CHARS]  # 上限文字数までの内容を残す
         + f"\n[TruncatedToolOutput] {omitted} additional characters were cut off "
-        f"(tool output limit: {TOOL_OUTPUT_LIMIT_CHARS} chars)."
+        f"(tool output limit: {TOOL_OUTPUT_LIMIT_CHARS} chars)."  # 何文字省略されたかを示す注記を追加
     )
 
 
 def _resolve_within_testbed(filepath: str) -> Path:
-    """Resolve filepath against TESTBED_PATH and refuse to leave it."""
-    # このファイル全体のセキュリティの要となる関数。read_file/edit_file/
-    # list_files/run_commandなど、パスを受け取るツールはすべてこの関数を
-    # 経由してから実際のファイルシステム操作を行う。
-    root = _testbed_root()
-    candidate = Path(filepath)
-    # 絶対パスならそのまま、相対パスならリポジトリルートからの相対として解釈する。
-    resolved = candidate if candidate.is_absolute() else root / candidate
-    # .resolve()でシンボリックリンクや ".." を実際に展開した最終的な
-    # 絶対パスにする。ここが重要: 文字列としては ".." を含んでいなくても、
-    # シンボリックリンクを辿った先がTESTBED_PATHの外を指しているケースを
-    # 見逃さないため。
-    resolved = resolved.resolve()
+    """filepathをTESTBED_PATHを基準に解決し、その外に出ることを拒否する。"""
+    root = _testbed_root()  # リポジトリのルートパスを取得
+    candidate = Path(filepath)  # 与えられたパス文字列をPathオブジェクト化
+    resolved = candidate if candidate.is_absolute() else root / candidate  # 絶対パスならそのまま、相対パスならルートと結合
+    resolved = resolved.resolve()  # シンボリックリンクや".."などを解決した実パスに正規化
     if not _is_within(root, resolved):
-        # 展開した結果、リポジトリルートの外に出ていたら例外。
-        # LLMが `filepath="../../etc/passwd"` のような値を渡してきても
-        # ここで弾かれる。
-        raise ValueError(f"'{filepath}' resolves outside the repository root {root}")
-    return resolved
+        raise ValueError(f"'{filepath}' resolves outside the repository root {root}")  # 解決結果がルート外であれば拒否する
+    return resolved  # 検証済みの絶対パスを返す
 
 
 def _is_within(root: Path, candidate: Path) -> bool:
-    # candidateがroot自身か、rootの子孫であるかを判定する小さなヘルパー。
-    # Path.parentsはcandidateの祖先パスすべてを列挙するイテレータなので、
-    # その中にrootが含まれていれば「rootの内側にある」と言える。
-    return candidate == root or root in candidate.parents
+    # candidateがrootそのもの、またはrootの配下にあるかどうかを判定するヘルパー関数
+    return candidate == root or root in candidate.parents  # 一致するか、祖先ディレクトリにrootが含まれていればTrue
 
 
 def _validate_glob_pattern(pattern: str) -> None:
-    # list_files/search_codeが受け取るglobパターン自体を検証する。
-    # パターン文字列そのものが絶対パスだったり ".." を含んでいたりすると、
-    # globの展開結果を待たずにその時点で明らかに不正なので早期に拒否する。
-    pattern_path = Path(pattern)
+    # globパターンが相対パスであり、".."を含まないことを検証するヘルパー関数
+    pattern_path = Path(pattern)  # パターン文字列をPathオブジェクト化
     if not pattern or pattern_path.is_absolute() or ".." in pattern_path.parts:
-        raise ValueError("glob pattern must be relative and must not contain '..'")
+        raise ValueError("glob pattern must be relative and must not contain '..'")  # 空文字・絶対パス・親ディレクトリ参照を拒否する
 
 
 def _matching_files(directory: Path, pattern: str, recursive: bool) -> list:
-    """Return only regular files whose resolved targets remain in TESTBED_PATH."""
-    # list_files/search_codeの共通処理: globパターンでファイルを探し、
-    # それぞれの解決結果が本当にTESTBED_PATHの中に収まっているかを
-    # 再チェックしてから返す(パターン検証だけでなく、展開結果も二重に確認)。
-    _validate_glob_pattern(pattern)
-    root = _testbed_root()
+    """解決後のパスがTESTBED_PATH配下に留まる通常ファイルのみを返す。"""
+    _validate_glob_pattern(pattern)  # まずパターン自体の安全性を検証する
+    root = _testbed_root()  # リポジトリのルートパスを取得
     try:
-        # recursiveならrglob(**相当)、そうでなければglob(直下のみ)。
-        candidates = list(directory.rglob(pattern) if recursive else directory.glob(pattern))
+        candidates = list(directory.rglob(pattern) if recursive else directory.glob(pattern))  # recursiveフラグに応じて再帰的/非再帰的にglob検索
     except (NotImplementedError, ValueError) as exc:
-        raise ValueError(f"invalid glob pattern '{pattern}': {exc}") from exc
+        raise ValueError(f"invalid glob pattern '{pattern}': {exc}") from exc  # globパターン自体が不正な場合はエラーとして送出
 
-    matches = []
+    matches = []  # 条件を満たすファイルのリスト(結果格納用)
     for candidate in candidates:
         try:
-            resolved = candidate.resolve()
+            resolved = candidate.resolve()  # 各候補パスをシンボリックリンク解決済みの絶対パスにする
         except OSError:
-            # 壊れたシンボリックリンクなど、resolve()自体が失敗するケースは
-            # 静かにスキップする(致命的なエラーにはしない)。
-            continue
+            continue  # 解決に失敗した場合(壊れたリンク等)はスキップする
         if not _is_within(root, resolved):
-            # globの展開結果がシンボリックリンク経由でリポジトリの外を
-            # 指していた場合は、ここで初めて検出されて例外になる。
-            raise ValueError(f"glob pattern '{pattern}' matched a path outside {root}")
+            raise ValueError(f"glob pattern '{pattern}' matched a path outside {root}")  # ルート外にマッチした場合は安全のため例外を送出
         if resolved.is_file() and ".git" not in resolved.parts:
-            # ディレクトリは除外(ファイルのみ対象)。.git配下も除外 -
-            # バージョン管理の内部データはコード検索・編集の対象として
-            # 意味が無いだけでなく、巨大なオブジェクトファイルなどで
-            # 無駄にノイズになるため。
-            matches.append(resolved)
-    return matches
+            matches.append(resolved)  # 通常ファイルであり、かつ.gitディレクトリ配下でないもののみ結果に追加
+    return matches  # 条件を満たすファイルパスのリストを返す
 
 
 # ---------------------------------------------------------------------------
-# File System Tools (Section 4.5.1)
+# ファイルシステム系ツール(セクション4.5.1)
 # ---------------------------------------------------------------------------
 
 
 @mcp.tool()
 def read_file(filepath: str, start_line: int = 1, end_line: Optional[int] = None) -> str:
-    """Read a file's content with line numbers, cat -n style.
+    """ファイルの内容を、cat -nのように行番号付きで読み取る。
 
-    Args:
-        filepath: Path to the file (absolute, or relative to the repo root).
-        start_line: First line to include (1-indexed, inclusive).
-        end_line: Last line to include (1-indexed, inclusive). Reads to EOF if omitted.
+    引数:
+        filepath: ファイルへのパス(絶対パス、またはリポジトリルートからの相対パス)。
+        start_line: 読み取りを開始する行(1始まり、この行を含む)。
+        end_line: 読み取りを終了する行(1始まり、この行を含む)。省略時はファイル末尾まで読む。
 
-    Returns:
-        "<line_number>: <line_content>" lines, one per line of the file.
+    戻り値:
+        ファイルの各行に対応する"<行番号>: <行の内容>"という形式の文字列。
     """
-    # 行番号付きでファイルを読む、最も基本的な探索ツール。
     try:
-        path = _resolve_within_testbed(filepath)
+        path = _resolve_within_testbed(filepath)  # 指定パスをリポジトリルート配下として解決・検証
     except ValueError as exc:
-        # パス脱出などの検証エラーは、例外を投げっぱなしにせず
-        # "[Error] ..." という文字列としてLLMに返す。MCPツールは常に
-        # 文字列を返す契約であり、かつLLMに「何が悪かったか」を
-        # 明示的に伝えるのがこのプロジェクトの一貫した方針。
-        return f"[Error] {exc}"
+        return f"[Error] {exc}"  # パスが不正・範囲外であればエラーメッセージを返す
     if not path.is_file():
-        return f"[Error] file not found: {filepath}"
+        return f"[Error] file not found: {filepath}"  # ファイルが存在しない場合のエラー
 
-    # errors="replace": ファイルがUTF-8として不正なバイト列を含んでいても
-    # 例外で落ちずに、置換文字(U+FFFD)で読み進める - 壊れたバイナリに
-    # 近いファイルを読ませてもツールがクラッシュしないための保険。
-    lines = path.read_text(errors="replace").splitlines()
-    last = end_line if end_line is not None else len(lines)
-    first = max(start_line, 1)
-    # Pythonのリストスライスは0始まりなので、1始まりのstart_line/end_lineから
-    # スライス用のインデックスへ変換している(first-1がスライス開始位置)。
-    selected = lines[first - 1: last]
-    return _cap_output("\n".join(f"{i}: {line}" for i, line in enumerate(selected, start=first)))
+    lines = path.read_text(errors="replace").splitlines()  # ファイル全体を読み込み、デコードエラーは置換文字にしつつ行のリストに分割
+    last = end_line if end_line is not None else len(lines)  # end_line未指定なら最終行までを対象とする
+    first = max(start_line, 1)  # start_lineが1未満にならないよう補正する
+    selected = lines[first - 1: last]  # 1始まりの行番号指定を0始まりのスライスに変換して該当範囲を抽出
+    return _cap_output("\n".join(f"{i}: {line}" for i, line in enumerate(selected, start=first)))  # 各行に行番号を付けて結合し、出力サイズ上限を適用して返す
 
 
 @mcp.tool()
 def edit_file(filepath: str, old_str: str, new_str: str) -> str:
-    """Replace an exact string occurrence in a file with a new string.
+    """ファイル内の完全一致する文字列を新しい文字列に置き換える。
 
-    Args:
-        filepath: Path to the file to edit.
-        old_str: Exact text to find (must appear exactly once).
-        new_str: Replacement text.
+    引数:
+        filepath: 編集対象ファイルへのパス。
+        old_str: 検索対象の正確なテキスト(ファイル内にちょうど1回だけ出現する必要がある)。
+        new_str: 置き換え後のテキスト。
 
-    Returns:
-        A status message. If the edit introduces a Python syntax error, that is
-        reported explicitly instead of being silently applied (Section 4.1's
-        mandatory "edit introduced a syntax error" feedback).
+    戻り値:
+        処理結果を示すメッセージ。編集によってPythonの構文エラーが発生した場合は、
+        黙って適用するのではなく明示的にその旨を報告する(セクション4.1が求める
+        「edit introduced a syntax error」フィードバックの必須要件)。
     """
     try:
-        path = _resolve_within_testbed(filepath)
+        path = _resolve_within_testbed(filepath)  # 指定パスをリポジトリルート配下として解決・検証
     except ValueError as exc:
-        return f"[Error] {exc}"
+        return f"[Error] {exc}"  # パスが不正・範囲外であればエラーメッセージを返す
     if not path.is_file():
-        return f"[Error] file not found: {filepath}"
+        return f"[Error] file not found: {filepath}"  # ファイルが存在しない場合のエラー
 
-    content = path.read_text(errors="replace")
-    occurrences = content.count(old_str)
+    content = path.read_text(errors="replace")  # 編集対象ファイルの内容全体を読み込む
+    occurrences = content.count(old_str)  # old_strがファイル内に何回出現するかを数える
     if occurrences == 0:
-        # old_strが1回も見つからない = LLMが記憶している内容と実ファイルが
-        # ズレている(既に編集済み、typoなど)可能性が高い。何もせずエラーで返す。
-        return f"[Error] old_str not found in {filepath}"
+        return f"[Error] old_str not found in {filepath}"  # 1回も見つからなければエラー
     if occurrences > 1:
-        # 2回以上ヒットする場合、「どちらを置換すべきか」が一意に決まらない。
-        # あいまいなまま片方を勝手に選んで書き換えるのではなく、
-        # LLMにもっと具体的な(前後の文脈を含む)old_strを渡すよう
-        # 差し戻す設計 - 「意図しない箇所を書き換えてしまう」事故を防ぐ。
         return (
             f"[Error] old_str is not unique in {filepath} "
             f"({occurrences} occurrences) - include more context"
-        )
+        )  # 複数回出現する場合は一意に特定できないためエラー(より多くの文脈を含めるよう促す)
 
-    # ここまで来れば厳密に1箇所だけの置換だと保証されている。
-    new_content = content.replace(old_str, new_str, 1)
-    path.write_text(new_content)
+    new_content = content.replace(old_str, new_str, 1)  # 一意に特定できたので、最初の1件だけを置換する
+    path.write_text(new_content)  # 置換後の内容をファイルに書き戻す
 
     if path.suffix == ".py":
-        # .pyファイルを編集した場合は、追加のセーフティネットとして
-        # py_compileで構文チェックする。編集そのものはすでに書き込み
-        # 済みなので、構文エラーがあっても元に戻すわけではなく、
-        # 「編集は適用されたが、その結果は構文エラーになっている」と
-        # 明示的にLLMへ伝える([EditSyntaxError])。これによりLLMは
-        # 次のターンで問題を認識し、自分で修正できる。
         result = subprocess.run(
             ["python3", "-m", "py_compile", str(path)], capture_output=True, text=True
-        )
+        )  # Pythonファイルであれば、コンパイルチェックで構文エラーが発生していないか検証する
         if result.returncode != 0:
-            return f"[EditSyntaxError] Edit applied, but introduced a syntax error:\n{result.stderr}"
+            return f"[EditSyntaxError] Edit applied, but introduced a syntax error:\n{result.stderr}"  # 構文エラーが検出された場合は編集済みだがエラーがある旨を報告する
 
-    return f"Edit applied to {filepath}"
+    return f"Edit applied to {filepath}"  # 正常に編集が完了したことを示すメッセージを返す
 
 
 @mcp.tool()
 def list_files(directory: str, pattern: str = "*") -> str:
-    """List files in a directory matching a glob pattern.
+    """指定ディレクトリ内で、globパターンに一致するファイルを一覧表示する。
 
-    Non-recursive by default (e.g. "*.py" lists only direct children); use a
-    "**/" prefix in pattern for a recursive search (e.g. "**/*.py").
+    デフォルトでは非再帰的(例えば"*.py"は直下の子ファイルのみを対象とする)。
+    再帰的に検索する場合はpatternの先頭に"**/"を付ける(例: "**/*.py")。
 
-    Args:
-        directory: Directory to list (absolute, or relative to the repo root).
-        pattern: Glob pattern to filter file names (e.g. "*.py", "**/*.py").
+    引数:
+        directory: 一覧表示するディレクトリ(絶対パス、またはリポジトリルートからの相対パス)。
+        pattern: ファイル名を絞り込むためのglobパターン(例: "*.py", "**/*.py")。
     """
     try:
-        path = _resolve_within_testbed(directory)
+        path = _resolve_within_testbed(directory)  # 指定ディレクトリをリポジトリルート配下として解決・検証
     except ValueError as exc:
-        return f"[Error] {exc}"
+        return f"[Error] {exc}"  # パスが不正・範囲外であればエラーメッセージを返す
     if not path.is_dir():
-        return f"[Error] directory not found: {directory}"
+        return f"[Error] directory not found: {directory}"  # ディレクトリが存在しない場合のエラー
 
     try:
-        # recursive=False固定 - list_filesは「このディレクトリの中身を
-        # ざっと見る」用途で、深い再帰探索がしたいなら次のsearch_codeや
-        # "**/"プレフィックス付きpatternを使えばよい、という役割分担。
-        matches = sorted(str(p) for p in _matching_files(path, pattern, recursive=False))
+        matches = sorted(str(p) for p in _matching_files(path, pattern, recursive=False))  # 非再帰的にマッチするファイルを検索し、パス文字列としてソートする
     except ValueError as exc:
-        return f"[Error] {exc}"
-    return _cap_output("\n".join(matches)) if matches else "(no files matched)"
+        return f"[Error] {exc}"  # globパターンが不正な場合などはエラーメッセージを返す
+    return _cap_output("\n".join(matches)) if matches else "(no files matched)"  # マッチがあれば一覧を返し、なければその旨のメッセージを返す
 
 
 # ---------------------------------------------------------------------------
-# Code Search Tools (Section 4.5.2)
+# コード検索系ツール(セクション4.5.2)
 # ---------------------------------------------------------------------------
 
 
 def _iter_matching_files(root: Path, file_pattern: str) -> list:
-    # search_code系ツールが使う内部ヘルパー。list_filesとは異なり常に
-    # recursive=Trueでリポジトリ全体を対象にする。
+    # 指定ルート配下を再帰的に検索し、file_patternに一致するファイルの一覧を返すヘルパー関数
     return _matching_files(root, file_pattern, recursive=True)
 
 
 @mcp.tool()
 def search_code(pattern: str, file_pattern: str = "*.py") -> str:
-    """Grep-like regex search across the codebase.
+    """コードベース全体に対するgrepライクな正規表現検索。
 
-    Args:
-        pattern: Regular expression to search for.
-        file_pattern: Glob for which files to search (default "*.py").
+    引数:
+        pattern: 検索対象の正規表現。
+        file_pattern: 検索対象とするファイルを絞り込むglobパターン(デフォルトは"*.py")。
 
-    Returns:
-        "/absolute/path.py:<line_number> <line_content>" lines.
+    戻り値:
+        "/absolute/path.py:<行番号> <行の内容>"という形式の行の並び。
     """
-    root = _testbed_root()
+    root = _testbed_root()  # リポジトリのルートパスを取得
     try:
-        # LLMが渡してくる正規表現は不正な場合もあるので、コンパイル失敗を
-        # ここで捕まえて分かりやすいエラーメッセージにする。
-        regex = re.compile(pattern)
+        regex = re.compile(pattern)  # 与えられたパターン文字列を正規表現としてコンパイル
     except re.error as exc:
-        return f"[Error] invalid regex: {exc}"
+        return f"[Error] invalid regex: {exc}"  # 正規表現として不正な場合はエラーメッセージを返す
 
     try:
-        matching_files = _iter_matching_files(root, file_pattern)
+        matching_files = _iter_matching_files(root, file_pattern)  # file_patternに一致する検索対象ファイル一覧を取得
     except ValueError as exc:
-        return f"[Error] {exc}"
+        return f"[Error] {exc}"  # globパターンが不正な場合などはエラーメッセージを返す
 
-    results = []
+    results = []  # マッチした行を集めるリスト
     for file in matching_files:
         try:
             for lineno, line in enumerate(file.read_text(errors="replace").splitlines(), start=1):
                 if regex.search(line):
-                    # grepと同じ "パス:行番号 内容" というよく見慣れた
-                    # フォーマットで結果を積む。これは
-                    # search_function_or_class_definition_in_code()や
-                    # find_references()でも共通して使われる形式。
-                    results.append(f"{file}:{lineno} {line}")
+                    results.append(f"{file}:{lineno} {line}")  # 正規表現にマッチした行を「ファイルパス:行番号 内容」の形式で記録
         except OSError:
-            # 読み取り中に権限エラーなどが起きても、そのファイルだけ
-            # スキップして検索全体は継続する。
-            continue
-    return _cap_output("\n".join(results)) if results else "(no matches)"
+            continue  # ファイル読み込みに失敗した場合はそのファイルをスキップする
+    return _cap_output("\n".join(results)) if results else "(no matches)"  # マッチがあれば結果を返し、なければその旨のメッセージを返す
 
 
-# 関数/クラス定義行にマッチする正規表現のテンプレート。{name}の部分に
-# エスケープ済みのシンボル名を埋め込んで使う。
-_DEF_RE_TEMPLATE = r"^\s*(?:async\s+def|def|class)\s+{name}\b"
+_DEF_RE_TEMPLATE = r"^\s*(?:async\s+def|def|class)\s+{name}\b"  # 関数・非同期関数・クラスの定義行にマッチする正規表現テンプレート
 
 
 @mcp.tool()
 def search_function_or_class_definition_in_code(name: str) -> str:
-    """Find where a function or class is defined.
+    """関数またはクラスがどこで定義されているかを探す。
 
-    Args:
-        name: Function or class name to look for.
+    引数:
+        name: 探したい関数またはクラスの名前。
 
-    Returns:
-        Same format as search_code: "/absolute/path.py:<line_number> <line_content>".
+    戻り値:
+        search_codeと同じ形式: "/absolute/path.py:<行番号> <行の内容>"。
     """
-    # search_codeの薄いラッパー。re.escape(name)でnameに正規表現の特殊文字が
-    # 含まれていても文字通りの文字列としてマッチさせる(例えば
-    # "foo.bar"のような名前が来ても、"."が「任意の1文字」として
-    # 解釈されないようにする)。
-    return str(search_code(_DEF_RE_TEMPLATE.format(name=re.escape(name)), "*.py"))
+    return str(search_code(_DEF_RE_TEMPLATE.format(name=re.escape(name)), "*.py"))  # 定義行にマッチする正規表現を組み立ててsearch_codeに委譲する
 
 
 @mcp.tool()
 def find_references(name: str, filepath: str = "", line: int = 0) -> str:
-    """Find all usages of a function or class name across the codebase.
+    """コードベース全体から、ある関数・クラス名のすべての使用箇所を探す。
 
-    Args:
-        name: Symbol name to search for.
-        filepath: Optional path to the file where `name` is defined. When given
-            together with `line`, that exact location is excluded from the
-            results, since a declaration is not itself a "usage".
-        line: Optional 1-indexed line of the definition (see filepath).
+    引数:
+        name: 検索対象のシンボル名。
+        filepath: `name`が定義されているファイルへの任意指定パス。lineと合わせて
+            指定した場合、宣言そのものは「使用」ではないため結果から除外される。
+        line: 定義箇所の1始まりの行番号(任意指定、filepathとセットで使用)。
 
-    Returns:
-        Same format as search_code: one usage per line, declaration excluded
-        when filepath/line identify it.
+    戻り値:
+        search_codeと同じ形式: 1行1使用箇所。filepath/lineで宣言箇所が
+        特定できた場合はそれを除外する。
     """
-    # \bname\b - 単語境界付きでnameそのものを検索する(部分一致の
-    # 誤検出、例えば "foo" を検索して "foobar" までヒットするのを防ぐ)。
-    results = str(search_code(rf"\b{re.escape(name)}\b", "*.py"))
+    results = str(search_code(rf"\b{re.escape(name)}\b", "*.py"))  # 単語境界付きでシンボル名を検索し、全出現箇所を取得する
     if not filepath or not line or results.startswith("[Error]") or results == "(no matches)":
-        # filepath/lineが指定されていない、あるいはそもそも検索自体が
-        # エラーだったり0件だったりする場合は、除外処理をせずそのまま返す。
-        return results
+        return results  # 宣言位置の情報がない、あるいは検索自体がエラー/該当なしの場合はそのまま返す
 
     try:
-        declaration_path = str(_resolve_within_testbed(filepath))
+        declaration_path = str(_resolve_within_testbed(filepath))  # 宣言ファイルのパスをリポジトリルート配下として解決する
     except ValueError:
-        # filepathの解決に失敗しても致命的エラーにはせず、
-        # 「除外なしの全結果」を返す方にフォールバックする。
-        return results
+        return results  # 宣言ファイルのパスが不正な場合は除外処理をせずそのまま返す
 
-    # 定義行そのものを示す行頭文字列("<パス>:<行番号> ")を作り、
-    # それで始まる行だけを結果からフィルタして除外する。
-    # 「定義」自体は「使用」ではない、という要求(docstring参照)を
-    # 満たすための処理。
-    declaration_marker = f"{declaration_path}:{line} "
-    filtered = [ln for ln in results.splitlines() if not ln.startswith(declaration_marker)]
-    return "\n".join(filtered) if filtered else "(no matches other than the declaration)"
+    declaration_marker = f"{declaration_path}:{line} "  # 宣言箇所の行を特定するための先頭一致文字列を組み立てる
+    filtered = [ln for ln in results.splitlines() if not ln.startswith(declaration_marker)]  # 宣言箇所に一致する行を結果から除外する
+    return "\n".join(filtered) if filtered else "(no matches other than the declaration)"  # 除外後の結果を返す(宣言以外に使用箇所がなければその旨を返す)
 
 
 # ---------------------------------------------------------------------------
-# Execution Tools (Section 4.5.3)
+# 実行系ツール(セクション4.5.3)
 # ---------------------------------------------------------------------------
 
 
 @mcp.tool()
 def run_command(command: str, workdir: str = "") -> str:
-    """Run a shell command in the given working directory.
+    """指定した作業ディレクトリでシェルコマンドを実行する。
 
-    Args:
-        command: The shell command to execute.
-        workdir: Working directory (absolute, or relative to the repo root;
-            defaults to the repo root).
+    引数:
+        command: 実行するシェルコマンド。
+        workdir: 作業ディレクトリ(絶対パス、またはリポジトリルートからの相対パス。
+            省略時はリポジトリルート)。
 
-    Returns:
-        A formatted block with stdout, stderr, and exit code.
+    戻り値:
+        stdout・stderr・終了コードをまとめた整形済みブロック。
     """
     try:
-        cwd = _resolve_within_testbed(workdir) if workdir else _testbed_root()
+        cwd = _resolve_within_testbed(workdir) if workdir else _testbed_root()  # workdirが指定されていればそれを解決し、なければリポジトリルートを使う
     except ValueError as exc:
-        return f"[Error] {exc}"
+        return f"[Error] {exc}"  # 作業ディレクトリの指定が不正な場合はエラーメッセージを返す
 
     try:
-        # shell=True: commandを文字列のままシェルに渡す(パイプやリダイレクトを
-        # LLMが自然に書けるようにするため)。start_new_session=True で
-        # このプロセスを新しいプロセスグループのリーダーにする - これにより、
-        # commandがさらに子プロセスを産んでいても(例: `sleep 999 &`)、
-        # プロセスグループ全体に対してシグナルを送れば取りこぼしなく
-        # 巻き込んで終了させられる。
         process = subprocess.Popen(
             command,
-            shell=True,
-            cwd=cwd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            start_new_session=True,
-        )
+            shell=True,  # シェル経由でコマンド文字列を実行する
+            cwd=cwd,  # 指定した作業ディレクトリで実行する
+            stdout=subprocess.PIPE,  # 標準出力をパイプで受け取る
+            stderr=subprocess.PIPE,  # 標準エラー出力をパイプで受け取る
+            text=True,  # バイト列ではなく文字列として入出力を扱う
+            start_new_session=True,  # 新しいプロセスグループで起動し、後でグループ単位でシグナルを送れるようにする
+        )  # サブプロセスとしてコマンドを起動する
         try:
-            # 通常経路: 120秒以内に終わればここで完了。
-            stdout, stderr = process.communicate(timeout=120)
+            stdout, stderr = process.communicate(timeout=120)  # 最大120秒待ってプロセスの完了と出力の取得を試みる
         except subprocess.TimeoutExpired:
-            # 120秒を超えたら、まずプロセスグループ全体にSIGTERM
-            # (穏やかな終了要求)を送る。os.killpgはプロセスグループID
-            # (ここではプロセスグループリーダーのpidと同じ値)を対象にする。
-            os.killpg(process.pid, signal.SIGTERM)
+            os.killpg(process.pid, signal.SIGTERM)  # タイムアウトした場合はプロセスグループ全体にSIGTERMを送って穏やかに終了を試みる
             try:
-                # SIGTERMを送ったあと2秒だけ待ち、自主的に終了するかを見る。
-                stdout, stderr = process.communicate(timeout=2)
+                stdout, stderr = process.communicate(timeout=2)  # SIGTERM後さらに2秒だけ終了を待つ
             except subprocess.TimeoutExpired:
-                # それでも終わらなければSIGKILLで問答無用に強制終了させる。
-                os.killpg(process.pid, signal.SIGKILL)
-                stdout, stderr = process.communicate()
-            # タイムアウト経路では、たとえ強制終了後に多少のstdout/stderrを
-            # 回収できていても、それは使わずに固定のエラーメッセージだけを返す
-            # (中途半端な出力をLLMに見せて誤解させないため)。
-            return "[Error] command timed out after 120s"
-        returncode = process.returncode
+                os.killpg(process.pid, signal.SIGKILL)  # それでも終了しなければSIGKILLで強制終了する
+                stdout, stderr = process.communicate()  # 強制終了後の出力を回収する
+            return "[Error] command timed out after 120s"  # タイムアウトが発生したことを示すエラーを返す
+        returncode = process.returncode  # 正常終了した場合の終了コードを取得
     except subprocess.TimeoutExpired:
-        # communicate()呼び出し自体がまれに例外として飛んでくる経路への保険。
-        return "[Error] command timed out after 120s"
+        return "[Error] command timed out after 120s"  # communicate呼び出し自体がタイムアウト例外を送出した場合のフォールバック
 
     return _cap_output(
         f"exit_code: {returncode}\n--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}"
-    )
+    )  # 終了コード・標準出力・標準エラー出力をまとめて整形し、出力サイズ上限を適用して返す
 
 
 @mcp.tool()
 def run_tests() -> str:
-    """Run the task's evaluation script.
+    """タスクの評価スクリプトを実行する。
 
-    Returns:
-        The evaluation script's combined output, or an explanatory error if no
-        evaluation script is available in this context.
+    戻り値:
+        評価スクリプトの標準出力・標準エラーを結合した出力。このコンテキストで
+        評価スクリプトが利用できない場合は、その旨を説明するエラーを返す。
     """
-    # このrun_tests()はmcp_tools_mbpp.pyのrun_tests(code, test_list)とは
-    # 完全に別物(引数無し)。SWE-benchでは「候補コードを直接assertで
-    # チェックする」のではなく、「タスクごとに用意された評価スクリプト
-    # (eval.sh)をリポジトリに対して丸ごと実行する」という方式を取る。
     try:
-        eval_script = _eval_script_path()
+        eval_script = _eval_script_path()  # 評価スクリプトのパスを決定する
     except ValueError as exc:
-        return f"[Error] {exc}"
+        return f"[Error] {exc}"  # パス決定に失敗した場合はエラーメッセージを返す
     if not eval_script.is_file():
-        # 評価スクリプトが存在しない(=moulinette経由ではなく単独で
-        # このMCPサーバーをテストしている場合など)は、代わりに
-        # run_command()を直接使うようLLM(または人間の開発者)に案内する。
         return (
             f"[Error] no evaluation script found at {eval_script}. "
             "Use run_command(...) to invoke the project's own test runner instead."
-        )
-    # 実体はrun_command()への薄い委譲。shlex.quote()でスクリプトパスを
-    # シェルエスケープしてから "bash <path>" として実行する。
-    return str(run_command(f"bash {shlex.quote(str(eval_script))}"))
+        )  # 評価スクリプトが存在しない場合、代わりにrun_command()を使うよう案内する
+    return str(run_command(f"bash {shlex.quote(str(eval_script))}"))  # 評価スクリプトをbashで実行するコマンドをrun_command()に委譲する(パスは安全にクォートする)
 
 
 @mcp.tool()
 def get_patch() -> str:
-    """Get the unified git diff of every change made to the repository so far.
+    """これまでにリポジトリに加えられた全ての変更をまとめたunified git diffを取得する。
 
-    Returns:
-        The output of `git -c core.fileMode=false diff` (Section 4.4).
-        Deliberately not passed through _cap_output - see that function's
-        docstring for why truncating a real patch would be worse than
-        leaving it whole.
+    戻り値:
+        `git -c core.fileMode=false diff`の出力(セクション4.4)。意図的に
+        _cap_outputを通していない - 本物のパッチを切り詰めることがなぜより悪いのかは
+        その関数のdocstringを参照。
     """
-    root = _testbed_root()
-    # -c core.fileMode=false: ファイルのパーミッションビット(実行権限など)の
-    # 変更をdiffの対象から除外するgit設定。コンテナ内でファイルを
-    # 書き換える際にパーミッションが本来の意図と無関係に変わってしまう
-    # ことがあり、それが無意味な差分としてパッチに混入するのを防ぐ。
+    root = _testbed_root()  # リポジトリのルートパスを取得
     result = subprocess.run(
         ["git", "-c", "core.fileMode=false", "diff"], cwd=root, capture_output=True, text=True
-    )
+    )  # ファイルモード変更を無視した設定でgit diffを実行し、リポジトリ全体の変更差分を取得する
     if result.returncode != 0:
-        return f"[Error] git diff failed: {result.stderr}"
-    # ここで意図的に_cap_output()を通していない点に注意
-    # (このファイル冒頭の_cap_output()のdocstringで理由を説明済み):
-    # この戻り値は final_answer(get_patch()) として直接提出されうるため、
-    # 切り詰めるとgit applyできない壊れたdiffになってしまう。
-    return result.stdout
+        return f"[Error] git diff failed: {result.stderr}"  # git diffの実行自体が失敗した場合はエラーメッセージを返す
+    return result.stdout  # 成功した場合はdiffの標準出力(パッチ本体)をそのまま返す
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="SWE-bench MCP tool server")
+    # エントリーポイント: コマンドライン引数を解析し、stdioまたはHTTPでMCPサーバを起動する
+    parser = argparse.ArgumentParser(description="SWE-bench MCP tool server")  # 引数パーサを作成
     parser.add_argument(
         "--http", type=int, default=None, help="Serve over streamable HTTP on this port instead of stdio"
-    )
-    args = parser.parse_args()
+    )  # HTTPで待ち受けるポート番号(指定しなければstdioモード)
+    args = parser.parse_args()  # 実際にコマンドライン引数を解析
 
     if args.http:
-        mcp.settings.port = args.http
-        mcp.run(transport="streamable-http")
+        mcp.settings.port = args.http  # 指定されたポート番号をサーバ設定に反映
+        mcp.run(transport="streamable-http")  # streamable HTTPトランスポートでサーバを起動
     else:
-        # docker_runner.pyのmcp_stdio_command()が組み立てる
-        # `docker exec -i ... python3 <path>` コマンドは、
-        # 引数無しでこのスクリプトを起動する - つまり実運用では常に
-        # このstdio分岐が使われる。
-        mcp.run(transport="stdio")
+        mcp.run(transport="stdio")  # デフォルトのstdioトランスポートでサーバを起動
 
 
 if __name__ == "__main__":
-    main()
+    main()  # スクリプトとして直接実行された場合にmain()を呼び出す

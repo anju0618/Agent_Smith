@@ -1,23 +1,13 @@
-"""Startup error and shutdown handling for both agent CLIs."""
-# ============================================================================
-# 日本語解説: このファイルは agent_mbpp.py / agent_swebench.py という
-# 2つのエージェントCLIの「起動直後のエラー処理」と「SIGTERM相当の
-# シャットダウン処理」をテストしています。本物のDockerや本物のMCP
-# サブプロセスは使わず、SweBenchContainerやMCPToolProxyといった
-# 依存コンポーネントをmonkeypatchで偽物に差し替えることで、
-# 「起動処理の途中でエラーが起きた場合」「Orchestratorがまだ
-# 生成される前にSIGTERMが届いた場合」といった、通常のテストでは
-# 再現しづらいタイミングの問題を確実に再現しています。
-# ============================================================================
-import json
-import sys
-from pathlib import Path
-from typing import Callable, Dict
+"""両方のエージェントCLI(MBPP用・SWE-bench用)における起動時エラーとシャットダウン処理のテスト。"""
+import json  # タスクファイル/出力ファイルのJSON読み書きに使用
+import sys  # sys.argvを差し替えてCLI引数をシミュレートするために使用
+from pathlib import Path  # ファイルパス操作のために使用
+from typing import Callable, Dict  # 型ヒント(コールバック関数・辞書)のために使用
 
-import pytest
+import pytest  # テストフレームワーク本体、monkeypatch型ヒントにも使用
 
-import agent_mbpp
-import agent_swebench
+import agent_mbpp  # MBPP用エージェントCLIのエントリーポイントモジュール
+import agent_swebench  # SWE-bench用エージェントCLIのエントリーポイントモジュール
 
 
 def _run_cli(
@@ -26,9 +16,8 @@ def _run_cli(
     task_file: Path,
     output_file: Path,
 ) -> None:
-    # sys.argvを差し替えて、あたかもコマンドラインから
-    # `python -m agent_mbpp --task-file ... --output ...` のように
-    # 起動されたかのように見せかけるヘルパー関数。
+    # sys.argvを書き換えて、指定したタスクファイル・出力ファイル・モデル名・
+    # プロバイダURLでCLIが起動されたかのように振る舞わせる
     monkeypatch.setattr(
         sys,
         "argv",
@@ -49,58 +38,47 @@ def _run_cli(
 def test_swebench_docker_initialization_failure_writes_error_solution(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # SweBenchContainerの初期化(Dockerイメージのpull/起動)が失敗する
-    # 状況をFailingContainerという偽クラスで再現する。エージェントが
-    # クラッシュして何も出力しないのではなく、たとえ起動処理の
-    # 最初期段階で失敗しても、success: falseと具体的なエラー内容
-    # ("docker unavailable")を含んだsolution.jsonが必ず書き出される
-    # ことを確認する。これは「成功でも失敗でも必ずsolution.jsonを
-    # 書き出す」という設計方針(EXPLAINED.md 11節)の裏付け。
-    task_file = tmp_path / "task.json"
-    output_file = tmp_path / "solution.json"
+    # SWE-bench: Dockerコンテナの初期化に失敗した場合、
+    # エラー内容を含むsolution.jsonが書き出されることを検証するテスト
+    task_file = tmp_path / "task.json"  # 一時ディレクトリに置くタスク定義ファイル
+    output_file = tmp_path / "solution.json"  # 一時ディレクトリに置く出力先ファイル
     task_file.write_text(
         json.dumps(
             {
-                "instance_id": "project__repo-1",
-                "problem_statement": "fix it",
-                "docker_image": "missing:image",
-                "eval_script": "true",
+                "instance_id": "project__repo-1",  # SWE-benchタスクの識別子
+                "problem_statement": "fix it",  # 問題文(ダミー)
+                "docker_image": "missing:image",  # 存在しないDockerイメージ名
+                "eval_script": "true",  # 評価スクリプト(ダミー)
             }
         )
     )
 
     class FailingContainer:
+        # コンストラクタで必ず例外を投げる、Docker初期化失敗をシミュレートするフェイククラス
         def __init__(self, docker_image: str) -> None:
             raise RuntimeError("docker unavailable")
 
+    # SweBenchContainerを上のフェイククラスに差し替える
     monkeypatch.setattr(agent_swebench, "SweBenchContainer", FailingContainer)
+    # シグナルハンドラ登録を無害化(実際にシグナルハンドラを設定しない)
     monkeypatch.setattr(agent_swebench.signal, "signal", lambda signum, handler: None)
+    # CLI引数を差し替える
     _run_cli(monkeypatch, "agent_swebench", task_file, output_file)
 
+    # 実際にCLIのmain関数を実行
     agent_swebench.main()
 
+    # 出力されたsolution.jsonの内容を検証
     result = json.loads(output_file.read_text())
-    assert result["success"] is False
-    assert "docker unavailable" in result["error"]
+    assert result["success"] is False  # 失敗として記録されているはず
+    assert "docker unavailable" in result["error"]  # エラーメッセージに原因が含まれるはず
 
 
 def test_swebench_sigterm_before_orchestrator_still_stops_cleanly(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # このテストが再現しているのは「まだOrchestratorインスタンスが
-    # 作られる前(=agent_swebench.pyのorchestrator変数がNoneのまま)の
-    # タイミングでSIGTERMが届いたらどうなるか」という、前の会話で
-    # 話したhandle_sigterm()の分岐（if orchestrator is None:
-    # raise ShutdownRequested(...)）を狙い撃ちしたテストです。
-    #
-    # signal.signalを直接呼ぶ代わりに、渡されたハンドラ関数を
-    # handlers["sigterm"]という辞書に保存しておくcapture_signalで
-    # 差し替えています。そしてInterruptingContainerのコンストラクタの
-    # 中で、あたかも「まさにこのタイミングでSIGTERMが届いた」かのように
-    # そのハンドラを手動で呼び出すことで、実際のOSシグナルを送らなくても
-    # 「Docker起動処理の最中にSIGTERMが来る」という状況を確実に
-    # 再現しています。それでもクラッシュせず、"shutdown requested"という
-    # エラーを含んだsolution.jsonがきちんと書き出されることを確認する。
+    # SWE-bench: orchestrator起動前(コンテナ初期化中)にSIGTERMを受け取っても、
+    # 正常にシャットダウン処理されエラーとして記録されることを検証するテスト
     task_file = tmp_path / "task.json"
     output_file = tmp_path / "solution.json"
     task_file.write_text(
@@ -113,60 +91,63 @@ def test_swebench_sigterm_before_orchestrator_still_stops_cleanly(
             }
         )
     )
-    handlers: Dict[str, Callable[[int, object], None]] = {}
+    handlers: Dict[str, Callable[[int, object], None]] = {}  # 登録されたシグナルハンドラを保持する辞書
 
     def capture_signal(signum: int, handler: Callable[[int, object], None]) -> None:
+        # signal.signal()の代わりに呼ばれ、実際に登録せずハンドラを保存するだけにする
         handlers["sigterm"] = handler
 
     class InterruptingContainer:
+        # コンストラクタの中でSIGTERMハンドラを呼び出し、初期化中の割り込みを再現するフェイククラス
         def __init__(self, docker_image: str) -> None:
             handlers["sigterm"](agent_swebench.signal.SIGTERM, None)
 
-    monkeypatch.setattr(agent_swebench.signal, "signal", capture_signal)
-    monkeypatch.setattr(agent_swebench, "SweBenchContainer", InterruptingContainer)
+    monkeypatch.setattr(agent_swebench.signal, "signal", capture_signal)  # シグナル登録を差し替え
+    monkeypatch.setattr(agent_swebench, "SweBenchContainer", InterruptingContainer)  # コンテナ初期化を差し替え
     _run_cli(monkeypatch, "agent_swebench", task_file, output_file)
 
     agent_swebench.main()
 
     result = json.loads(output_file.read_text())
-    assert result["success"] is False
-    assert "shutdown requested" in result["error"]
+    assert result["success"] is False  # 失敗として記録されているはず
+    assert "shutdown requested" in result["error"]  # シャットダウン要求が原因と記録されているはず
 
 
 def test_mbpp_sigterm_before_orchestrator_still_stops_cleanly(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # 上のSWE-bench版と全く同じ考え方のテストを、agent_mbpp.py側でも
-    # 行っている。今度はMCPToolProxyの初期化中(MCPサブプロセス起動中)
-    # にSIGTERMが届く状況を再現し、同じく正しくエラー終了することを確認する。
+    # MBPP: orchestrator起動前(MCPプロキシ初期化中)にSIGTERMを受け取っても、
+    # 正常にシャットダウン処理されエラーとして記録されることを検証するテスト
     task_file = tmp_path / "task.json"
     output_file = tmp_path / "solution.json"
     task_file.write_text(
         json.dumps(
             {
-                "task_id": 1,
-                "task_definition": "add numbers",
-                "function_definition": "def add(a, b):",
-                "test_list": ["assert add(1, 2) == 3"],
+                "task_id": 1,  # MBPPタスクのID
+                "task_definition": "add numbers",  # タスクの説明文
+                "function_definition": "def add(a, b):",  # 関数シグネチャの雛形
+                "test_list": ["assert add(1, 2) == 3"],  # 検証用のassert文リスト
             }
         )
     )
-    handlers: Dict[str, Callable[[int, object], None]] = {}
+    handlers: Dict[str, Callable[[int, object], None]] = {}  # 登録されたシグナルハンドラを保持する辞書
 
     def capture_signal(signum: int, handler: Callable[[int, object], None]) -> None:
+        # signal.signal()の代わりに呼ばれ、実際に登録せずハンドラを保存するだけにする
         handlers["sigterm"] = handler
 
     class InterruptingProxy:
+        # コンストラクタの中でSIGTERMハンドラを呼び出し、初期化中の割り込みを再現するフェイククラス
         def __init__(self, stdio_command: str, env: Dict[str, str]) -> None:
             handlers["sigterm"](agent_mbpp.signal.SIGTERM, None)
 
-    monkeypatch.setattr(agent_mbpp.signal, "signal", capture_signal)
-    monkeypatch.setattr(agent_mbpp, "MCPToolProxy", InterruptingProxy)
-    monkeypatch.setattr(agent_mbpp, "SCRATCH_DIR", tmp_path / "scratch")
+    monkeypatch.setattr(agent_mbpp.signal, "signal", capture_signal)  # シグナル登録を差し替え
+    monkeypatch.setattr(agent_mbpp, "MCPToolProxy", InterruptingProxy)  # MCPプロキシ初期化を差し替え
+    monkeypatch.setattr(agent_mbpp, "SCRATCH_DIR", tmp_path / "scratch")  # 作業用スクラッチディレクトリを一時パスに変更
     _run_cli(monkeypatch, "agent_mbpp", task_file, output_file)
 
     agent_mbpp.main()
 
     result = json.loads(output_file.read_text())
-    assert result["success"] is False
-    assert "shutdown requested" in result["error"]
+    assert result["success"] is False  # 失敗として記録されているはず
+    assert "shutdown requested" in result["error"]  # シャットダウン要求が原因と記録されているはず

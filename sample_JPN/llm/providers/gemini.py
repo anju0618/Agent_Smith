@@ -1,174 +1,99 @@
-# ============================================================================
-# 【日本語解説】llm/providers/gemini.py — Google AI Studio (Gemini) 専用実装
-#
-# なぜopenai_compatible.pyと別ファイルなのか: GeminiのREST APIは構造そのものが違う。
-#   - エンドポイントが "/chat/completions" ではなく "/models/{model}:generateContent"
-#   - 認証がAuthorizationヘッダーではなく、URLのクエリパラメータ "?key=..."
-#   - リクエストボディが「messages」ではなく「contents」＋「parts」という入れ子構造
-#   - レスポンスが「choices」ではなく「candidates」という入れ子構造
-# この「本当に構造が違う2つ目のプロバイダ」がちゃんとChatProviderプロトコル
-# （llm/provider.py）を満たせることで、「抽象化がOpenAI形式のラッパーに過ぎない」
-# という状態を避けられている。
-#
-# 【最重要】このファイルには実際に起きたセキュリティインシデントへの対策が
-# 埋め込まれている。詳しくは chat() 内の except ブロックのコメントを参照。
-# ============================================================================
-"""Chat completion client for Google AI Studio's Gemini REST API.
+"""Google AI StudioのGemini REST API向けのチャット補完クライアント。
 
-Kept separate from OpenAICompatibleProvider because Gemini's wire format
-differs structurally (no /chat/completions path, API key as a query parameter,
-"contents"/"parts" request schema, "candidates" response schema) - this is the
-second, structurally different provider backing the multi-provider abstraction
-required by Section 4.6, proving the abstraction isn't just an OpenAI-shaped
-interface in disguise.
+Geminiのワイヤーフォーマットは構造的に異なる(/chat/completionsパスがない、
+APIキーはクエリパラメータとして渡す、"contents"/"parts"というリクエストスキーマ、
+"candidates"というレスポンススキーマ)ため、OpenAICompatibleProviderとは分離して
+実装している - これはSection 4.6で要求されているマルチプロバイダ抽象化を
+裏付ける、構造的に異なる2つ目のプロバイダであり、この抽象化が単なる
+OpenAI形式のインターフェースの偽装ではないことを証明している。
 """
-from __future__ import annotations
+from __future__ import annotations  # 型注釈の評価を遅延させるためのfuture import
 
-import time
-from typing import List, Optional, Tuple
+import time  # リクエストの所要時間を計測するためのtimeモジュール
+from typing import List, Optional, Tuple  # 型ヒント用のList、Optional、Tuple
 
-import requests
+import requests  # HTTPリクエストを送信するためのrequestsライブラリ
 
-from llm.provider import GenerationResult
+from llm.provider import GenerationResult  # 統一された生成結果の型
 
 
 class GeminiProvider:
     def __init__(self, base_url: str) -> None:
-        self.base_url = base_url.rstrip("/")
+        self.base_url = base_url.rstrip("/")  # 末尾のスラッシュを除去したベースURLを保持
 
     @staticmethod
     def _to_gemini_contents(messages: List[dict]) -> Tuple[Optional[str], List[dict]]:
-        # 【日本語解説】
-        # このプロジェクト内部では「OpenAI形式」のメッセージリスト
-        # （{"role": "system"/"user"/"assistant", "content": "..."}）を共通形式として
-        # 使っている（orchestrator.pyのmessagesがまさにこれ）。しかしGemini APIは
-        # 独自の形式を要求するので、ここで変換する。
-        #
-        # Geminiの作法:
-        #   - "system"ロールという概念がAPI上は無く、代わりに別フィールド
-        #     "systemInstruction"としてリクエストのトップレベルに渡す必要がある。
-        #     そのため、system役割のメッセージはcontentsリストには入れず、
-        #     system_instruction変数として個別に取り出しておく。
-        #   - assistant（アシスタント自身の過去発言）は Gemini では "model" という
-        #     ロール名になる。それ以外（user）はそのまま "user"。
-        #   - 各メッセージのテキストは {"parts": [{"text": "..."}]} という
-        #     入れ子構造で包む必要がある。
-        system_instruction = None
-        contents = []
-        for msg in messages:
-            role = msg["role"]
-            if role == "system":
-                system_instruction = msg["content"]
-                continue
-            gemini_role = "model" if role == "assistant" else "user"
-            contents.append({"role": gemini_role, "parts": [{"text": msg["content"]}]})
-        return system_instruction, contents
+        # OpenAI形式のmessagesリストを、Gemini API用の(systemInstruction, contents)形式に変換するヘルパー
+        system_instruction = None  # システムメッセージの内容を保持する変数(見つからなければNoneのまま)
+        contents = []  # Gemini形式の会話内容(contents)を蓄積するリスト
+        for msg in messages:  # 各メッセージについて
+            role = msg["role"]  # メッセージのロール(system/user/assistantなど)を取得
+            if role == "system":  # システムロールのメッセージなら
+                system_instruction = msg["content"]  # systemInstructionとして別扱いで保持する
+                continue  # contentsには追加せず次のメッセージへ
+            gemini_role = "model" if role == "assistant" else "user"  # assistantはGeminiでは"model"、それ以外は全て"user"にマッピング
+            contents.append({"role": gemini_role, "parts": [{"text": msg["content"]}]})  # Gemini形式のcontentsエントリとして追加
+        return system_instruction, contents  # システム指示文と会話内容のタプルを返す
 
     def chat(
         self,
-        messages: List[dict],
-        model: str,
-        api_key: str,
-        stop: Optional[List[str]],
-        max_output_tokens: int,
-        timeout: float,
+        messages: List[dict],  # 会話履歴(role/contentの辞書のリスト、OpenAI形式)
+        model: str,  # 使用するモデル名
+        api_key: str,  # 認証用のAPIキー
+        stop: Optional[List[str]],  # 生成を止めるストップシーケンス(任意)
+        max_output_tokens: int,  # 生成する最大トークン数
+        timeout: float,  # リクエストのタイムアウト秒数
     ) -> GenerationResult:
-        system_instruction, contents = self._to_gemini_contents(messages)
-        url = f"{self.base_url}/models/{model}:generateContent"
+        system_instruction, contents = self._to_gemini_contents(messages)  # OpenAI形式のメッセージをGemini形式に変換する
+        url = f"{self.base_url}/models/{model}:generateContent"  # Geminiのgenerate用エンドポイントURLを組み立てる
 
-        # 【日本語解説】
-        # stop sequenceや出力トークン上限は、Geminiでは"generationConfig"という
-        # 専用オブジェクトの中にまとめて入れる（OpenAI互換APIのようにpayload直下ではない）。
-        generation_config: dict = {"maxOutputTokens": max_output_tokens}
-        if stop:
-            generation_config["stopSequences"] = stop
+        generation_config: dict = {"maxOutputTokens": max_output_tokens}  # 生成設定(最大出力トークン数)を初期化
+        if stop:  # ストップシーケンスが指定されていれば
+            generation_config["stopSequences"] = stop  # Gemini形式のキー名で生成設定に追加する
 
-        payload: dict = {"contents": contents, "generationConfig": generation_config}
-        if system_instruction:
-            payload["systemInstruction"] = {"parts": [{"text": system_instruction}]}
+        payload: dict = {"contents": contents, "generationConfig": generation_config}  # リクエストボディの基本部分を構築
+        if system_instruction:  # システム指示があれば
+            payload["systemInstruction"] = {"parts": [{"text": system_instruction}]}  # Gemini形式のsystemInstructionとして追加する
 
-        start = time.monotonic()
+        start = time.monotonic()  # リクエスト開始時刻を記録(単調増加クロックを使用)
         try:
-            # 【日本語解説】
-            # ここが構造上の最大の違い: 認証がHTTPヘッダーではなく、URLの
-            # クエリパラメータ "?key=<APIキー>" として送られる
-            # （params={"key": api_key} → requestsがURLに自動的に付加する）。
-            # OpenAI互換プロバイダのように Authorization: Bearer ヘッダーを使う
-            # 選択肢がGoogle AI Studioには無いため、この方式にせざるを得ない。
-            # ただしこれが、下のexceptブロックで説明する漏洩リスクの直接の原因になる。
-            response = requests.post(url, params={"key": api_key}, json=payload, timeout=timeout)
-            response.raise_for_status()
+            response = requests.post(url, params={"key": api_key}, json=payload, timeout=timeout)  # APIキーをクエリパラメータとして付与しPOSTする
+            response.raise_for_status()  # HTTPエラーステータスなら例外を送出する
         except requests.RequestException as exc:
-            # ================================================================
-            # 【日本語解説：最重要・実際のセキュリティインシデントへの対策】
-            #
-            # なぜこのtry/exceptが存在するのか、そしてなぜ絶対にこの部分の
-            # ロジックを変更してはいけないのかを説明する。
-            #
-            # requestsライブラリ（およびその内部で使われるurllib3）は、
-            # HTTPError・ConnectionError・Timeoutのデフォルトのエラーメッセージを
-            # 「実際にリクエストした完全なURL」から自動的に組み立てる。
-            # このGeminiプロバイダでは、そのURLには
-            #   ?key=AIzaSy...(本物のAPIキー)...
-            # というクエリパラメータが含まれている（上のrequests.post()参照）。
-            #
-            # もしここで例外を素通しにしてしまうと、そのエラーメッセージ文字列は
-            # 次のような経路でファイルに書き出されてしまう:
-            #
-            #   requests.RequestException（キー入りURLを含む）
-            #     → llm/client.py の AllProvidersExhaustedError のメッセージに連結される
-            #     → orchestrator.py で SolutionOutput.error / StepMetrics.sandbox_output
-            #       に代入される
-            #     → agent_*.py が solution.json としてディスクに平文で書き出す
-            #
-            # 実際にこの経路で本物のAPIキーが3つのsolution.jsonファイルに
-            # 漏洩する事故が起きた。GitHubへのpushを試みた際、GitHubの
-            # push protection機能がAPIキーのパターンを検知してブロックしたことで
-            # 初めて発覚した（詳細はBENCHMARK_REPORT.md参照）。
-            #
-            # 【対策の中身】
-            # requests.RequestExceptionをそのまま再送出（re-raise）せず、
-            # 必ずここで「キーを含まない情報」だけから新しいメッセージを
-            # 組み立て直してから送出する:
-            #   - `url`変数（=クエリパラメータを含まない、f-stringで組み立てた
-            #     ベースURL+パスのみの文字列。requests.post()に渡した
-            #     `params={"key": api_key}`はurlという変数そのものには
-            #     含まれていないことに注意）
-            #   - HTTPステータスコード（あれば）だけを添える
-            # `from None`を付けているのは、元の例外（キー入りURLの情報を
-            # 内部に保持している可能性がある）を例外チェーンからも切り離し、
-            # トレースバック経由での漏洩リスクも断つため。
-            #
-            # ★★★ このtry/exceptブロックの中身は、キーを一切露出させない
-            # という目的のために存在する。修正・簡略化する際は、
-            # 「urlに実際のクエリパラメータ（?key=...)が含まれていないこと」を
-            # 必ず再確認すること。★★★
-            # ================================================================
-            status = getattr(getattr(exc, "response", None), "status_code", None)
-            status_part = f"status={status}" if status is not None else type(exc).__name__
+            # ここで発生したrequests例外をそのまま伝播させてはならない: requestsとurllib3は
+            # (HTTPError、ConnectionError、Timeoutいずれも)デフォルトのメッセージを
+            # リクエストの *完全な* URLから組み立てるが、このプロバイダの場合そのURLには
+            # `?key=...` というクエリパラメータとしてAPIキーが含まれている -
+            # Geminiにはヘッダーベースの認証方法が存在しないためである。その文字列は
+            # 最終的にAllProvidersExhaustedErrorのメッセージに入り、そこから
+            # SolutionOutput.error / StepMetrics.sandbox_outputへとそのまま渡る -
+            # つまりsolution.jsonとしてディスクに書き込まれてしまう - ので、それが
+            # 漏洩する前にここで(キーを含むリクエスト/レスポンスのurlからではなく、
+            # 常に`url`変数から)メッセージを再構築する。(実際に発生した事例: 本物の
+            # APIキーがこの経路で3つのsolution.jsonファイルに残ってしまい、GitHubの
+            # push protectionによってpushされる直前に検知された - 詳細は
+            # BENCHMARK_REPORT.md参照)
+            status = getattr(getattr(exc, "response", None), "status_code", None)  # 例外にレスポンスがあればそのステータスコードを取得
+            status_part = f"status={status}" if status is not None else type(exc).__name__  # ステータスコードがあればそれを、なければ例外の型名を使う
             raise requests.RequestException(
                 f"Gemini request failed ({status_part}) for url: {url} "
                 "(query parameters, including the API key, redacted)"
-            ) from None
-        elapsed_ms = (time.monotonic() - start) * 1000
-        data = response.json()
+            ) from None  # APIキーを含まない安全なメッセージで例外を再送出する(元の例外はチェーンしない)
+        elapsed_ms = (time.monotonic() - start) * 1000  # 所要時間をミリ秒単位で計算する
+        data = response.json()  # レスポンスボディをJSONとしてパースする
 
-        # 【日本語解説】
-        # Geminiのレスポンス形式: {"candidates": [{"content": {"parts": [{"text": "..."}]}}],
-        # "usageMetadata": {"promptTokenCount": N, "candidatesTokenCount": M}}
-        # partsが複数に分かれて返ってくることがあるため、joinで全部連結してから
-        # 1つのテキストにまとめている。
-        candidate = data["candidates"][0]
-        parts = candidate.get("content", {}).get("parts", [])
-        text = "".join(part.get("text", "") for part in parts)
+        candidate = data["candidates"][0]  # 最初の(唯一の)生成候補を取り出す
+        parts = candidate.get("content", {}).get("parts", [])  # 候補の中のテキストパーツ一覧を取得(なければ空リスト)
+        text = "".join(part.get("text", "") for part in parts)  # 全パーツのテキストを連結して1つの文字列にする
 
-        usage = data.get("usageMetadata", {})
+        usage = data.get("usageMetadata", {})  # トークン使用量メタデータを取得(なければ空辞書)
 
+        # 統一されたGenerationResult形式に変換して返す
         return GenerationResult(
-            text=text,
-            input_tokens=usage.get("promptTokenCount", 0),
-            output_tokens=usage.get("candidatesTokenCount", 0),
-            request_time_ms=elapsed_ms,
-            api_url=self.base_url,
-            model_name=model,
+            text=text,  # 生成されたテキスト
+            input_tokens=usage.get("promptTokenCount", 0),  # 入力トークン数(なければ0)
+            output_tokens=usage.get("candidatesTokenCount", 0),  # 出力トークン数(なければ0)
+            request_time_ms=elapsed_ms,  # リクエストにかかった時間(ミリ秒)
+            api_url=self.base_url,  # 使用したAPIのベースURL
+            model_name=model,  # 使用したモデル名
         )
