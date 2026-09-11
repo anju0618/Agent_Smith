@@ -47,11 +47,19 @@
 - **SWE-bench** — 実在の GitHub リポジトリのバグを、実際に動く Docker コンテナの中で調査・修正し、
   `git diff` として提出する。
 
+「エージェント」という言葉が何を指すかを先に定義しておく。ここでの**エージェント**とは、LLM（大規模言語モデル、いわゆるChatGPTのようなもの）を「1回質問して1回答えをもらって終わり」ではなく、**自分で考え・コードを書き・その結果を見て、また次の一手を考える**というサイクルを何度も繰り返させる仕組みのこと。人間がその都度指示を出す必要はなく、LLM自身が「次に何を試すべきか」を判断しながらループを回す——だから「自律的」と呼ばれる。
+
 エージェントは **Thought → Code → Observation** ループ（[CodeAct](https://arxiv.org/abs/2402.01030)
-方式）を繰り返す。LLM が自然言語で考え（Thought）、Python コードを1ブロック書き（Code）、
-そのコードがセキュリティ制限付きサンドボックス内で実行され、結果（Observation）が次のターンの
-入力に追加される。これを LLM が `final_answer(...)` を呼ぶまで、あるいはイテレーション数・
-トークン予算・時間予算のいずれかが尽きるまで続ける。
+方式）を繰り返す。この3つの言葉の意味はこうなる:
+
+- **Thought（思考）**: LLMが「次に何を試すか」を自然言語で書く部分。人間で言えば「よし、まずこの関数を書いて、公開テストに通るか確認してみよう」という独り言に相当する。
+- **Code（コード）**: その思考を実行可能なPythonコードとして1ブロック書く部分。
+- **Observation（観測）**: そのコードを実際に実行した結果（出力やエラーメッセージ）をLLMに見せる部分。LLMはこれを見て、次のThoughtを考える。
+
+つまり「LLM が自然言語で考え（Thought）、Python コードを1ブロック書き（Code）、そのコードがセキュリティ制限付きサンドボックス内で実行され、結果（Observation）が次のターンの入力に追加される」という1周が、そのままThought→Code→Observationの3語に対応する。**サンドボックス**（Section 8で詳しく扱う）とは、「LLMが書いた、信用できるかどうか分からないコード」を安全に動かすための隔離環境のこと——通常のPythonの`exec()`をそのまま使うと、悪意のあるコード（あるいは単にバグのあるコード）がファイルを消したりネットワークに接続したりできてしまうため、実行できる範囲を厳しく制限した箱の中でだけコードを走らせる。
+
+このループは、LLM が `final_answer(...)` という特別な関数を呼ぶまで、あるいはイテレーション数・
+トークン予算・時間予算のいずれかが尽きるまで続く。**トークン**とはLLMがテキストを処理する際の最小単位（英単語1つが複数トークンに分かれることもある）で、多くのLLM APIは「入力に使えるトークン数」「1回のリクエストで生成できるトークン数」に応じて課金される。ループを無制限に回すとAPI費用も実行時間も青天井になってしまうため、「最大何回ループを回してよいか（イテレーション数）」「入力・出力それぞれ合計何トークンまで使ってよいか（トークン予算）」「合計何秒まで許すか（時間予算）」という3種類の上限を設け、そのどれか1つでも超えたら強制的にループを打ち切る（詳細はSection 5）。
 
 README.md 末尾の「How AI was used」に記載の通り、開発中は AI コーディングアシスタントを
 補助的に活用している。
@@ -59,6 +67,8 @@ README.md 末尾の「How AI was used」に記載の通り、開発中は AI コ
 ---
 
 ## 2. ディレクトリ構成
+
+各ファイルの役割を一覧できるよう、実際のディレクトリ構成をコメント付きで示す。太字で示した3つ（`orchestrator.py`, `sandbox/`, `llm/`）が特に中核で、他の多くのファイルはこの3つを「どのベンチマーク向けに、どう組み合わせるか」を決める配線係だと考えると読みやすい。
 
 ```
 .
@@ -95,6 +105,8 @@ README.md 末尾の「How AI was used」に記載の通り、開発中は AI コ
 └── BENCHMARK_REPORT.md              # 5モデル×3プロバイダ×3タスクの実測比較
 ```
 
+`sandbox/`と`llm/`がそれぞれ独立したPythonパッケージ（サブディレクトリ＋複数ファイル）として切り出されているのは偶然ではない——「信用できないコードを実行する」という関心事と「LLM APIの違いを吸収する」という関心事は、それぞれ内部に複数の役割分担があるほど複雑なので、1ファイルに詰め込まず専用のディレクトリに分けている。逆に`agent_mbpp.py`/`agent_swebench.py`/`code_extraction.py`/`prompts.py`/`models.py`/`config.py`/`docker_runner.py`のようなトップレベルの単一ファイル群は、それぞれが「1つの役割」で完結するくらいの大きさに収まっている、という目安で読み分けるとよい。
+
 ---
 
 ## 3. 全体アーキテクチャとデータフロー
@@ -119,6 +131,15 @@ LLM API  <--Prompt/Response-->  Orchestrator (orchestrator.py)
                           （別プロセスとして起動される）
 ```
 
+この図を上から下へ、実際に1回分のループがどう流れるかという時系列で読み解くと分かりやすい:
+
+1. **Orchestrator**（Section 5）がLLM APIにプロンプトを送り、テキスト応答（Thought＋Code）を受け取る。
+2. 応答テキストは、LLMごとにツール呼び出しの書き方の癖が異なる（```python フェンスで書くモデルもあれば、XMLタグで書くモデルもある）ため、**code_extraction.py**（Section 6）がその違いを吸収し、どんな形式で来ても「実行すべきPythonコード文字列」に正規化する。
+3. 正規化されたコードは**Sandbox**（Section 8）に渡され、そこで初めて実際に実行される。
+4. サンドボックス内のコードが（LLMに渡されたツール一覧の中から）ツールを呼び出すと、それは見た目こそ普通のPython関数呼び出しだが、実体は**MCPToolProxy**（Section 8.3）を経由して外部のツールサーバーへ転送される呼び出しである。
+5. 転送先は**mcp_tools_mbpp.py**または**mcp_tools_swebench.py**（Section 12）——これらはOrchestratorやSandboxとは**別プロセス**として起動されており、実際のテスト実行やファイル操作を担当する。
+6. その実行結果がObservationとしてOrchestratorに戻り、1に戻って次のターンが始まる。
+
 **キーポイントは「Orchestrator は MBPP でも SWE-bench でも一字一句同じ」ということ。**
 違いは3つだけ:
 
@@ -127,7 +148,7 @@ LLM API  <--Prompt/Response-->  Orchestrator (orchestrator.py)
 3. 接続する MCP サーバー（`mcp_tools_mbpp.py` か `mcp_tools_swebench.py`、後者は
    Docker コンテナの中で動く）
 
-この分離のおかげで、「エージェントのロジック」と「タスク固有の道具立て」が完全に疎結合になっている。
+この分離のおかげで、「エージェントのロジック」と「タスク固有の道具立て」が完全に疎結合になっている。**疎結合**とは、2つの部品が互いの内部実装をほとんど知らずに済むように設計されている状態を指す——ここでは「Orchestratorはどんなツールが繋がっているかを一切知らなくても動く」し、逆に「ツールサーバー側もOrchestratorの内部ループの都合を一切知らなくてよい」。この結果、新しいベンチマーク（例えば3つ目の未知のタスク種別）を追加したくなっても、Orchestrator自体には一切手を入れずに、システムプロンプト・サンドボックス設定・MCPサーバーの3点だけを新しく用意すればよい、という拡張性が生まれている。
 
 ---
 
@@ -141,7 +162,11 @@ LLM API  <--Prompt/Response-->  Orchestrator (orchestrator.py)
 ```
 
 つまりこれは自作の型ではなく**採点システム側のスキーマのコピー**。フィールドを1つ変えるだけで
-採点が壊れるので、「形は編集禁止」。全86行、5つの `BaseModel`（`StepMetrics`: 9-26行目、
+採点が壊れるので、「形は編集禁止」。
+
+ここで使われている**Pydantic**というライブラリについて、まず基本から説明する。素のPythonクラスは、フィールドに何を代入しても文句を言わない——`step: int`と書いてあっても、実際には`step = "abc"`のような文字列を入れてもエラーにはならない（型注釈はあくまで人間やエディタへのヒントで、実行時には強制されない）。Pydanticの`BaseModel`を継承したクラスは違う: インスタンスを作る瞬間に、宣言された型と実際に渡された値を**実行時に照合**し、合っていなければ即座に例外を投げる。つまり「このフィールドは必ず整数でなければならない」「このフィールドは必須で、省略はできない」といったルールを、コメントで説明する代わりに**コードそのものとして強制**できる——これが「型契約」と呼ばれる所以で、`models.py`が「moulinette(採点システム)とエージェントの間の約束事」を表現する手段として選ばれている理由でもある。
+
+全86行、5つの `BaseModel`（`StepMetrics`: 9-26行目、
 `SolutionOutput`: 29-47行目、`SandboxConfig`: 50-60行目、`MBPPTaskInput`: 63-72行目、
 `SWEBenchTaskInput`: 75-85行目）に役割は3種類しかない: moulinette→エージェントの
 **入力契約**（`MBPPTaskInput`/`SWEBenchTaskInput`）、エージェント内部だけで完結する**設定**
@@ -150,9 +175,9 @@ LLM API  <--Prompt/Response-->  Orchestrator (orchestrator.py)
 
 地味だが徹底されている点として、**5クラス86行のほぼ全フィールドが `Field(..., description=...)`
 または `Field(default=..., description=...)` の形で書かれている**（必須フィールドは
-`Field(...)`、省略可能なら`default`/`default_factory`付き）。単なる型注釈ではなくフィールドごとに
+`Field(...)`、省略可能なら`default`/`default_factory`付き）。この`Field(...)`という書き方についても補足しておく: Pydanticでは単に`step: int`と書くだけでも動くが、そのフィールドに説明文やデフォルト値、生成ルールを追加で持たせたい場合に`Field(...)`という関数を使う。`Field(...)`の第一引数が三点リーダー`...`（Pythonの`Ellipsis`という特殊な値）になっているものは「デフォルト値なし＝必須フィールド」を意味し、`Field(default="")`や`Field(default_factory=lambda: ...)`になっているものは「省略された場合はこの値・この関数の戻り値を使う」という意味になる（`default_factory`は、リストや辞書のように「複数のインスタンスで使い回すと危険な可変オブジェクト」をデフォルト値にする際、呼び出すたびに新しく作り直すために使われる）。単なる型注釈ではなくフィールドごとに
 自然文の説明が付与されているのは、このファイルがmoulinette側で人間が読むドキュメントとしても
-JSON Schemaとしても機能することを想定した設計であることの表れ——このファイル自体が
+JSON Schema（後述のSection 8.3で説明するMCPツールの引数記述にも同じ考え方が出てくる、「型と説明文の組み合わせを機械可読な形式で表現したもの」）としても機能することを想定した設計であることの表れ——このファイル自体が
 「エージェント開発者向けの唯一の正式な契約書」になっている。`SandboxConfig.max_output_chars`
 の説明文には `"project-internal, not required by the moulinette"` という一文が埋め込まれており
 （60行目）、モデル定義の中に「このフィールドだけは採点契約の一部ではなく実装都合のものだ」
@@ -242,7 +267,7 @@ class SandboxConfig(BaseModel):
     max_output_chars: int = 20_000           # プロジェクト内部の都合。moulinette契約外
 ```
 
-`authorized_imports` はデフォルト**拒否**方式 — ここに無い名前は `import` した瞬間ブロックされる。
+`authorized_imports` はデフォルト**拒否**方式 — ここに無い名前は `import` した瞬間ブロックされる。「デフォルト拒否（allowlist、許可リスト方式）」とは、「明示的に許可したものだけが通り、それ以外は自動的にすべて禁止」という考え方で、「明示的に禁止したものだけがダメで、それ以外はすべて許可」という逆方向の「デフォルト許可（blocklist、拒否リスト方式）」より安全側に倒れている——新しい危険なモジュールが将来追加・発見されても、ホワイトリストに載せない限り自動的にブロックされ続けるため。
 実際の値は `agent_mbpp.py` と `agent_swebench.py` で明確に差がある:
 
 | | `agent_mbpp.py:107-116` | `agent_swebench.py:102-107` |
@@ -308,13 +333,19 @@ container.start(eval_script=task.eval_script, tools_file=TOOLS_FILE)
 
 `Orchestrator.run(task_id, benchmark, task_prompt)` が1タスクを最後まで走らせ、`SolutionOutput` を返す。
 
+このセクションを読む前に、繰り返し出てくる3つの前提知識を押さえておく。
+
+- **トークン(token)**: LLM(大規模言語モデル)はテキストをそのまま1文字ずつ処理するのではなく、「トークン」という単位に分割してから処理する。1トークンはおおよそ数文字〜1単語程度に相当することが多いが、厳密な対応はモデルごとのトークナイザ次第で、バイト数や文字数とは別物である。LLM APIの課金や利用上限(このプロジェクトでは`max_input_tokens`/`max_output_tokens`)は、このトークン数を単位に数えられる。以降「入力トークン予算」「出力トークン予算」という言葉が繰り返し出てくるが、これは「LLMに送るテキスト(入力)」「LLMが生成するテキスト(出力)」それぞれについて、使ってよいトークン数の上限を指す。
+- **`time.monotonic()`**: OSの「壁時計」(いわゆる現在時刻、`datetime.now()`など)は、NTPによる時刻同期やユーザーの手動変更で不連続に飛ぶことがある。`time.monotonic()`はそれとは別の、システム起動からの経過を単調に増加し続けるだけの時計で、時刻の巻き戻り・飛びが原則として起こらない。「経過時間を測る」という用途に限れば、こちらの方が安全——`start = time.monotonic()`を記録し、あとで`time.monotonic() - start`を計算すれば、途中でシステム時計が調整されても影響を受けない経過時間が得られる。
+- **UNIXシグナル(SIGTERM/SIGKILL)**: OSがプロセスに送る、非同期の「割り込み通知」。`SIGTERM`は「お願いベース」の終了要求で、プロセス側は`signal.signal(...)`でハンドラ関数を登録し、通知が来たときに任意の後始末コードを挟んでから終了できる。一方`SIGKILL`はOSレベルで即座にプロセスを強制終了させる命令で、プロセス側は一切関与できず、`finally`節すら実行されない。このセクションで説明する`ShutdownRequested`の設計は、この2つのシグナルの性質の違いに直接由来している。
+
 ### ループの1イテレーションの流れ
 
 ```python
 for step_number in range(1, max_iterations + 1):
-    # 0. 停止条件チェック（SIGTERM要求／時間予算／入力トークン予算／出力トークン予算）
-    # 1. 次のリクエストで超過しないか「送信前に」見積もる（後述）
-    # 2. LLMClient.generate() を呼ぶ（stop=["<end_code>"]）
+    # 0. 停止条件チェック(SIGTERM要求／時間予算／入力トークン予算／出力トークン予算)
+    # 1. 次のリクエストで超過しないか「送信前に」見積もる(後述)
+    # 2. LLMClient.generate() を呼ぶ(stop=["<end_code>"])
     # 3. code_extraction.extract_code() でコード抽出
     # 4. コードが無ければ note をそのまま Observation にする
     # 5. あれば Sandbox.run() で実行 → 結果 or FinalAnswer 例外
@@ -323,7 +354,7 @@ for step_number in range(1, max_iterations + 1):
     # 8. そうでなければ assistant/user メッセージを追記して次へ
 ```
 
-### `run()` の実装を行単位で追う（`orchestrator.py:101-235`）
+### `run()` の実装を行単位で追う(`orchestrator.py:101-235`)
 
 ```python
 for step_number in range(1, self.config.max_iterations + 1):        # 118
@@ -376,23 +407,19 @@ else:
 ポイントは次の3つ:
 
 1. **8つの停止条件チェック(0〜7)が毎イテレーションの先頭で毎回すべて評価される**こと。
-   `_stop_requested` チェック（118-122行目）はポーリング的な保険であり、実際にSIGTERMが
-   ループの外（LLM呼び出し中やサンドボックス実行中）で届いた場合の主経路は後述の
+   `_stop_requested` チェック(118-122行目)はポーリング的な保険であり、実際にSIGTERMが
+   ループの外(LLM呼び出し中やサンドボックス実行中)で届いた場合の主経路は後述の
    `ShutdownRequested` 例外の方である。
-2. **`for...else`構文の利用**（219-221行目）: Pythonの`for`ループは`break`されずに
-   イテレータを使い切って終わると`else`節が実行される。`break`されたケース（成功・各種予算超過・
-   SIGTERM）はすべて`else`をスキップするので、`else`節に「その他の終了理由」＝
-   「上限イテレーション到達」だけが自然に残る。専用のフラグ変数を使わずに済ませる、
-   Pythonらしいイディオム。
+2. **`for...else`構文の利用**(219-221行目): まずこの構文自体があまり馴染みがないかもしれないので説明しておく——Pythonの`for`ループには`else`節を付けられ、これは「ループが`break`で**途中終了しなかった**場合(＝イテレータを最後まで自然に使い切った場合)にだけ実行される」という、他の言語にはあまり見ない機能。裏を返せば、ループのどこかで`break`が実行されればその時点で`else`節は**スキップ**される。ここでの`break`されるケース(成功・各種予算超過・SIGTERM)はすべて`else`をスキップするので、`else`節に「その他の終了理由」＝「上限イテレーション到達」だけが自然に残る。専用のフラグ変数(例えば`reached_max_iterations = True`のような変数を用意して最後にチェックする、という書き方)を使わずに済ませる、Pythonらしいイディオム。
 3. **223-224行目の最終セーフティネット**: `success`も`error`もどちらもセットされずにループを
-   抜けるケースは理論上ほぼ起こらないはずだが（8つの`break`経路と`for...else`ですべて
-   カバーされている）、万一のロジック漏れがあっても`SolutionOutput.error`が空文字列のまま
+   抜けるケースは理論上ほぼ起こらないはずだが(8つの`break`経路と`for...else`ですべて
+   カバーされている)、万一のロジック漏れがあっても`SolutionOutput.error`が空文字列のまま
    moulinetteに渡ってしまう事故を防ぐための、意図的な多重防御。
 
 ### 設計上の工夫
 
-- **stop sequence `<end_code>` の必然性**: これがないと、モデルが本物のツール実行結果を
-  待たずに、次のObservationを幻覚して自分で書き続けてしまう危険がある（README.md Section 4.6 のtip）。
+- **stop sequence `<end_code>` の必然性**: まず「stop sequence」というLLM API共通の概念を説明しておく——多くのLLM APIには、生成中のテキストが指定した特定の文字列と一致した瞬間に、そこで生成を打ち切ってレスポンスを返す、という機能がある。この文字列のことをstop sequenceと呼ぶ。`config.stop_sequences`にデフォルトで入っている`<end_code>`がまさにこれで、LLMが1つのCodeブロックを書き終えた合図として使われている。これがないと、モデルが本物のツール実行結果を
+  待たずに、次のObservationを幻覚して自分で書き続けてしまう危険がある(README.md Section 4.6 のtip)。
 - **コードブロックが無い場合の扱い**: `[NoCodeBlock] ...` をそのまま次のObservationとして
   LLMに見せる。ループが「たぶんこうだろう」と推測することは絶対にしない。これは
   Section 4.1 の「明示的フィードバック必須」要件を体現している。
@@ -412,21 +439,23 @@ else:
   ```
 
   なぜ「初回はバイト数、2回目以降は実測トークン数ベース」で式が変わるのか: 1トークンは
-  平均して1バイトより長い（英語で概ね3〜4バイト/トークン）ため、バイト数をそのままトークン数の
-  上限として使うのは常に安全側（トークン数を大きく見積もりすぎ）に倒れる。初回はまだ
+  平均して1バイトより長い(英語で概ね3〜4バイト/トークン)ため、バイト数をそのままトークン数の
+  上限として使うのは常に安全側(トークン数を大きく見積もりすぎ)に倒れる。初回はまだ
   プロバイダから実測トークン数をもらっていないので、この安全側バイト数を仕方なく使う。
-  2回目以降は前回のレスポンスに含まれる実測`input_tokens`（正確な値）を土台にし、
+  2回目以降は前回のレスポンスに含まれる実測`input_tokens`(正確な値)を土台にし、
   「今回追加された分」のバイト数だけをワーストケース換算で足す。こうすることで、
-  会話履歴が伸びるたびに履歴全体をバイト単位で再見積もりする無駄（＝予算チェックが
-  過度に保守的になり、本来まだ余裕があるのに早期に打ち切ってしまう事態）を避けている。
+  会話履歴が伸びるたびに履歴全体をバイト単位で再見積もりする無駄(＝予算チェックが
+  過度に保守的になり、本来まだ余裕があるのに早期に打ち切ってしまう事態)を避けている。
 
 - **`ShutdownRequested` は `BaseException`、しかも例外は「シグナルハンドラの中で即座に」
-  送出される**（`orchestrator.py:21-34, 91-99`、`agent_mbpp.py:91-99` /
-  `agent_swebench.py:91-99` と対）:
+  送出される**(`orchestrator.py:21-34, 91-99`、`agent_mbpp.py:91-99` /
+  `agent_swebench.py:91-99` と対):
+
+  まず一般的な前提として、Pythonの例外クラスには階層がある。ほぼすべての「プログラムのエラー」を表す例外(`ValueError`、`KeyError`、`TypeError`など)は`Exception`というクラスを継承しており、`except Exception:`という書き方は「通常起こりうるエラーは一通り拾う」という意味で広く使われる。一方`Exception`自身は、さらに上位の`BaseException`というクラスを継承している。`KeyboardInterrupt`(Ctrl+Cによる割り込み)や`SystemExit`(`sys.exit()`)のような「プログラムの実行そのものを打ち切りたい」特別な信号は、あえて`Exception`ではなく`BaseException`を**直接**継承するよう設計されている——これにより、コード中に大量にある`except Exception:`の網に引っかからず、必ず外側まで伝播する。`ShutdownRequested`がわざわざ`BaseException`を継承しているのは、まさにこの性質(`Exception`ベースの汎用catch節を素通りする)を借りるため。
 
   よくある誤解は「SIGTERMが届いたら`_stop_requested`フラグが立ち、ループが次にそれを
   チェックしたタイミングで気づいて止まる」というポーリング的なイメージだが、実際の主経路は
-  それとは別にある。CLI側（`agent_mbpp.py:93-99`）で登録されるシグナルハンドラを見ると分かる:
+  それとは別にある。CLI側(`agent_mbpp.py:93-99`)で登録されるシグナルハンドラを見ると分かる:
 
   ```python
   orchestrator: Optional[Orchestrator] = None
@@ -440,11 +469,11 @@ else:
   ```
 
   Pythonのシグナルハンドラは、SIGTERMが実際に届いた瞬間に**そのときプロセスが実行していた
-  任意のPythonバイトコードの合間に割り込んで**呼び出される。つまり`handle_sigterm`は
+  任意のPythonバイトコードの合間に割り込んで**呼び出される。「ポーリング」(ループが定期的に「止まれと言われていないか」を自分から確認しに行く方式)とは対照的に、これは「OS側からの通知がPython側の実行を強制的に中断させる」割り込み駆動の方式——ループの次のチェックポイントまで待つ必要が一切ない。つまり`handle_sigterm`は
   「LLM APIへの`requests.post()`がブロックしている最中」でも「サンドボックス内でLLM生成コードが
   実行されている最中」でも、任意のタイミングで発火しうる。`Orchestrator`インスタンスが
-  まだ生成されていなければ（起動シーケンスの初期段階でSIGTERMが来た場合）その場で直接
-  `ShutdownRequested`を送出し、生成済みなら`orchestrator.request_stop()`（`orchestrator.py:91-99`）
+  まだ生成されていなければ(起動シーケンスの初期段階でSIGTERMが来た場合)その場で直接
+  `ShutdownRequested`を送出し、生成済みなら`orchestrator.request_stop()`(`orchestrator.py:91-99`)
   を呼ぶ:
 
   ```python
@@ -459,9 +488,9 @@ else:
   `Exception`ではなく`BaseException`を継承している理由に直結する:
   `Sandbox.run()`内部の汎用`except Exception`や、`requests`/`urllib3`が内部で使う
   幅広いtry/exceptに、この割り込み例外が誤って捕捉されて握りつぶされてはならない
-  （`sandbox/executor.py`が`SandboxTimeoutError`を`SIGALRM`ハンドラから同じ発想で
-  送出しているのと同一の技法）。`Orchestrator.run()`側では`except ShutdownRequested`
-  （171-173行目）がLLM呼び出しを包む`try`のすぐ外側に置かれ、素通りしてきた例外を
+  (`sandbox/executor.py`が`SandboxTimeoutError`を`SIGALRM`ハンドラから同じ発想で
+  送出しているのと同一の技法)。`Orchestrator.run()`側では`except ShutdownRequested`
+  (171-173行目)がLLM呼び出しを包む`try`のすぐ外側に置かれ、素通りしてきた例外を
   ここで初めて捕捉して通常の`error`セット→`break`の経路に合流させる。
 
   この即時中断が必要な理由はmoulinetteの運用制約にある: 外部ハーネスはSIGTERMを送った後、
@@ -470,7 +499,7 @@ else:
   `agent_swebench.py`は`finally: container.cleanup()`でDockerコンテナの後始末をしなければ
   ならないので、「SIGTERMを受けてから10秒以内に、今実行中の処理を抜けて`finally`ブロックまで
   到達する」ことが必須になる。ポーリングでフラグを見るだけの設計だと、ループの次の
-  チェックポイントまで到達するのにLLM呼び出しやサンドボックス実行の残り時間（最大で数十秒）
+  チェックポイントまで到達するのにLLM呼び出しやサンドボックス実行の残り時間(最大で数十秒)
   がかかってしまい、10秒の猶予に間に合わない可能性がある。シグナルハンドラの中で
   即座に例外を送出する設計は、この時間制約を満たすための直接的な必然性から来ている。
 
@@ -478,13 +507,13 @@ else:
 
 `success`/`solution`/`iterations`/`total_requests`/`total_input_tokens`/`total_output_tokens`/
 `total_time_seconds`/`steps`/`system_prompt`/`error` をすべて埋めて返す。
-失敗時（例外、タイムアウト、予算超過、上限イテレーション到達）でも空の `SolutionOutput` ではなく、
+失敗時(例外、タイムアウト、予算超過、上限イテレーション到達)でも空の `SolutionOutput` ではなく、
 **そこまでの steps を含んだ** `SolutionOutput` を返す設計になっている。`iterations=len(steps)`
-（`orchestrator.py:231`）である点も見落としやすい ── これは「ループが何周走ろうとしたか」では
+(`orchestrator.py:231`)である点も見落としやすい ── これは「ループが何周走ろうとしたか」では
 なく「実際に`StepMetrics`が1件でも記録されたステップの数」であり、例えば最初のLLM呼び出しが
 `AllProvidersExhaustedError`で失敗した場合は`steps`が1件も積まれないまま`iterations=0`で
-終了する（それでも`total_requests`だけは`exc.attempted_requests`ぶん加算されている、
-という非対称性はSection 9.2で扱う`AllProvidersExhaustedError`の設計と対になっている）。
+終了する(それでも`total_requests`だけは`exc.attempted_requests`ぶん加算されている、
+という非対称性はSection 9.2で扱う`AllProvidersExhaustedError`の設計と対になっている)。
 
 ---
 
@@ -495,7 +524,13 @@ LLM ごとにツール呼び出しの書き方の癖が異なる。このモジ�
 これによりサンドボックス自体は完全にフォーマット非依存でいられる。176行の小さなファイルで、
 中身は正規表現5個 + 変換ヘルパー2個 + 形式別抽出関数3個 + それを順に試す `extract_code()` 1個だけ。
 
-### 使う正規表現（優先順位そのままの定義順、`code_extraction.py:17-32`）
+### 使う正規表現(優先順位そのままの定義順、`code_extraction.py:17-32`)
+
+コードを見る前に、正規表現(regex)側の記法を3つだけ確認しておく。
+
+- **`re.DOTALL`フラグ**: 通常、正規表現の`.`(任意の1文字)は改行文字`\n`にはマッチしない。`re.DOTALL`を付けると`.`が改行も含めたあらゆる文字にマッチするようになる——LLMの出力は複数行にまたがるコードブロックなので、これを付けないと1行目しか拾えない。
+- **`(?:...)`という書き方**: 通常の`(...)`は「グループ化」と「あとで`match.group(N)`として取り出せるようにキャプチャする」の両方を兼ねるが、`(?:...)`は前者(グループ化して`|`(OR)や繰り返しをまとめる)だけを行い、キャプチャはしない。取り出す必要のない部分をこう書くことで、`match.group(1)`のような番号が意図通りの箇所を指すようにできる。
+- **貪欲(greedy)マッチと非貪欲(non-greedy)マッチ**: `.*`は既定で「マッチできる限り長く」文字列を食う(貪欲)。末尾に`?`を付けた`.*?`は逆に「マッチできる限り短く」で止まる(非貪欲)。次の`_PYTHON_FENCE_RE`が`(.*?)`を使っているのは、コードフェンスの中身を「最初に現れた閉じタグの直前まで」で止めたい(貪欲だと、応答の中に複数のコードブロックがある場合に不必要に長く食ってしまう)ため。
 
 ```python
 _PYTHON_FENCE_RE   = re.compile(r"```python\s*\n(.*?)(?:```|<end_code>)", re.DOTALL)   # 17
@@ -510,11 +545,13 @@ _REACT_RE          = re.compile(r"Action:\s*(\S+)\s*\nAction Input:\s*(\{.*?\}|\
 `_PYTHON_FENCE_RE` が `(?:```|<end_code>)` の**どちらでも**閉じられるのがポイント:
 モデルが `<end_code>` を書き忘れて ``` ``` ``` だけで閉じても、逆に ``` ``` ``` を忘れて
 `<end_code>` だけ書いても、どちらも正常系として拾える。`_GENERIC_FENCE_RE` は言語指定
-（```` ```json ```` など）の有無を問わない代わりに閉じフェンス必須、`_UNCLOSED_FENCE_RE` は
-逆に`python`指定必須の代わりに閉じフェンス不要（`$`まで食う）という、互いに補い合う正規表現に
+(```` ```json ```` など)の有無を問わない代わりに閉じフェンス必須、`_UNCLOSED_FENCE_RE` は
+逆に`python`指定必須の代わりに閉じフェンス不要(`$`まで食う)という、互いに補い合う正規表現に
 なっている。
 
-### `ExtractionResult` — 抽出結果と「注記」の運搬役（`code_extraction.py:35-48`）
+### `ExtractionResult` — 抽出結果と「注記」の運搬役(`code_extraction.py:35-48`)
+
+コードの前に`@dataclass`という書き方について: これはPython標準の`dataclasses`モジュールが提供するデコレータで、クラス本体にフィールド名と型だけを並べて書くと、コンストラクタ(`__init__`)・等価比較(`__eq__`)・見やすい文字列表現(`__repr__`)などを自動生成してくれる。素の`class`で同じことをすると`__init__`を手書きする必要があるが、`@dataclass`を付けるだけで「値をいくつか束ねて持ち運ぶだけの入れ物」を数行で書ける——この`ExtractionResult`のような「処理結果をまとめて返すだけの型」に向いている書き方。
 
 ```python
 @dataclass
@@ -524,11 +561,11 @@ class ExtractionResult:
 ```
 
 `note`は単なるログではなく、**Orchestratorが次のObservationの先頭にそのまま連結してLLMへ
-返す文字列**（Section 5, `orchestrator.py:186, 191`）。つまり`code_extraction.py`は
+返す文字列**(Section 5, `orchestrator.py:186, 191`)。つまり`code_extraction.py`は
 「コードを抜き出す」だけでなく「抜き出す過程で何が起きたかをLLMに直接語りかける」という
 2つ目の役割を負っている。
 
-### 変換のコア: `_call_from_kwargs()` と `_py_literal()`（`code_extraction.py:51-69`）
+### 変換のコア: `_call_from_kwargs()` と `_py_literal()`(`code_extraction.py:51-69`)
 
 ```python
 def _py_literal(value: str) -> str:                       # 51
@@ -549,22 +586,22 @@ def _call_from_kwargs(name: str, kwargs: dict, parse_string_literals: bool = Fal
 ```
 
 ここに **XML形式だけが特別扱いされる非対称性**がある。XMLの`<parameter>`はワイヤ形式として
-テキストしか運べない（`<parameter name="start_line">1</parameter>`の`1`は文字列`"1"`でしか
-ない）ため、`_extract_xml_invoke()`は`parse_string_literals=True`を渡し、`_py_literal()`に
+テキストしか運べない(`<parameter name="start_line">1</parameter>`の`1`は文字列`"1"`でしか
+ない)ため、`_extract_xml_invoke()`は`parse_string_literals=True`を渡し、`_py_literal()`に
 「`json.loads`で数値・真偽値として読めるなら読み直す」救済を行わせる。一方JSON/Hermesの
 `<tool_call>`とReActの`Action Input`はどちらも中身がJSON文字列であり、`json.loads()`した
-時点で**既に正しい型**（数値なら`int`/`float`、文字列なら`str`）が付いている。ここで
+時点で**既に正しい型**(数値なら`int`/`float`、文字列なら`str`)が付いている。ここで
 もし`parse_string_literals=True`を使ってしまうと、`"123"`という**文字列としての引数**が
 `_py_literal()`によって数値`123`に**誤って再解釈**されてしまう——これを防ぐために
 `_extract_json_tool_call()`と`_extract_react()`は`parse_string_literals`を指定しない
-（デフォルトの`False`のまま`_call_from_kwargs()`に渡す）。この非対称性は
+(デフォルトの`False`のまま`_call_from_kwargs()`に渡す)。この非対称性は
 `tests/test_code_extraction.py`の`test_json_tool_call_preserves_string_argument_types`
-（`{"pattern": "123", "file_pattern": "false"}` → `pattern='123', file_pattern='false'`と
-**文字列のまま**変換されることを確認）と`test_react_format_preserves_json_string_argument_types`
-（`{"pattern": "null"}` → `pattern='null'`と、JSON特殊値`null`ではなく文字列`"null"`のまま
-であることを確認）の2つのテストで直接ロックされている。
+(`{"pattern": "123", "file_pattern": "false"}` → `pattern='123', file_pattern='false'`と
+**文字列のまま**変換されることを確認)と`test_react_format_preserves_json_string_argument_types`
+(`{"pattern": "null"}` → `pattern='null'`と、JSON特殊値`null`ではなく文字列`"null"`のまま
+であることを確認)の2つのテストで直接ロックされている。
 
-### `extract_code()` が試す順序と、それぞれの変換結果（`code_extraction.py:117-175`）
+### `extract_code()` が試す順序と、それぞれの変換結果(`code_extraction.py:117-175`)
 
 `extract_code(llm_output: str) -> ExtractionResult` が上から順に試し、最初にヒットした形式を使う。
 
@@ -594,16 +631,16 @@ if generic:
 return ExtractionResult(code=None, note="[NoCodeBlock] ...")         # 168-175
 ```
 
-1. **正しく閉じた ```` ```python ... ``` ```` フェンス** — プライマリ形式。`note=""`（空文字列、
+1. **正しく閉じた ```` ```python ... ``` ```` フェンス** — プライマリ形式。`note=""`(空文字列、
    `None`ではない点に注意——Orchestrator側は`if extraction.note:`のような真偽判定ではなく
-   常に`note`の有無を文字列として扱う）でそのまま抽出。変換なし。
+   常に`note`の有無を文字列として扱う)でそのまま抽出。変換なし。
    `tests/test_code_extraction.py::test_closed_python_fence`がこの経路を固定している。
-2. **閉じられていない ```` ```python ```` フェンス**（`_UNCLOSED_FENCE_RE`）— 救済策。
+2. **閉じられていない ```` ```python ```` フェンス**(`_UNCLOSED_FENCE_RE`)— 救済策。
    残り全部をコードとして使い、`note`に
    `[MalformedCodeBlock] The ```python fence was never closed with ``` or <end_code>; the
    rest of the response was used as the code anyway.`を付ける
-   （`test_unclosed_python_fence_is_salvaged`）。
-3. **XML `<invoke>`** — `_extract_xml_invoke()`（`code_extraction.py:72-83`）が
+   (`test_unclosed_python_fence_is_salvaged`)。
+3. **XML `<invoke>`** — `_extract_xml_invoke()`(`code_extraction.py:72-83`)が
    `<parameter name="...">...</parameter>`を`_XML_PARAM_RE.finditer()`で1つずつ拾い、
    `name`属性がなければ`arg0`, `arg1`, ...という仮名を振りつつ`kwargs`辞書に詰め、
    `_call_from_kwargs(name, kwargs, parse_string_literals=True)`で等価コードに変換する。
@@ -616,8 +653,8 @@ return ExtractionResult(code=None, note="[NoCodeBlock] ...")         # 168-175
    </invoke>
    ```
 
-   は次のPythonコードに変換される（`filepath`は文字列のまま、`start_line`は`_py_literal()`が
-   `"1"`を`json.loads`で読み直して整数`1`にする）:
+   は次のPythonコードに変換される(`filepath`は文字列のまま、`start_line`は`_py_literal()`が
+   `"1"`を`json.loads`で読み直して整数`1`にする):
 
    ```python
    result = read_file(filepath='/testbed/a.py', start_line=1)
@@ -627,7 +664,7 @@ return ExtractionResult(code=None, note="[NoCodeBlock] ...")         # 168-175
    `note`には`[FormatConverted] Response used a XML <invoke> tool call format; converted to
    an equivalent Python call before execution.`が付く。
 4. **JSON/Hermes `<tool_call>{"name": ..., "arguments": {...}}</tool_call>`** —
-   `_extract_json_tool_call()`（`code_extraction.py:86-99`）がJSONとしてパースし、
+   `_extract_json_tool_call()`(`code_extraction.py:86-99`)がJSONとしてパースし、
    `name`が無い・`arguments`が辞書でない・JSONとして壊れている、のいずれかなら黙って`None`を
    返し次の形式へフォールバックする。`test_json_tool_call_is_converted`の例:
 
@@ -637,9 +674,9 @@ return ExtractionResult(code=None, note="[NoCodeBlock] ...")         # 168-175
       print(result)
    ```
 
-5. **ReAct `Action: name\nAction Input: {...}`** — `_extract_react()`（`code_extraction.py:102-114`）
-   が`Action Input`をJSONとしてパース。辞書でなければ（例えば`Action Input: 42`のように裸の値
-   の場合）`{"value": raw_input}`として1引数関数呼び出し扱いにするフォールバックまで
+5. **ReAct `Action: name\nAction Input: {...}`** — `_extract_react()`(`code_extraction.py:102-114`)
+   が`Action Input`をJSONとしてパース。辞書でなければ(例えば`Action Input: 42`のように裸の値
+   の場合)`{"value": raw_input}`として1引数関数呼び出し扱いにするフォールバックまで
    用意されている。`test_react_format_is_converted`の例:
 
    ```
@@ -650,14 +687,14 @@ return ExtractionResult(code=None, note="[NoCodeBlock] ...")         # 168-175
    ```
 
 6. **末尾の保険**: 上記いずれにも当たらなければ `_GENERIC_FENCE_RE` で最初の汎用フェンス
-   （```` ```json ```` や ```` ``` ```` だけの無言語指定フェンスなど）を最後の手段として使う。
+   (```` ```json ```` や ```` ``` ```` だけの無言語指定フェンスなど)を最後の手段として使う。
    `note`は`[MalformedCodeBlock] No ```python fence found; used the first generic fenced
    block instead.`
 7. **それでも何も見つからなければ** `code=None` を返し、`note`に
    `[NoCodeBlock] No valid Python code block or recognized tool-call format ... was found in
    the model's response. Reply with a \`\`\`python ... \`\`\` block ending in <end_code>.`
    という、次に何を書けばいいかまで指示する明示的なフィードバックを付ける
-   （`test_no_code_block_found`）。
+   (`test_no_code_block_found`)。
 
 `code=None` になったケースは `orchestrator.py:185-186` で「サンドボックス実行そのものを
 スキップし、`note` をそのままObservationとして渡す」という分岐に落ちる。ループが
@@ -672,17 +709,19 @@ XMLの`<invoke>`タグを両方含んでいたとしても、**常にフェン�
 
 ## 7. `prompts.py` — システムプロンプト構築
 
+まず前提として、「システムプロンプト」とは何かを確認しておく。LLM APIに送るメッセージ列(会話履歴)には、通常のユーザー発言・アシスタント発言とは別に「システムメッセージ」という特別な役割の1通を先頭に置ける。ここには「あなたはこういう役割のアシスタントで、こういうルールに従って応答してください」という、対話全体を通じて効かせたい指示をまとめて書く。このプロジェクトでは、`FRAMEWORK_EXPLANATION`(ルール)・`sandbox_manual`(使える道具)・`final_answer`の使い方・worked exampleを1本のテキストに連結したものがシステムプロンプトになり、`Orchestrator.run()`(Section 5)が組み立てる`messages`リストの先頭(`role: "system"`)に置かれる。
+
 `build_system_prompt(benchmark, sandbox_manual, include_example=True)` が、以下の4パーツを
 文字列結合してシステムプロンプト全文を組み立てる。ファイル全体で130行、うち大半は
 定数として定義された素のテキストブロックで、ロジックは末尾の関数1つだけ。冒頭のモジュール
-docstring（`prompts.py:1-4`）が「明確なツールのドキュメント、構造化されたThought/Code/
+docstring(`prompts.py:1-4`)が「明確なツールのドキュメント、構造化されたThought/Code/
 Observationの各枠、そして効果的な推論ループの例」という3つの要素を明言しており、それが
 そのまま後述のパーツ2・パーツ1・パーツ4に対応する。各定数の中身が英語のままなのは、
-`FRAMEWORK_EXPLANATION`直前のコメント（`prompts.py:7`）に「文字列リテラルの中身は英語のまま、
+`FRAMEWORK_EXPLANATION`直前のコメント(`prompts.py:7`)に「文字列リテラルの中身は英語のまま、
 モデルへの指示なので変更しない」と明記されている通り、これはLLMに送られる実データそのもの
 だからである。
 
-### パーツ1: `FRAMEWORK_EXPLANATION`（両ベンチマーク共通、丸ごと固定文字列、`prompts.py:8-33`）
+### パーツ1: `FRAMEWORK_EXPLANATION`(両ベンチマーク共通、丸ごと固定文字列、`prompts.py:8-33`)
 
 ```
 You are an autonomous coding agent. You solve tasks by repeating a strict
@@ -713,7 +752,7 @@ Rules:
 
 「必ずキーワード引数で呼べ」という指示は**あくまで助言**でしかない — モデルが位置引数で
 呼んできても壊れないように、実際の強制は `sandbox/mcp_client.py` の `_make_wrapper()` 側
-（Section 8.3）で保証されている。ここに書かれているルールと、コード側の防御が
+(Section 8.3)で保証されている。ここに書かれているルールと、コード側の防御が
 二重に噛み合っている一例。
 
 見落としやすいが重要な点: **この`FRAMEWORK_EXPLANATION`のどこにも「ツール呼び出しの結果を
@@ -721,17 +760,17 @@ Rules:
 見えない」という**事実**だけで、「だからツール呼び出しは`result = tool(...); print(result)`という
 形で書け」という**やり方**までは教えていない。この情報がどこから来るかはパーツ4で扱う。
 
-### パーツ2: `sandbox_manual`（呼び出し元から注入される、動的パート）
+### パーツ2: `sandbox_manual`(呼び出し元から注入される、動的パート)
 
 `build_system_prompt()` 自身はツール名を1つも知らない。`sandbox_manual` 引数として
-`MCPToolProxy.manual_text()`（Section 8.3）の出力をそのまま受け取り、
+`MCPToolProxy.manual_text()`(Section 8.3)の出力をそのまま受け取り、
 `## Available tools\n{sandbox_manual}\n\n` として埋め込むだけ。**別のMCPサーバーに繋ぎ変える
 だけでこの部分も自動的に変わる**ため、「未知のMCPサーバーでテストされる」という課題要件に
 そのまま対応できる。`manual_text()`はツール名・パラメータ名・型・必須/任意・説明文を
 機械的に整形するだけであり、こちらにも「`print()`で結果を出力せよ」という運用上の指示は
-含まれていない（Section 8.3参照）。
+含まれていない(Section 8.3参照)。
 
-### パーツ3: `final_answer` の使い方（ベンチマークごとに完全に別文面、`prompts.py:35-52`）
+### パーツ3: `final_answer` の使い方(ベンチマークごとに完全に別文面、`prompts.py:35-52`)
 
 ```python
 # prompts.py:36-45
@@ -756,18 +795,20 @@ made to the repository - do not hand-write the patch yourself.
 
 `_SWEBENCH_FINAL_ANSWER` の「`get_patch()`を呼べ、自分でパッチを手書きするな」という一文は
 地味だが重要 — LLMが差分を手で組み立てると、行番号やコンテキスト行のズレで `git apply`
-不能な壊れたdiffになりがちなので、必ずツール（`git diff` の薄いラッパー、Section 12）を
+不能な壊れたdiffになりがちなので、必ずツール(`git diff` の薄いラッパー、Section 12)を
 経由させて機械的に正しいものだけを提出させている。
 
 `_MBPP_FINAL_ANSWER` の「テストが通ったら次のターンで即 `final_answer` を呼べ、再検証するな」
 という指示は、トークン予算・イテレーション予算をエージェント自身に節約させるための
 プロンプトレベルのガードレール。
 
-### パーツ4: worked example（`include_example=True` の場合のみ、`prompts.py:54-97`）
+### パーツ4: worked example(`include_example=True` の場合のみ、`prompts.py:54-97`)
+
+「worked example」(お手本例、いわゆるfew-shot example)とは、LLMに何かのやり方を教える際、**説明文で指示する代わりに、実際にその通りに書かれた具体例をそのまま見せる**という手法。人間に「こういう形式で書いてください」と口頭で説明するより、実物のサンプルを1つ渡すほうが速く正確に伝わることが多いのと同じ発想で、プロンプトエンジニアリングでも広く使われる。
 
 MBPP用・SWE-bench用それぞれに、Thought→Code→Observationを1〜2ターン分そのまま書いた例が
 定数として埋め込まれている。**この定数こそが、Observationとして印字すべき値をどう作るかを
-モデルへ教える唯一の実演**になっている。MBPP用（`_MBPP_EXAMPLE`, `prompts.py:55-74`）を
+モデルへ教える唯一の実演**になっている。MBPP用(`_MBPP_EXAMPLE`, `prompts.py:55-74`)を
 全文見ると分かりやすい:
 
 ```
@@ -794,26 +835,26 @@ final_answer("def add(a, b):\n    return a + b")
 ここで実演されているのは3つのこと: (1) ツール呼び出し`run_tests(...)`を丸ごと`print(...)`で
 包むという構文パターン、(2) `run_tests`が`{"success": true, ...}`というJSON文字列を返すこと、
 (3) それを見た**次のターンで即座に**、同一のコード文字列で`final_answer(...)`を呼ぶという
-`_MBPP_FINAL_ANSWER`の指示の実例。SWE-bench用（`_SWEBENCH_EXAMPLE`, `prompts.py:77-97`）も
+`_MBPP_FINAL_ANSWER`の指示の実例。SWE-bench用(`_SWEBENCH_EXAMPLE`, `prompts.py:77-97`)も
 同じ構造で、`search_function_or_class_definition_in_code(...)`と`read_file(...)`の2回の
 呼び出しをどちらも`print(result)`で包んで見せている。
 
 `include_example`フラグは本番の2つのCLIでは常に`True`で呼ばれるが、`BENCHMARK_REPORT.md`の
-アブレーション実験（同じ関数を`include_example=False`で呼び、worked exampleだけを抜いた
-「before」プロンプトを作る）のためにわざわざ引数化されている。パーツ1・パーツ2で確認した通り、
+アブレーション実験(同じ関数を`include_example=False`で呼び、worked exampleだけを抜いた
+「before」プロンプトを作る)のためにわざわざ引数化されている。パーツ1・パーツ2で確認した通り、
 「ツール呼び出しの結果を`print()`で明示的に出力せよ」という指示は`FRAMEWORK_EXPLANATION`にも
 `sandbox_manual`にもどこにも存在せず、**唯一この worked example だけがそれを実演している**。
 したがって`include_example=False`にすると、モデルにとって「ツール呼び出し結果をどう
 Observationに載せるか」を学ぶ手がかりが文字通りゼロになる。Section 17で触れる通り、実際に
 この1引数の有無だけで「`success: true`の意味」が根本的に変わる実験結果が出ている ──
 worked exampleが無いと、モデルはツール呼び出し結果を`print()`せずにコードを実行し続け
-（例えば`run_tests(code=code, test_list=test_list)`とだけ書いて結果を変数に受けるだけで
-出力しない、あるいは戻り値を無視してコードを書き進める）、`sandbox_output`が空文字列に近い
+(例えば`run_tests(code=code, test_list=test_list)`とだけ書いて結果を変数に受けるだけで
+出力しない、あるいは戻り値を無視してコードを書き進める)、`sandbox_output`が空文字列に近い
 まま`final_answer()`を呼んでしまう。プロンプトのルールを読んだだけでは導けない、
 「結果は`print()`しないとサンドボックスの標準出力に現れず、Observationとして戻ってこない」
 という**サンドボックスの実行モデル特有の暗黙知**を、worked exampleだけが埋めている。
 
-### 組み立て本体（`build_system_prompt()`, `prompts.py:100-129`）
+### 組み立て本体(`build_system_prompt()`, `prompts.py:100-129`)
 
 ```python
 def build_system_prompt(benchmark: str, sandbox_manual: str, include_example: bool = True) -> str:
@@ -835,12 +876,13 @@ def build_system_prompt(benchmark: str, sandbox_manual: str, include_example: bo
 ```
 
 未知の `benchmark` 文字列が来たら黙ってどちらかにフォールバックするのではなく即座に
-`ValueError`（119行目）— システムプロンプトの中身を静かに間違えるくらいなら、起動直後に
+`ValueError`(119行目)— システムプロンプトの中身を静かに間違えるくらいなら、起動直後に
 はっきり落ちたほうがいい、という判断。組み立て順序自体も意味を持っている: 枠組み説明 →
-ツール一覧 → 提出方法 → （あれば）worked example、という並びは、実際のThought→Code→
+ツール一覧 → 提出方法 → (あれば)worked example、という並びは、実際のThought→Code→
 Observationループを読む順番そのままに「ルールを教え、道具を見せ、ゴールを示し、最後に
 実演する」というチュートリアルの型を踏襲している。
 ---
+</content>
 
 ## 8. `sandbox/` — 実行境界（最重要パート）
 
@@ -861,9 +903,32 @@ if apply_process_memory_limit:
 self.namespace = self._build_namespace(extra)
 ```
 
+ここで言う「ラッパー」「ワーカー」が何を指すか、先にはっきりさせておく。
+
+- **ラッパー(wrapper)**とは、中身の実処理を自分では持たず、別の場所にある本体を「包んで」呼び出しやすくするだけのオブジェクトのこと。`isolated=True`のときの`Sandbox`がまさにこれ: コンストラクタは`self.namespace = {}`（空っぽ）にして`IsolatedSandboxProcess`を作り、実行の仕事を丸ごとそちらへ投げて`return`するだけである。つまり見た目は`Sandbox`でも、実体は「別プロセスへの取り次ぎ役」でしかない。
+- **ワーカー(worker)**とは、実際の作業（ここではLLMが書いたコードの`exec()`実行）を請け負う、別プロセスとして起動される実行主体のこと。8.2で詳しく見る`isolated_worker.py`がその実体であり、OSレベルで隔離された「檻」の中で動く。
+
+この2つを踏まえて`isolated`引数の分岐を読むと:
+
 `isolated=True`（デフォルト）なら実行そのものを`IsolatedSandboxProcess`（8.2）に丸ごと委譲し、このクラス自身は空の`namespace`を持つだけの薄いラッパーになる。`isolated=False`は「OS境界が既に確立された後、ワーカー自身がコードを実行するための内部モード」で、実際には`isolated_worker.py:83-88`が`Sandbox(config, ..., isolated=False)`という形で使うだけであり、外部から信頼できないコードに対して直接この経路を使うべきではないと`_apply_memory_limit()`のdocstring（390-399行目）にも明記されている。
 
+まとめると呼び出し関係はこうなる:
+
+```
+Orchestrator
+  → Sandbox(isolated=True) ...... ラッパー。自分では何も実行しない
+      → IsolatedSandboxProcess ... 親プロセス側。unshare/bwrapでOS隔離された
+                                    子プロセス(ワーカー)を起動する(8.2で詳述)
+          → ワーカー = isolated_worker.py が動いている
+              → その内部でさらに Sandbox(isolated=False) を作り、
+                実際にexec()する(Pythonレベルの制限つき)
+```
+
+つまり「OSレベルの隔離(主たる防御線)」と「Pythonレベルの制限(このあと説明する多層防御)」は、`isolated=True`という1つの入り口の裏側で、親プロセス／ワーカープロセスという2つの別プロセスに役割分担されている。
+
 #### インポート制限（多重チェック）
+
+ここで言う「静的チェック」「動的チェック」の違いを先に押さえておく。**静的チェック**とは、コードを**実行せずに**、書かれたテキストを解析してあやしい箇所を見つける方法。ここで使われる`ast`（Abstract Syntax Tree＝抽象構文木）はPython標準ライブラリの1つで、ソースコードの文字列を「`import`文」「関数呼び出し」「属性アクセス」のような部品(ノード)の木構造に分解してくれる。`ast.walk(tree)`はその木を1つ残らず辿るための関数で、「コードのどこかに`import os`という文が**書かれているか**」をテキストレベルで機械的に調べられる。ただしこれには弱点がある——「書かれた形」を見ているだけなので、`import`という単語を一切使わずに同じ効果を実行時に起こすコード（例えば`__import__("os")`という**関数呼び出し**）は素通りしてしまう。そこを埋めるのが**動的チェック**——コードが実際に**実行されている最中**に、危険な操作(`__import__`の呼び出しそのもの)を横取りして止める方法。このファイルの防御はこの2つを重ねる形になっている。
 
 **静的チェック** `check_imports()`（165-186行目）は`ast.walk(tree)`で`ast.Import`/`ast.ImportFrom`ノードを拾い、`_is_authorized()`（90-92行目、`fnmatch.fnmatch`によるglobマッチ）で許可リストと照合する。`from foo import *`は「どの名前が実際にインポートされるか静的に分からない」という理由で無条件禁止（185-186行目）。
 
@@ -912,11 +977,13 @@ allowed = any(target == base or target.startswith(base + os.sep) for base in res
 
 #### 危険な組み込みの除去
 
+前提として、このサンドボックスは`exec(compiled, self.namespace)`（後述の`Sandbox.run()`）というPython標準の仕組みでコードを実行している。`exec()`は文字列やコンパイル済みコードを、指定した「名前空間」(変数名→値の辞書)の中でそのまま実行する組み込み関数——普段何気なく使っている`print(...)`や`open(...)`のような関数は、実は`__builtins__`という特別な名前空間経由で暗黙に見えているだけであり、`exec()`にどんな`__builtins__`を渡すかを差し替えれば、そのコードから見える「使える関数の一覧」自体を絞り込める。これがこの節の土台になっている考え方。
+
 `_UNSAFE_BUILTINS`（56-59行目）= `{eval, exec, compile, input, breakpoint, help, exit, quit, __import__, open, vars}`を、`_build_namespace()`（411-431行目）が通常の`builtins`の辞書から取り除いたものを`__builtins__`として渡す。`__import__`/`open`/`getattr`/`setattr`の4つはさらに個別の制限版に差し替えられる（423-426行目）— `getattr`/`setattr`まで差し替えているのは後述のdunder属性保護のためで、単なる除去では済まない。
 
 #### サンドボックスエスケープ対策（`check_dunder_attribute_access`）
 
-このファイルで最も重要な部分。古典的なin-process Pythonサンドボックス脱出手法:
+このファイルで最も重要な部分。まず「dunder」という言葉について: Pythonでは`__init__`や`__class__`のように前後をアンダースコア2つ(_ _)で挟んだ名前を"double underscore"→**dunder**と呼び、オブジェクトの型情報・継承関係・内部状態にアクセスするための特別な属性名として使われている。これらは普段は`x.__class__`のように「今扱っているオブジェクトの型を知る」といった無害な用途に使うが、CPython(標準のPython実装)は実行中のプロセスの**あらゆるクラス・関数・モジュールの内部構造**をこのdunder属性経由でどこまでも辿れるように作られている——この「どこまでも辿れる」性質(イントロスペクション)こそが、次に説明する古典的なin-process Pythonサンドボックス脱出手法の土台になる:
 
 ```python
 ().__class__.__bases__[0].__subclasses__()
@@ -989,6 +1056,8 @@ def restricted_getattr(obj, name, *default):
 
 #### タイムアウト・メモリ制限
 
+ここからは、Pythonのコードレベルではなく**OSがプロセスに対して直接かけてくる制限**の話になる。「シグナル」はOSカーネルがプロセスに送る非同期の割り込み通知（後述のSection 5でSIGTERMについて詳しく扱う仕組みと同じ種類のもの）で、`SIGALRM`は「指定した秒数が経過したら送られてくる」タイマー専用のシグナル。「リソース上限(rlimit)」はOSがプロセスごとに設定できる使用量の天井（メモリ量やファイル数など）で、超えた瞬間にOS側が強制的に失敗させる仕組み。どちらもPythonのコードを一切信用せず、**OSレベルで**時間とメモリに歯止めをかける。
+
 - `signal.alarm()` + `SIGALRM`ハンドラ（344-347行目、467-470行目）でコード実行に壁時計タイムアウトをかける。`_alarm_handler`が`SandboxTimeoutError`を送出し、`run()`側の`except SandboxTimeoutError`（476-482行目）がそれまでの部分出力を添えて`[Timeout] ...`を返す。`finally`節（498-502行目）で必ずアラームを解除し元のハンドラに戻す。
 - `resource.setrlimit(RLIMIT_AS, ...)`（`_apply_memory_limit()`, 390-409行目）でプロセスのアドレス空間を制限し、暴走したメモリ確保をOSのOOM killerではなくPythonの`MemoryError`として捕捉できるようにする。ハード上限が既存より小さければそちらを尊重する（`new_hard = hard if hard != resource.RLIM_INFINITY and hard < limit_bytes else limit_bytes`, 406行目）。サンドボックス化されたCI環境などで上限をこれ以上下げられない`ValueError`/`OSError`はベストエフォートとして握りつぶす（403-409行目）。
 
@@ -1020,6 +1089,18 @@ except Exception as exc:                     # noqa: BLE001 - 意図的
 ### 8.2 `sandbox/isolated_process.py` と `sandbox/isolated_worker.py`
 
 上記のPythonレベルの制限は「多層防御の一枚」に過ぎない。**本丸はOSレベルの隔離**。`IsolatedSandboxProcess`（親プロセス側、`isolated_process.py`）が`unshare`+`bubblewrap`（`bwrap`）で常駐ワーカープロセスを起動し、標準入出力越しのJSONプロトコルで通信する。`isolated_worker.py`（子プロセス側のエントリポイント）が、実際に`Sandbox(isolated=False)`を使ってコードを実行する。
+
+#### `unshare`と`bwrap`は何をしているのか（概念編）
+
+具体的なコマンドラインを読む前に、そもそも`unshare`と`bwrap`が何を根拠に「隔離」を実現しているのかを押さえておく。この2つは役割が違う、**二段重ね**の仕組みになっている。
+
+**大前提：Linuxの「名前空間（namespace）」**——Linuxカーネルには、プロセスに「グローバルなリソース(ネットワーク、ファイルシステムのマウント状況、プロセスID一覧、ユーザーID体系など)の**専用の見え方**」を持たせる機能がある。これが名前空間。新しい名前空間の中にいるプロセスは、ホスト側の本物のリソースが見えなくなり、「その名前空間の中だけの、空っぽの状態」からスタートする。`unshare`も`bwrap`も、この名前空間機能を使うためのコマンド。
+
+**`unshare`：外側の箱を作る**——`unshare --user --map-root-user --net`は、新しい**ユーザー名前空間**（誰が何の権限を持つかをホストとは別管理にする）と新しい**ネットワーク名前空間**（NICを1つも持たないため外部ネットワークに一切到達できない）を作る。`--map-root-user`は、その新しいユーザー名前空間の**中でだけ**、今のユーザーを`uid 0`（root）に見せかける——ホスト上で本物のrootになるわけではない（ホストからはただの一般ユーザーのまま）。これは次の`bwrap`が内部でさらに名前空間を作る操作(マウント操作など)をするのに「名前空間内でのroot権限」を必要とするための下ごしらえで、suid-rootでインストールされた`bwrap`バイナリを使わずに、この「にせroot」経由で必要な権限だけを与える、という一般的なテクニック。
+
+**`bwrap`（bubblewrap）：中身（ファイルシステムなど）を組み立てる**——`unshare`が用意した「にせroot」の権限を使って、`bwrap`はさらに細かい隔離環境を組み立てる。`--unshare-user --uid 65534 --gid 65534`でもう一段ユーザー名前空間を切り、実際にコードを実行する段階では`nobody`/`nogroup`相当の無権限ユーザーに戻す。そして最も重要なのが**ファイルシステム**: `bwrap`は既定で「何も見えない空っぽのルートファイルシステム」から始まり、明示的に`--ro-bind`（読み取り専用でマウント）や`--bind`（読み書き可能でマウント）したパスだけが見えるようになる——リポジトリのルート全体や`.env`ファイルなど、明示的にマウントしなかったものは、脱出したコードから見ても**そもそも存在しない**扱いになる。
+
+つまりPythonレベルの制限(import禁止・dunder属性ブロックなど)を仮に突破して`os.system(...)`のような本物のシステムコールに到達しても、ネットワーク名前空間のおかげで外部と通信できず、マウント名前空間のおかげで見えているファイルシステムが最小限のコピー＋明示的に許可されたディレクトリだけであり、無権限ユーザーなので大した権限もない——脱出しようにも脱出先が物理的にない、という設計になっている。次の節では、この考え方が実際のコマンドライン(各フラグ)としてどう具体化されているかを見る。
 
 #### 隔離の中身（`_build_command`, `isolated_process.py:88-215`）
 
@@ -1072,6 +1153,8 @@ if any(root in target.parents for root in protected_roots):
 `/`と`/tmp`はサブディレクトリを許可することを認めている（`/tmp`は元々空のtmpfsとして書き込み可能だから）一方、`/usr`のようなちょうど読み取り専用でro-bindしたルートの内部を`allowed_directories`に指定すると、その中身が書き込み可能な`--bind`で**上書き**されて隔離が弱まってしまうため、これを明示的に拒否している。`_add_directory_mounts()`（278-291行目）は、bwrapが「マウント先の親ディレクトリが事前に存在している必要がある」という制約を満たすため、ターゲットパスまでの各階層に`--dir`を積み上げていくヘルパー。
 
 #### 通信プロトコル
+
+親プロセスとワーカープロセス(子)は、メモリを共有できない別々のプロセスなので、何かをやり取りするには標準入出力(stdin/stdout)のようなバイト列のパイプを介するしかない。ここで使われているのは「1行＝1メッセージ」という単純なプロトコル: 送りたい情報をJSON文字列にシリアライズし、末尾に改行を付けて書き出すだけ。受け取る側は1行読んで`json.loads()`すればいい。複雑なフレーミング(メッセージの区切りを長さプレフィックスで表現する等)を使わずに済むのは、JSONの中身自体に改行を含めない前提（テキストは適切にエスケープされる）があるため。
 
 親↔子は改行区切りのJSONメッセージで通信する（`_send`/`_read_message`、`isolated_process.py:293-314`と`isolated_worker.py`側の`_send`/`_read`, 18-34行目が対応する実装）:
 
@@ -1128,7 +1211,9 @@ if thread.is_alive():
 
 ### 8.3 `sandbox/mcp_client.py`
 
-`MCPToolProxy`（`sandbox/mcp_client.py:40-319`）— サンドボックスの外（信頼された親プロセス側）で動く、MCP公式SDKの非同期クライアントに対する**同期ファサード**。
+まず前提知識を2つ。**MCP(Model Context Protocol)**とは、LLMエージェントが「外部の道具(ツール)」を呼び出すための標準規格——「このサーバーにはどんな関数があるか(名前・引数・説明)を教えてもらい、名前を指定して引数付きで実行し、結果を受け取る」という一連のやり取りを、どんなツールサーバーに対しても同じ手順で行えるようにする。このプロジェクトの`mcp_tools_mbpp.py`/`mcp_tools_swebench.py`（Section 12）がまさに「MCPサーバー」であり、エージェント側はこのMCPToolProxyを通してそれらに接続する。**asyncio**とは、Pythonの非同期処理の仕組みで、「I/O待ち(ネットワーク応答待ちなど)の間、他の作業を進められるようにする」ためのシングルスレッドの協調的なタスクスケジューラ(=イベントループ)を指す。`async def`で定義された関数(コルーチン)は、`await`した箇所で一旦他のタスクに実行を譲る——複数のI/O待ちを効率よくさばける代わりに、呼び出す側のコードも基本的に`async`の世界に揃える必要がある、という制約がある。
+
+`MCPToolProxy`（`sandbox/mcp_client.py:40-319`）— サンドボックスの外（信頼された親プロセス側）で動く、MCP公式SDKの非同期クライアントに対する**同期ファサード**（ファサード＝複雑な内部実装を、シンプルな窓口だけに整理して見せる設計パターン）。
 
 - **なぜ必要か**: サンドボックスの`exec()`名前空間には`result = search_code("foo")`のような普通の同期Python関数が必要だが、`mcp`パッケージの`ClientSession`はasyncioベース。コンストラクタ（48-95行目）がバックグラウンドスレッド（`_run_event_loop`, 97-105行目）で専用イベントループを1つ回し、`_run()`（121-129行目）が`asyncio.run_coroutine_threadsafe()`で全呼び出しを橋渡しすることで、他のコードは一切asyncioを意識しなくて済むようにしている。
 - **2つの必須トランスポートに両対応**: `_connection_owner()`（131-191行目）が`stdio_command`か`http_url`かで分岐し、`stdio_client`（MCPサーバーをサブプロセスとして起動）または`streamablehttp_client`（既に起動しているHTTPサーバーに接続）いずれかのコンテキストに入る（154-164行目）。
@@ -1169,6 +1254,8 @@ uv run sandbox --mcp-server http://localhost:8000/mcp # HTTP経由でMCP接続
 
 ## 9. `llm/` — LLM プロバイダ抽象化層
 
+このセクションから先は、サンドボックス(実行境界)の話ではなく「LLM API をどう安定して呼び続けるか」という別の関心事に移る。前提として、OpenRouter・Groq・Together AI・Fireworks AI・Google AI Studioのような無料枠付きのLLM APIは、どれも**リクエスト数やトークン数に上限(レート制限)がある**うえに、上限に達すると一時的にHTTPエラー(429など)を返してくる。1つのプロバイダ・1本のAPIキーだけに頼っていると、そこが制限に達した瞬間にエージェントが止まってしまう。この`llm/`ディレクトリは、その不安定さを吸収して「複数のプロバイダ・複数のAPIキーを、順番に・自動的に試す」ための層になっている。
+
 ### 9.1 `llm/provider.py`
 
 冒頭のdocstring（`llm/provider.py:1-8`）が存在理由を明言している: requirements.mdが指摘する実装ギャップ——「`generate()`は生テキストだけでなく、`StepMetrics`を埋めるために十分なメタデータ（トークン数、時間、api_url、model_name、retries）を返さなければならない」——を埋めるための契約がこのファイル。63行に3つの型しかない。
@@ -1185,6 +1272,8 @@ class GenerationResult:                    # provider.py:15-25
     retries: int = 0         # 成功するまでにかかったリトライ回数
 ```
 
+`@dataclass`は、Pythonの標準ライブラリ`dataclasses`が提供するデコレータ。「データを保持するだけのクラス」を書くとき、素のクラスなら自分で書かなければならない`__init__`（コンストラクタ）や`__repr__`（`print()`したときの表示形式）を、フィールド名と型を並べるだけで自動生成してくれる——ここでの`GenerationResult`のように「値をひとまとめにして持ち運ぶだけ」の型を簡潔に書くための道具だと考えればよい。
+
 `StepMetrics`（models.py）のフィールドと1対1で対応していることが分かる——`orchestrator.py:197-209`の`StepMetrics(...)`組み立てが`gen.input_tokens`/`gen.output_tokens`/`gen.request_time_ms`/`gen.api_url`/`gen.model_name`/`gen.retries`をそのまま横流しできているのは、この型がそう設計されているから。`retries`だけデフォルト値`0`を持つのは、`llm/client.py`側で成功結果を返す直前に`result.retries = retries`（後述）と後から書き換える運用になっているため。
 
 ```python
@@ -1193,7 +1282,7 @@ class ChatProvider(Protocol):               # provider.py:28-40
               max_output_tokens, timeout) -> GenerationResult: ...
 ```
 
-`Protocol`（構造的部分型）を使っているのがポイント——`OpenAICompatibleProvider`や`GeminiProvider`は明示的にこのクラスを継承していない（Section 9.3/9.4で見る通り、どちらも素の`class`で、同じシグネチャの`chat()`メソッドを持つだけ）。継承関係を強制せず「このシグネチャさえ満たせば`ChatProvider`として扱える」という緩い契約にしているのは、新しいプロバイダを追加する際に既存クラス階層を意識させないための設計。
+`Protocol`（`typing.Protocol`）というのは、Pythonの型システムにおける少し変わった仕組みで、**構造的部分型(structural typing)**と呼ばれる考え方を実現する。普段Pythonでクラスの互換性を保証したければ、`class OpenAICompatibleProvider(ChatProvider):`のように明示的に継承させるのが一般的な発想だが、`Protocol`はそれを要求しない——「継承関係が実際にあるかどうか」ではなく「同じ名前・同じ引数のメソッドを実際に持っているかどうか」だけを見て、互換とみなす。俗に言う「アヒルのように歩き、アヒルのように鳴くなら、それはアヒルとみなす(ダックタイピング)」を型チェッカーのレベルで形式化したもの、とイメージすると分かりやすい。実際`OpenAICompatibleProvider`や`GeminiProvider`は明示的にこのクラスを継承していない（Section 9.3/9.4で見る通り、どちらも素の`class`で、同じシグネチャの`chat()`メソッドを持つだけ）。継承関係を強制せず「このシグネチャさえ満たせば`ChatProvider`として扱える」という緩い契約にしているのは、新しいプロバイダを追加する際に既存クラス階層を意識させないための設計。
 
 ```python
 @dataclass
@@ -1217,7 +1306,7 @@ class UsageStats:                            # provider.py:43-62
 
 ### 9.2 `llm/client.py`
 
-`LLMClient`（143行）が「1つの論理モデルを、複数プロバイダにわたるフォールバック付きで呼び出す」中核部分。
+`LLMClient`（143行）が「1つの論理モデルを、複数プロバイダにわたるフォールバック付きで呼び出す」中核部分。フォールバックとは、第一候補がうまくいかなかったときに、あらかじめ用意しておいた次善の候補へ自動的に切り替える設計のこと——ここでは「プロバイダA→ダメならプロバイダB→ダメならプロバイダC」という順序で候補を用意しておき、エージェント側のコードは「候補が何個あるか」「今どれを使っているか」を一切意識せずに済むようにしている。
 
 #### コンストラクタ（`client.py:61-89`）— 使えるプロバイダだけをスロット化する
 
@@ -1233,7 +1322,7 @@ if not self._slots:
     raise ValueError(f"No API keys found for provider(s): {names}. ...")   # 84-89
 ```
 
-`_ProviderSlot`（`client.py:44-50`）は`spec`（静的設定）・`chat_provider`（実際にHTTPを叩く実装）・`api_keys`（収集済みキー一覧）・`next_key_index`（ラウンドロビン位置）をまとめたデータクラス。`_build_chat_provider()`（`client.py:37-41`）は`spec.kind`が`"gemini"`かどうかだけで`GeminiProvider`と`OpenAICompatibleProvider`を出し分ける2行のファクトリ。キーが1件も無いプロバイダは`_slots`に**そもそも登録されない**——`generate()`側のフォールバックループはキー無しプロバイダの存在を意識する必要が一切なく、コンストラクタの時点で「使えるものだけのリスト」に絞り込まれている。全プロバイダでキーが1つも見つからなければ、実行を始める前に`ValueError`で即座に落ちる（起動直後に気づかせる設計は`prompts.py`の未知`benchmark`即エラーと同じ思想）。
+`_ProviderSlot`（`client.py:44-50`）は`spec`（静的設定）・`chat_provider`（実際にHTTPを叩く実装）・`api_keys`（収集済みキー一覧）・`next_key_index`（ラウンドロビン位置）をまとめたデータクラス。ここで言う**ラウンドロビン方式**とは、複数の候補（この場合はAPIキー）を順番に1つずつ巡回して使っていく方式のこと——時計の針のように「今使ったら、次は次の候補へ」と一巡してまた最初に戻る、という単純な割り当てルールで、特定の1つだけを使い続けて偏らせないための基本パターン。`_build_chat_provider()`（`client.py:37-41`）は`spec.kind`が`"gemini"`かどうかだけで`GeminiProvider`と`OpenAICompatibleProvider`を出し分ける2行のファクトリ。キーが1件も無いプロバイダは`_slots`に**そもそも登録されない**——`generate()`側のフォールバックループはキー無しプロバイダの存在を意識する必要が一切なく、コンストラクタの時点で「使えるものだけのリスト」に絞り込まれている。全プロバイダでキーが1つも見つからなければ、実行を始める前に`ValueError`で即座に落ちる（起動直後に気づかせる設計は`prompts.py`の未知`benchmark`即エラーと同じ思想）。
 
 `from_provider_url()`（`client.py:91-94`）は`config.resolve_provider(provider_url)`（Section 10）が返す単一の`ProviderSpec`だけを使う`LLMClient`を組み立てるショートカット。`agent_mbpp.py:125`/`agent_swebench.py`が実際に呼んでいるのはこちらで、CLI引数`--provider-url`1つから「複数プロバイダにフォールバックする汎用クライアント」ではなく「指定された1プロバイダだけを使うクライアント」を作る（複数プロバイダにまたがるフォールバックを使いたい場合はコンストラクタを直接呼ぶ必要がある、という非対称性がある）。
 
@@ -1258,6 +1347,8 @@ for slot in self._slots:                              # 111  プロバイダを�
                     time.sleep(self.backoff_seconds * (attempt + 1))  # 134  線形バックオフ
         # このキーのリトライを使い果たした → 次のキー/プロバイダへフォールスルー(コメントのみ、135行目)
 ```
+
+ここで使われている**リトライとバックオフ**という設計パターンについて: 通信エラーやレート制限は「少し待てば直る」一過性の失敗であることが多いので、失敗したら即座にもう一度叩くのではなく、いったん待機time.sleep()してから再試行する。この待機時間を毎回少しずつ伸ばしていく(ここでは`backoff_seconds * (attempt + 1)`という単純な線形増加、1回目1.5秒、2回目3.0秒、...)のが「バックオフ」で、相手のサーバーに立て続けに負荷をかけて状況を悪化させるのを防ぐ狙いがある(より高度な実装では倍々に増やす「指数バックオフ」を使うことも多いが、ここでは単純な線形増加が採用されている)。
 
 `slot.next_key_index`の更新（114行目）が**リクエスト送信の成否に関わらず必ず実行される**点が地味に重要——失敗しても次回はローテーションが1つ進んだ状態から始まる（同じ壊れた/レート制限中のキーを毎回先頭で引き続けることがない）。`except`が捕まえる例外の型が`(requests.RequestException, KeyError, IndexError)`の3種類に絞られているのも意図的——`requests.RequestException`はHTTPエラー・接続エラー・タイムアウトを、`KeyError`/`IndexError`はレスポンスJSONの形式が想定と違う場合（`data["choices"][0]`が無い等、Section 9.3参照）を拾う。これ以外の例外（例えばプログラムのバグに起因する`TypeError`など）は意図的に伝播させ、リトライで握りつぶさない。
 
@@ -1305,7 +1396,9 @@ def chat(self, messages, model, api_key, stop, max_output_tokens, timeout) -> Ge
     )
 ```
 
-`data["choices"][0]`（54行目）と`usage.get(...)`（56行目）の非対称性に注目——前者は角括弧アクセス（キーが無ければ`KeyError`を送出し、`llm/client.py`の`except (requests.RequestException, KeyError, IndexError)`（Section 9.2）にちょうど捕捉されてリトライ対象になる）、後者は`.get(..., {})`/`.get(..., 0)`（無くても例外にならず`0`扱い）。これは「候補（`choices`）が無いレスポンスは明確な異常なのでリトライすべき」だが「使用量情報（`usage`）が欠けているのは一部プロバイダの仕様上の揺れであり、致命的ではないので`0`として処理を続行すべき」という区別を、例外を投げるか否かのコード上の選択だけで表現している。認証はAuthorizationヘッダーの`Bearer`トークン方式（44行目）——これがGemini（クエリパラメータ方式、9.4節）と根本的に構造が異なる部分であり、`llm/client.py`が`ChatProvider`という共通インターフェースの裏でこの違いを吸収している。
+`headers = {"Authorization": f"Bearer {api_key}", ...}`（44行目）は**HTTPヘッダー認証**の一例——APIキーをHTTPリクエストの「ヘッダー」という、URLやボディとは別枠の付加情報領域に載せる方式で、`Authorization: Bearer <トークン>`という書式はWeb API全般で広く使われる標準的な認証パターン。これが後述するGemini（クエリパラメータ方式、9.4節——APIキーをURL自体の一部として`?key=...`のように埋め込む方式）と根本的に構造が異なる部分であり、`llm/client.py`が`ChatProvider`という共通インターフェースの裏でこの違いを吸収している。
+
+`data["choices"][0]`（54行目）と`usage.get(...)`（56行目）の非対称性に注目——前者は角括弧アクセス（キーが無ければ`KeyError`を送出し、`llm/client.py`の`except (requests.RequestException, KeyError, IndexError)`（Section 9.2）にちょうど捕捉されてリトライ対象になる）、後者は`.get(..., {})`/`.get(..., 0)`（無くても例外にならず`0`扱い）。これは「候補（`choices`）が無いレスポンスは明確な異常なのでリトライすべき」だが「使用量情報（`usage`）が欠けているのは一部プロバイダの仕様上の揺れであり、致命的ではないので`0`として処理を続行すべき」という区別を、例外を投げるか否かのコード上の選択だけで表現している。`response.raise_for_status()`（51行目）は、HTTPのステータスコードが4xx(クライアント側エラー、例えば401=認証失敗や429=レート制限超過)や5xx(サーバー側エラー)であれば`requests`ライブラリが自動的に例外を送出してくれる仕組みで、これも同じ`except requests.RequestException`で拾われてリトライにつながる。
 
 ### 9.4 `llm/providers/gemini.py`
 
@@ -1341,7 +1434,7 @@ if system_instruction:
 response = requests.post(url, params={"key": api_key}, json=payload, timeout=timeout)  # 60
 ```
 
-`params={"key": api_key}`（60行目）——Bearerヘッダーではなく**クエリパラメータ**として認証する。これが次のインシデントの直接の原因になる。
+`params={"key": api_key}`（60行目）——**クエリパラメータ認証**という方式。`requests`ライブラリの`params`引数に渡した辞書は、送信直前にURLの末尾へ`?key=<値>`という形で自動的に連結される。つまりBearerヘッダー方式(9.3節)とは違い、APIキー自体がリクエストの「宛先URL」の一部になってしまう——これが次のインシデントの直接の原因になる。
 
 #### キー漏洩インシデントの対策コード（`gemini.py:59-81`）
 
@@ -1390,6 +1483,8 @@ return GenerationResult(
 
 冒頭のdocstring（`config.py:1-6`）が存在理由を明言する通り、「`os.environ`に直接触るコードをこのファイル1つに集約し、他のどこにもAPIキーをハードコードさせないための建て付け」——「APIキーのハードコード禁止」というルールを、レビューや規約で守らせるのではなく**アーキテクチャで強制する**ための1ファイル。108行で`load_env()`/`ProviderSpec`/`KNOWN_PROVIDERS`/`resolve_provider()`の4点だけ。
 
+ここでいう**環境変数(environment variable)**とは、OSがプロセスごとに持たせているキー・バリュー形式の設定領域のこと——プログラムのソースコードを書き換えずに、実行する環境（開発者のPC、CI、本番サーバーなど）ごとに異なる値(APIキーなど)を渡すための標準的な仕組み。**`.env`ファイル**は、その環境変数を開発時にローカルで手軽に再現するためのテキストファイル形式（`KEY=value`を1行ずつ並べるだけ）で、`python-dotenv`のようなライブラリがこれを読み込んで実際のプロセスの環境変数として反映してくれる。APIキーのような機密情報を`.env`に書いて`.gitignore`で除外しておけば、ソースコード自体にはキーが一切現れないので、誤ってGitリポジトリへコミットしてしまう事故を防げる——これがまさにこのファイルの存在理由になっている。
+
 ### `load_env()` — 冪等な`.env`読み込み（`config.py:18-31`）
 
 ```python
@@ -1406,7 +1501,9 @@ def load_env() -> None:
 load_env()                                              # 31  モジュールがimportされた瞬間に1回だけ実行
 ```
 
-`override=False`（27行目）が地味に重要——CIやDocker実行時にシェル側で既に環境変数がセットされている場合、リポジトリに置かれた`.env`の値でその値を**上書きしてしまわない**。`_ENV_LOADED`フラグ（18行目）はモジュール内グローバル変数なので、`config`モジュールが複数箇所（`agent_mbpp.py`と`llm/client.py`の両方など）から`import`されても、Pythonのモジュールキャッシュにより同一プロセス内では`load_env()`の中身（＝`python-dotenv`によるファイルI/O）は最初の1回しか実際には走らない。31行目でモジュールトップレベルに`load_env()`の呼び出しが直接書かれているため、「`import config`した時点で自動的に`.env`が読み込まれている」という副作用が保証される——呼び出し側のコードが明示的に`config.load_env()`を呼ぶ必要はない。
+**冪等(idempotent)**という言葉は、「同じ操作を何度実行しても、結果が1回だけ実行したときと変わらない」性質を指す。この関数が冪等であるべき理由は単純で、`config`モジュールはプロジェクトの複数箇所（`agent_mbpp.py`と`llm/client.py`の両方など）から`import`される可能性があり、それぞれが独自に`load_env()`を呼んでも、ファイルの読み込みという処理自体は最初の1回しか実際には走らせたくないため。
+
+`override=False`（27行目）が地味に重要——CIやDocker実行時にシェル側で既に環境変数がセットされている場合、リポジトリに置かれた`.env`の値でその値を**上書きしてしまわない**。`_ENV_LOADED`フラグ（18行目）はモジュール内グローバル変数なので、`config`モジュールが複数箇所から`import`されても、Pythonのモジュールキャッシュにより同一プロセス内では`load_env()`の中身（＝`python-dotenv`によるファイルI/O）は最初の1回しか実際には走らない。31行目でモジュールトップレベルに`load_env()`の呼び出しが直接書かれているため、「`import config`した時点で自動的に`.env`が読み込まれている」という副作用が保証される——呼び出し側のコードが明示的に`config.load_env()`を呼ぶ必要はない。
 
 ### `ProviderSpec` — 1プロバイダの静的定義とキー収集（`config.py:34-62`）
 
@@ -1433,7 +1530,7 @@ class ProviderSpec:
         return keys
 ```
 
-`frozen=True`（34行目）——`ProviderSpec`はイミュータブルなデータクラス。一度作られたら書き換え不可であることを型レベルで保証しており、`KNOWN_PROVIDERS`（後述）のようなモジュールレベルの共有リストの要素として複数箇所から参照されても、どこかのコードが誤ってフィールドを書き換えて他の利用箇所に影響を与える事故を構造的に防いでいる。
+`frozen=True`（34行目）——`@dataclass`デコレータに渡せるオプションの1つで、これを付けると生成されたインスタンスのフィールドを後から書き換えようとすると例外になる（イミュータブル＝不変になる）。`ProviderSpec`は一度作られたら書き換え不可であることを型レベルで保証しており、`KNOWN_PROVIDERS`（後述）のようなモジュールレベルの共有リストの要素として複数箇所から参照されても、どこかのコードが誤ってフィールドを書き換えて他の利用箇所に影響を与える事故を構造的に防いでいる。
 
 具体例として`.env`に
 
@@ -1494,7 +1591,6 @@ def resolve_provider(base_url: str) -> ProviderSpec:
 `KNOWN_PROVIDERS`のどれとも前方一致しなければ、URLのホスト名から機械的に環境変数名を組み立てて即席の`ProviderSpec`を作る——つまり「新しいプロバイダを追加するのにコード変更は一切不要、`.env`に対応する環境変数を1本用意するだけでよい」という要件を、コードを1行も書かずに満たしている。`normalized.startswith(spec_url)`（100行目）が完全一致だけでなく**前方一致**も許しているのは、同じベースURLの配下に複数のサブパス（例えば将来的にモデル種別ごとに`/v1/chat`と`/v1/embeddings`のようなURLが混在するケース）が現れても、ホスト部分が一致していれば同じ`ProviderSpec`として扱えるようにするための緩さ。
 
 ただし`kind`は102-107行目で常に`"openai_compatible"`に固定されるため、Geminiのような非互換なAPI構造を持つ未知のプロバイダをURLとして渡しても正しく動かない——これは仕様として妥当なトレードオフで、「本当に異なるワイヤ形式」は`KNOWN_PROVIDERS`に明示的に登録するしかない設計になっている（`_env_var_from_url`はあくまで「認証ヘッダー方式と`/chat/completions`互換のペイロードさえ守っていれば」という前提の上に成り立つ推測にすぎない）。
----
 
 ## 11. `agent_mbpp.py` / `agent_swebench.py` — エージェント CLI
 
@@ -1540,6 +1636,8 @@ TIMEOUT_SECONDS = 900
 ### `agent_mbpp.py`固有の設定
 
 - MCPサーバーはローカルサブプロセスとして`f"{sys.executable} {MCP_TOOLS_SCRIPT}"`(`agent_mbpp.py:110`)、すなわち**今動いているのと同じPythonインタプリタ**で`mcp_tools_mbpp.py`をstdio起動する。`sys.executable`を使うのは、`uv run`が作った仮想環境のPythonと違うインタプリタ(例えばシステムの`python3`)を誤って使ってしまい、依存パッケージが見つからない事故を防ぐため。
+
+  ここで言う「stdio起動」について: プロセス同士が情報をやり取りする方法は大きく分けて2種類ある。1つは同じマシン上のプロセス間で、標準入力(stdin)・標準出力(stdout)というパイプをそのまま通信路として使う方法(stdio通信)——親プロセスが子プロセスをサブプロセスとして起動し、子の標準入出力を親側から読み書きできるように繋ぎ変えるだけでよいので、ネットワークの設定が一切不要で、同一ホスト内で完結する用途に向く。もう1つはHTTPのようなネットワーク越しの通信で、別のマシン(あるいは同じマシンでも独立して起動済みのサーバープロセス)に接続する場合に使う。`mcp_tools_mbpp.py`はローカルサブプロセスとして毎回新しく起動されるので前者(stdio)、Section 8.3で見た`MCPToolProxy`の`http_url`引数を使うケースは後者にあたる——同じ`MCPToolProxy`がどちらのトランスポートも受け付けられるように作られているのは、このプロジェクトが「未知のMCPサーバーに接続される」ことを前提にしているため(Section 3)。
 - `tool_env = {"AGENT_SMITH_TEST_IMPORTS": json.dumps(task.test_imports)}`(`agent_mbpp.py:109`)を`MCPToolProxy(..., env=tool_env)`に渡す。これが`mcp_tools_mbpp.py`の`_test_imports()`(Section 12)が読む環境変数の**唯一の注入経路**。
 - `max_execution_time_seconds=20`(`agent_mbpp.py:119`)には、直上の116-118行目に実運用で踏んだ地雷の跡がコメントとして残っている: `mcp_tools_mbpp.py`内部の`run_tests()`が使う10秒のサブサンドボックスタイムアウトより確実に大きくしておかないと、正しいが少し遅いテスト実行に対して外側のサンドボックスアラームが先に発火し、正解を誤ってタイムアウト扱いにしてしまう(実プロバイダに対するライブスモークテストで発見)。
 
@@ -1553,7 +1651,9 @@ TIMEOUT_SECONDS = 900
 
 ## 12. `mcp_tools_mbpp.py` / `mcp_tools_swebench.py` — MCP ツールサーバー
 
-エージェント本体（`orchestrator.py`＋`sandbox/`）から見ると、これらは「MCPサーバーという名の**別プロセス**」でしかない。どちらも `mcp.server.fastmcp.FastMCP` を使い、`@mcp.tool()` デコレータを付けた素のPython関数を1つ書くだけで、それが自動的にJSON Schema付きのMCPツールとして公開される。`--http <port>` を渡せば streamable HTTP、渡さなければ stdio（標準入出力）で待ち受ける——起動オプション以外の設計思想は2ファイルで大きく異なる。
+エージェント本体（`orchestrator.py`＋`sandbox/`）から見ると、これらは「MCPサーバーという名の**別プロセス**」でしかない。Section 8.3で見た通り、MCPは「LLMエージェントが外部の道具(ツール)を呼び出すための標準規格」だった——ここで登場するのはその**サーバー側**の実装、つまり実際に呼び出される道具そのものを提供する側。どちらも `mcp.server.fastmcp.FastMCP` を使い、`@mcp.tool()` デコレータを付けた素のPython関数を1つ書くだけで、それが自動的にJSON Schema付きのMCPツールとして公開される。
+
+「デコレータを1つ付けるだけで自動的にツールとして公開される」という部分を少し補足すると: Pythonの**デコレータ**とは、`@何か`という記法で関数の直前に書き、その関数を別の関数でラップ(加工)する仕組みのこと。`@mcp.tool()`が付いた関数は、関数名・引数の型ヒント・docstring(関数の説明文)を`FastMCP`が実行時に自動的に読み取り、「この名前で、こういう型の引数を受け取り、こういう説明を持つツールです」という情報(JSON Schema)を組み立てて登録する。開発者は普通のPython関数を書くだけでよく、MCPのワイヤ形式(通信データの形式)を手で組み立てる必要はない——`mcp_tools_mbpp.py:21`で`mcp = FastMCP("agent-smith-mbpp-tools")`とサーバーインスタンスを作り、`mcp_tools_mbpp.py:41`の`@mcp.tool()`がその1個だけのツールをこのサーバーに登録している。`--http <port>` を渡せば streamable HTTP、渡さなければ stdio（標準入出力）で待ち受ける——起動オプション以外の設計思想は2ファイルで大きく異なる。
 
 ### `mcp_tools_mbpp.py`（109行、ツールは1個だけ）
 
@@ -1603,13 +1703,15 @@ return json.dumps({"success": success, "output": output})
 6. **成功時のみ**マーカー文字列を出力から除去する（88-89行目）。失敗時にマーカーを残しているのは、`success: false`のときの`output`は「テストが失敗した理由の生のtraceback」であり、そこにマーカーが混入していても実害がない（というよりマーカーはそもそも出力されていない）ため、無駄な文字列処理を省いている。
 7. `85-86行目`のタイムアウトメッセージ書き換え（`"Execution exceeded 10s"`→`"Execution timed out after 10s"`）は、サンドボックス側の汎用的なタイムアウト文言を、このツール固有の文脈（10秒はこのMCPサーバーが指定した値）に合わせてより分かりやすく言い換えるための、小さな後処理。
 
-`test_mcp_tools_mbpp.py`はこの実装を直接関数呼び出しでテストしている（`@mcp.tool()`デコレータは元の関数呼び出し可能性を保持するため、MCPトランスポート無しでテストできる）: `test_run_tests_uses_task_test_imports_env_var`が環境変数注入の経路を、`test_run_tests_syntax_error_in_candidate`/`test_run_tests_infinite_loop_times_out`が異常系を、`test_run_tests_rejects_unauthorized_host_import`が「候補コードが`os`のような未許可importを試みても`run_tests`経由でブロックされる」ことを検証している——つまり「サンドボックスの防御は`run_tests`を経由しても素通りできない」ことの回帰テスト。
+`test_mcp_tools_mbpp.py`はこの実装を直接関数呼び出しでテストしている（`@mcp.tool()`デコレータは元の関数呼び出し可能性を保持するため、MCPトランスポート無しでテストできる——デコレータはあくまで「関数に付加情報を付けて登録する」だけで、関数自体を`run_tests(code=..., test_list=...)`のように普通に呼び出す能力は失われない）: `test_run_tests_uses_task_test_imports_env_var`が環境変数注入の経路を、`test_run_tests_syntax_error_in_candidate`/`test_run_tests_infinite_loop_times_out`が異常系を、`test_run_tests_rejects_unauthorized_host_import`が「候補コードが`os`のような未許可importを試みても`run_tests`経由でブロックされる」ことを検証している——つまり「サンドボックスの防御は`run_tests`を経由しても素通りできない」ことの回帰テスト。
 
 ### `mcp_tools_swebench.py`（412行、必須9ツールすべて）
 
 SWE-benchは実リポジトリの調査・修正が必要なので、ツール数も複雑さも桁違い。しかし設計の芯は1つ: **`TESTBED_PATH`環境変数さえ設定されていれば動く**（`_testbed_root()`、29-37行目）、Docker固有のロジックを一切持たないプレーンなファイルシステム/subprocess操作の集合体、という点（Section 4.4）。同じコードがホスト上のベアなチェックアウトでも、コンテナの中でも変わらず動く。
 
 #### パスの脱出防止 — `_resolve_within_testbed()` / `_validate_glob_pattern()` / `_matching_files()`
+
+先に「glob(グロブ)パターン」という言葉について: シェルでよく見る`*.py`や`**/*.py`のような、ファイル名やパスを**ワイルドカード(あいまい一致)で表現する記法**のことをglobパターンと呼ぶ。`*`は「区切り(`/`)を跨がない任意の文字列」、`**`は「区切りを跨いでもよい任意の階層」にマッチする、というのがよくある慣習(Pythonの`Path.glob()`/`Path.rglob()`もこの記法に従う)。`search_code`のようなツールが「あるパターンに一致する全ファイル」を探すために、この記法をそのままLLMからの入力として受け取っている。
 
 ```python
 # mcp_tools_swebench.py:74-116
@@ -1664,6 +1766,8 @@ return f"Edit applied to {filepath}"
 
 曖昧な置換を許すと「LLMが意図した箇所と違う場所を書き換えてしまう」事故につながるため、**あいまいさを検出したら実行せず、LLMに前後関係を増やして書き直させる**という設計（`test_edit_file_rejects_ambiguous_match`で検証）。`.py`ファイルへの編集は書き込み後に即座に`py_compile`でコンパイルチェックされ（184-189行目）、構文エラーを混入させた場合は**編集自体は既に適用された状態のまま**`[EditSyntaxError]`が返る——ロールバックはしない。これは「編集はもう起きた、次のターンでLLMがそれを踏まえて追加修正すべき」というThought→Code→Observationループの哲学(常に実際に起きたことをそのまま見せる、Section 6)と一貫している。
 
+ここで使われている`subprocess.run(...)`について補足しておく: `subprocess`はPython標準ライブラリで、OSに対して**別のコマンド/プログラムを子プロセスとして起動する**ための機能。`subprocess.run(command, capture_output=True, text=True)`は、指定したコマンド(ここでは`python3 -m py_compile <path>`——`py_compile`はファイルを実行せずコンパイル(構文チェック)だけを行う標準モジュール)を1回実行し、完了するまで待ち、その標準出力・標準エラー出力・終了コード(`returncode`)をまとめて返す。終了コードは「0なら成功、0以外なら何らかの失敗」という慣習がUNIX系コマンド全般にある——ここでは明示していないが、`subprocess.run`には`check`という引数もあり、`check=True`にすると終了コードが非ゼロだったときに自動的に例外(`CalledProcessError`)を送出してくれる。このコードでは`check`を指定せず(=デフォルトの`False`)、代わりに`result.returncode != 0`を自分で判定している——例外にせず、失敗を`[EditSyntaxError] ...`という通常の文字列Observationとして返したいためで、Section 8.1で見た「候補コードの実行エラーは例外ではなく文字列として返す」という一貫したポリシーがここにも表れている。
+
 #### `run_command` の二段階kill（311-354行目）
 
 ```python
@@ -1682,7 +1786,9 @@ except subprocess.TimeoutExpired:
     return "[Error] command timed out after 120s"
 ```
 
-`start_new_session=True`で起動することで、コマンドが起動した子プロセスも含めた**プロセスグループ全体**に`os.killpg`でシグナルを送れるようにしている——`sleep 999 & sleep 999 &`のような多重子プロセスを起動するコマンドでも、タイムアウト後に取りこぼしなく終了させられる。まず`SIGTERM`で2秒だけ猶予を与え、それでも生きていれば`SIGKILL`で強制終了する二段構え（`sandbox/isolated_process.py`の親プロセスがワーカーに対して行う終了処理と同じパターン、Section 8.2）。
+`subprocess.Popen(...)`は`subprocess.run(...)`より一段低レベルなAPIで、コマンドを起動した直後に**待たずに**戻ってくる(=`Popen`＝"Process open"、プロセスを開いたハンドルを返すだけ)。ここでは`process.communicate(timeout=120)`で「最大120秒だけ完了を待つ」という制御を自前で行いたいため、待機まで自動でやってしまう`subprocess.run`ではなく`Popen`を使っている。
+
+`start_new_session=True`で起動することが何を意味するかも補足する: LLMが指示するコマンド(例えば`shell=True`が示す通りシェル経由で実行される)は、それ自身がさらに子プロセスを生み出すことがある(`sleep 999 &`のようにバックグラウンドジョブを起動する、パイプで複数コマンドを繋ぐ、等)。`start_new_session=True`は、起動したプロセスを**新しいプロセスグループのリーダー**にする指定——これにより、その後に生まれた孫プロセスも含めた「グループ全体」に対して、`os.killpg(process.pid, signal)`という1回の呼び出しでシグナルをまとめて送れるようになる(`killpg`＝"kill process group"）。これが無いと、直接の子プロセスだけを`SIGTERM`しても孫プロセスが生き残ってしまう(タイムアウト後も居座るゾンビ/迷子プロセスの原因になる)。まず`SIGTERM`で2秒だけ猶予を与え、それでも生きていれば`SIGKILL`で強制終了する二段構え（`sandbox/isolated_process.py`の親プロセスがワーカーに対して行う終了処理と同じパターン、Section 8.2）。
 
 #### `get_patch()` と `_cap_output()` の非対称性（51-71行目、377-392行目）
 
@@ -1700,7 +1806,12 @@ def _cap_output(text: str) -> str:
 
 ## 13. `docker_runner.py` — Docker ブリッジ
 
-`SweBenchContainer`がタスクのDockerイメージのライフサイクル全体を管理する。実装しているのはSection 4.4の**アプローチ(b)**: サンドボックス（Pythonインタプリタ）自体はホストに置いたまま、**MCPツールサーバーのプロセスだけ**を`docker exec`でコンテナの中に立てる。`mcp_tools_swebench.py`自体はDockerを意識しないので、同じコードがベアなホストチェックアウトでもコンテナ内でも動く。
+`SweBenchContainer`がタスクのDockerイメージのライフサイクル全体を管理する。まずDockerの基礎用語を2つ整理しておく:
+
+- **イメージ(image)**とは、アプリケーションとその実行に必要な一式(OSの最小構成・ライブラリ・ファイル)をまとめた、**読み取り専用のひな型**のこと。ファイルのスナップショットのようなもので、それ自体は「動いていない」。
+- **コンテナ(container)**とは、そのイメージから実際に**起動した、動いている実行環境**のこと。同じイメージから何個でもコンテナを起動できる(同じひな型のコピーを何個も動かすイメージ)。コンテナは、ホストOSのカーネルを共有しながらも、ファイルシステムやプロセス空間が(名前空間によって、Section 8.2で説明したのと同種の仕組みで)隔離されている。
+
+このクラスが実装しているのはSection 4.4の**アプローチ(b)**: サンドボックス（Pythonインタプリタ）自体はホストに置いたまま、**MCPツールサーバーのプロセスだけ**を`docker exec`でコンテナの中に立てる。`mcp_tools_swebench.py`自体はDockerを意識しないので、同じコードがベアなホストチェックアウトでもコンテナ内でも動く。
 
 ### `start()` の実行順序（40-53行目）
 
@@ -1716,6 +1827,8 @@ def start(self, eval_script: str, tools_file: Path) -> None:
 
 `command="tail -f /dev/null"`でコンテナを起動しているのは、SWE-benchのDockerイメージ自体は（テスト実行用であって）常駐サーバーではないため、何もしなければコンテナがすぐ終了してしまう——`tail -f /dev/null`は「何も出力せずに永遠にブロックし続ける」ダミーコマンドとして、`docker exec`で後から中に入れる状態を維持するための定石。
 
+ここで登場する`docker exec`と、次の節で出てくる`docker cp`の違いも整理しておく。**`docker exec`**は、**起動中のコンテナの内部で新しいコマンドを実行する**操作——コンテナがすでに動いていることが前提で、その中に入って何かを行う(ちょうどSSHでリモートサーバーに接続してコマンドを打つのに近い)。**`docker cp`**は、ホストとコンテナの間で**ファイルをコピーする**操作——コンテナが動いているかどうかに関わらず使える、ファイル転送専用のコマンド。この2つの使い分けが、次の`_write_into_container()`の設計判断の核になる。
+
 ### `_write_into_container()` — `docker cp`のUIDバグ回避策（55-82行目）
 
 ```python
@@ -1727,9 +1840,9 @@ def _write_into_container(self, content: str, container_path: str) -> None:
     )
 ```
 
-`docker cp`はtarベースのコピーで、抽出したファイルをホストのUIDに`lchown`しようとする。ユーザーごとのsubuid/subgidレンジ（`/etc/subuid`）でコンテナのUIDリマッピングを行っているホスト環境では、ホストユーザーのUIDがそのレンジ外に落ちて`Error response from daemon: failed to Lchown ...: invalid argument`で失敗する（実際にこのホストで遭遇し、`BENCHMARK_REPORT.md`に記録されている。moulinette自身の`validate swebench`も内部で同じエラーを踏むことが確認されている＝このプロジェクト固有のバグではなくホスト環境依存の既知の問題）。
+`docker cp`はtarベースのコピーで、抽出したファイルをホストのUIDに`lchown`しようとする。ここで言う**UID(User ID)**とは、OSがユーザーを識別するための数値のことで、Linuxのファイルにはそれぞれ「所有者はこのUID」という情報が付いている。コンテナは通常、ホストとは独立したUID体系を持つが、ホスト環境によっては「コンテナ内のUIDを、ホスト側の別のUID範囲に自動的にマッピング(対応付け)する」設定(user namespace remapping、`/etc/subuid`で指定される範囲)が入っていることがある。ユーザーごとのsubuid/subgidレンジ（`/etc/subuid`）でコンテナのUIDリマッピングを行っているホスト環境では、ホストユーザーのUIDがそのレンジ外に落ちて`Error response from daemon: failed to Lchown ...: invalid argument`で失敗する（実際にこのホストで遭遇し、`BENCHMARK_REPORT.md`に記録されている。moulinette自身の`validate swebench`も内部で同じエラーを踏むことが確認されている＝このプロジェクト固有のバグではなくホスト環境依存の既知の問題）。
 
-対策として、`docker cp`を使わず`docker exec -i <id> sh -c 'cat > <path>'`に標準入力で内容を流し込む方式にする。これはコンテナのエントリポイントが動くユーザーとして書き込むため、ホスト側のUIDマッピングの影響を受けない。この`docker exec`呼び出しは`docker-py`クライアントではなく`docker`CLIを直接呼んでいるため、`docker-py`クライアントのデフォルトタイムアウトを継承しない ── そこで明示的に`timeout=30`を指定し、コンテナが応答不能になった場合でも`container.start()`（＝エージェント全体）を無期限にハングさせないようにしている。
+対策として、`docker cp`を使わず`docker exec -i <id> sh -c 'cat > <path>'`に標準入力で内容を流し込む方式にする。これは`docker exec`が「コンテナの内部で」コマンドを実行する(=書き込みもコンテナ内部のプロセスとして行われる)ため、ホスト側のUIDマッピングというレイヤーを一切経由せずに済む——`docker cp`のようなホスト⇔コンテナ間のファイル転送特有の変換処理を、そもそも発生させない、という回避策になっている。この`docker exec`呼び出しは`docker-py`クライアントではなく`docker`CLIを直接呼んでいるため、`docker-py`クライアントのデフォルトタイムアウトを継承しない ── そこで明示的に`timeout=30`を指定し、コンテナが応答不能になった場合でも`container.start()`（＝エージェント全体）を無期限にハングさせないようにしている。`subprocess.run(..., check=True, ...)`——ここでは`check=True`が指定されている点にも注目——コンテナへの書き込みが失敗したのに気づかずそのまま処理を続けてしまう(例えば空のファイルのまま後続処理が進む)方が危険なので、終了コードが非ゼロなら即座に例外を送出させ、失敗をその場で顕在化させている。
 
 ### `_bootstrap_dependencies()` — ベストエフォートのセットアップ（84-120行目）
 
@@ -1748,7 +1861,7 @@ if install.returncode != 0:
         f"(likely no network access in this image): {install.stderr.decode(errors='replace')}")
 ```
 
-まず`import mcp`が既に通るか確認し（多くのSWE-benchイメージには入っていない）、通らなければ`pip install`でその場にブートストラップする。ネットワークが無いイメージではこれが失敗するが、それは例外を握りつぶさず`RuntimeError`として`agent_swebench.py`側に伝播し、そこで「グレースフルなエージェントエラー」（クラッシュではなく`solution.json`へのエラー記録）として処理される——General Rulesの「すべてのエラーはgracefulに処理されなければならない」要件に対応。
+まず`import mcp`が既に通るか確認し（多くのSWE-benchイメージには入っていない）、通らなければ`pip install`でその場にブートストラップする。この最初の確認コマンドは`check=False`（デフォルト）で呼ばれている点に注目——ここでの非ゼロ終了コード(`import`失敗)は「異常事態」ではなく「想定内の分岐(まだインストールされていない)」なので、例外にせず`returncode`を自分で見て次のステップに進む、という判断。ネットワークが無いイメージではこれが失敗するが、それは例外を握りつぶさず`RuntimeError`として`agent_swebench.py`側に伝播し、そこで「グレースフルなエージェントエラー」（クラッシュではなく`solution.json`へのエラー記録）として処理される——General Rulesの「すべてのエラーはgracefulに処理されなければならない」要件に対応。
 
 ### `mcp_stdio_command()` と `cleanup()`（122-147行目）
 
@@ -1772,12 +1885,15 @@ def cleanup(self) -> None:
     self._container = None
 ```
 
-`mcp_stdio_command()`が組み立てる文字列がそのまま`MCPToolProxy(stdio_command=...)`（`agent_swebench.py:105`）に渡され、`-e`フラグで`TESTBED_PATH`/`AGENT_SMITH_EVAL_SCRIPT`を環境変数として注入する——これが`mcp_tools_swebench.py`側の`_testbed_root()`/`_eval_script_path()`が読む値の出所そのもの。`cleanup()`は`stop`/`remove`の両方を個別の`try/except Exception: pass`で包んでいる（例外を握りつぶす）。これは「後始末の失敗でエージェント全体をクラッシュさせない」という設計判断で、Section 8.1の「通常のコードエラーで例外を投げることは絶対にない」というサンドボックスの方針と同じ発想がここにも表れている——ただし対象は「信頼できないコードの実行結果」ではなく「後片付け処理自体の失敗」である点が異なる。`self._container = None`で内部状態をリセットするのは、`cleanup()`が万一2回呼ばれても（例えば`finally`節と何らかの例外パスの両方から）2回目は即座に early return するための保険（137-138行目）。
+`mcp_stdio_command()`が組み立てる文字列がそのまま`MCPToolProxy(stdio_command=...)`（`agent_swebench.py:105`）に渡され、`-e`フラグで`TESTBED_PATH`/`AGENT_SMITH_EVAL_SCRIPT`を環境変数として注入する——これが`mcp_tools_swebench.py`側の`_testbed_root()`/`_eval_script_path()`が読む値の出所そのもの。注目したいのは、この文字列自体が「`docker exec`でコンテナの中の`python3 <MCPサーバースクリプト>`をstdio起動する」というコマンドになっていること——つまり`MCPToolProxy`から見れば、相手がベアなローカルプロセスなのか、Docker越しのコンテナ内プロセスなのかの違いは、「どんなコマンド文字列を`stdio_command`として渡すか」だけに閉じ込められている(Section 11の`agent_mbpp.py`がローカルの`sys.executable`をそのまま使っていたのと対比すると分かりやすい)。`cleanup()`は`stop`/`remove`の両方を個別の`try/except Exception: pass`で包んでいる（例外を握りつぶす）。これは「後始末の失敗でエージェント全体をクラッシュさせない」という設計判断で、Section 8.1の「通常のコードエラーで例外を投げることは絶対にない」というサンドボックスの方針と同じ発想がここにも表れている——ただし対象は「信頼できないコードの実行結果」ではなく「後片付け処理自体の失敗」である点が異なる。`self._container = None`で内部状態をリセットするのは、`cleanup()`が万一2回呼ばれても（例えば`finally`節と何らかの例外パスの両方から）2回目は即座に early return するための保険（137-138行目）。
+
 ---
 
 ## 14. 設定ファイル・補助ファイル
 
 ### `pyproject.toml` — 依存関係とプロジェクトメタデータ（`pyproject.toml:1-35`）
+
+`pyproject.toml`はPythonプロジェクトの標準的な設定ファイル形式(TOML＝Tom's Obvious, Minimal Language、`key = value`を中心とした人間に読みやすい設定ファイル記法)で、「このプロジェクトにはどんな依存パッケージが必要か」「どうビルドするか」「コマンドラインツールとして何を公開するか」などをまとめて宣言する。
 
 ```toml
 [project]
@@ -1828,6 +1944,8 @@ testpaths = ["tests"]                                                  # 35
 を担う、別レイヤーの問題を別ファイルで解決している。
 
 ### `Makefile` — よく使う操作のショートカット（`Makefile:1-35`）
+
+`Makefile`は`make <ターゲット名>`という短いコマンドで、あらかじめ定義しておいた一連のシェルコマンドをまとめて実行できるようにするビルドツールの設定ファイル。ここでは本来の「ビルド」用途ではなく、開発時によく使う操作(依存インストール・実行・lint・テストなど)へのショートカットとして使われている。
 
 ```makefile
 .PHONY: install run debug sandbox clean fclean lint lint-strict test    # 1
@@ -1995,6 +2113,8 @@ extend-exclude = .venv,models.py
 
 ## 15. テストスイート（`tests/`）
 
+まず前提知識をいくつか。**`pytest`**はPythonで最もよく使われるテストフレームワークで、関数名が`test_`で始まる関数を自動的に見つけて片っ端から実行し、その中の`assert`文（「これが真でなければ失敗」という表明）が1つでも失敗すればそのテストを不合格として報告してくれる——テストを実行する仕組み自体を自分で書く必要がない。**フィクスチャ(fixture)**は、複数のテストで共通して必要になる「準備」(例えば「一時ディレクトリに小さな偽リポジトリを作る」)や「後片付け」をひとまとめにして使い回すための仕組みで、`@pytest.fixture()`を付けた関数をテスト関数の引数名として指定するだけで、そのテストの実行前に自動的に呼び出される（後述の`fake_repo`フィクスチャがその実例）。**モック/フェイク(mock/fake)**とは、本物の依存先(LLM API、ネットワーク、本物のDockerコンテナなど)をテストの中でそのまま使うと「遅い」「お金がかかる」「結果が毎回変わる」という問題が起きるため、代わりに「決まった入力に対して決まった出力を返すだけの、挙動を固定した偽物」に差し替えてテストする、というテスト設計の基本手法——後述の`_ScriptedLLMClient`(あらかじめ用意した応答を順番に返すだけの偽LLMクライアント)がその実例。
+
 `make test`(=`uv run pytest -v`)で、**ネットワークもAPIキーも一切不要**に完結するように
 設計されている。各ファイルの狙い:
 
@@ -2011,12 +2131,14 @@ extend-exclude = .venv,models.py
 | `test_agent_startup.py` | 両エージェントCLIの起動時エラー処理とシャットダウン処理 |
 | `test_edge_cases.py` | 各コンポーネント共通の境界値・不正入力ケース |
 
+この表に出てくる「結合テスト」という言葉にも触れておく。1つの関数やクラス単体だけを検証する**単体テスト(unit test)**に対し、**結合テスト(integration test)**は複数の部品を実際に組み合わせて(ここでは「本物のサブプロセスとして起動したMCPサーバー」と「本物のクライアント」を実際に接続して)動かし、部品同士の繋ぎ込みが正しく機能するかを検証する。`test_mcp_client.py`はネットワークこそ使わないが、ローカルのサブプロセス起動というOS機能は本物を使っているという点で単体テストより一段上のレイヤーを検証している。`fake_repo`フィクスチャの実体を覗いてみると(`tests/test_mcp_tools_swebench.py:11-30`)、`tmp_path`(pytestが標準で提供する「このテストの間だけ存在する一時ディレクトリ」のフィクスチャ)の中に小さなPythonファイルを1つ書いて`git init`まで行い、本物の(ただし使い捨ての)gitリポジトリを毎テストごとにまっさらな状態で用意している——これにより、あるテストが前のテストの残骸に影響されて結果が変わる、という事故を防いでいる。
+
 ### `test_orchestrator.py` — ループ全体のend-to-endテスト
 
-`_ScriptedLLMClient`という「呼ばれるたびにあらかじめ用意した応答テキストを順番に1つずつ返す」
+ここで言う**end-to-endテスト**とは、個々の部品(コード抽出、サンドボックス、LLMクライアントの各々)を単体で検証するのではなく、「タスクの入力を渡してから`SolutionOutput`が返ってくるまで」という実際の使われ方に最も近い流れを、部品を組み合わせたまま通しで検証するテストのこと。ここでは`_ScriptedLLMClient`という「呼ばれるたびにあらかじめ用意した応答テキストを順番に1つずつ返す」
 フェイクLLMクライアントを使い、**本物の`Sandbox`**(`apply_process_memory_limit=False`で
 プロセス全体へのメモリ制限だけ無効化)と組み合わせてSection 5の`Orchestrator.run()`を
-実際に走らせる。代表的なテスト:
+実際に走らせる。LLM API呼び出しだけを偽物に差し替え、それ以外(サンドボックスでの実際のコード実行、コード抽出、ループの停止判定)は本物のまま動かしているのがポイント——「LLMの気まぐれな応答」という制御しづらい部分だけを固定値に置き換えることで、ループ制御ロジック自体の正しさを再現性ある形でテストできる。代表的なテスト:
 
 - `test_final_answer_ends_the_loop_successfully`: 1ターン目は`print(1+1)`、2ターン目で
   `final_answer("def f():\n    return 1")`を呼ぶ2ステップの会話を用意し、
@@ -2153,7 +2275,7 @@ test_successful_call_still_works
 ## 16. セキュリティ設計まとめ
 
 `README.md` の「Sandbox design」節を踏まえて要点だけ再掲する。各対策には
-「もし無かったら何が起きるか」を併記する。
+「もし無かったら何が起きるか」を併記する。ここに登場する用語(AST・Linux namespace・`unshare`/`bwrap`・`RLIMIT_AS`・`final_answer()`の例外伝播など)はいずれもSection 8で1つずつ平易な言葉から説明済みなので、この表はそれらの「まとめ・索引」として読んでほしい。
 
 | 懸念 | 対策 | もし無かったら | トレードオフ |
 |---|---|---|---|
@@ -2171,7 +2293,7 @@ test_successful_call_still_works
 
 ## 17. `BENCHMARK_REPORT.md` からの知見
 
-Section 4.7 要求(5モデル以上×2プロバイダ以上×3タスク以上)を満たす実測レポート。
+Section 4.7 要求(5モデル以上×2プロバイダ以上×3タスク以上)を満たす実測レポート。以下の表を読む前に、ベンチマーク特有の用語を3つ定義しておく。**レイテンシ(latency)**は「リクエストを送ってから応答が返ってくるまでにかかった時間」——ここでは1リクエストあたりの平均応答時間(ミリ秒)として使われている。**可用性(availability)**は「そのプロバイダ・モデルの組み合わせに、実際にどれだけ安定してリクエストを通せたか」——後述の表では「何回に1回リクエストが失敗せずに済んだか」というニュアンスで使われている。また表中の`429`/`400`は**HTTPステータスコード**で、`429`は「レート制限超過(Too Many Requests)」——一定時間あたりに送れるリクエスト数の上限を超えたときにサーバーが返すエラー、`400`は「不正なリクエスト(Bad Request)」——プロバイダ側がこちらの送ったリクエストの形式自体を受け付けられなかったことを意味する(ここでは後述の通り「モデルがこのプロジェクトのプロンプト形式に非互換だった」ことに起因する)。
 
 ### 実測結果(15ラン全件、`solutions/`の証跡と1対1対応)
 
@@ -2226,7 +2348,7 @@ Groqの「分あたり8,000トークン」という上限は、このプロジ�
 
 ### アブレーション実験の詳細(Section 7も参照)
 
-`prompts.py`の`include_example`引数を`True`/`False`で切り替え、同じモデル・同じタスク
+まず「アブレーション実験(ablation study)」という言葉について。これはもともと機械学習分野でよく使われる用語で、「システムからある要素を1つだけ取り除いて(切除=ablationして)、取り除く前後の結果を比較することで、その要素が実際にどれだけ結果に寄与していたかを確かめる」という実験手法を指す。ここでは`prompts.py`の`include_example`引数を`True`/`False`で切り替え、同じモデル・同じタスク
 (`minimax-m3`, xarray-4629)で比較:
 
 | | worked exampleあり | worked exampleなし |
@@ -2266,6 +2388,8 @@ Docker/実プロバイダ/独立レビューによって初めて見つかった
 
 ## 18. 実行方法チートシート
 
+以下は実際にこのプロジェクトを動かすためのコマンド集。`uv`はこのプロジェクトが使っているPythonのパッケージ/仮想環境管理ツールで、`uv sync`が`pyproject.toml`に書かれた依存関係を仮想環境にインストールし、`uv run <コマンド>`がその仮想環境の中でコマンドを実行する、という2つだけ覚えておけば以下は読める。
+
 ```sh
 cd sample_JPN
 uv sync
@@ -2302,7 +2426,7 @@ make fclean        # clean に加えて .venv ごと削除
 コマンドで取得することを前提にしている(README.md)——`cache/mbpp_task.json`等は
 このダンプの出力を想定した置き場所。
 
-サンドボックスは Linux の `unshare` と `bubblewrap`(`bwrap`)を必要とする。
+サンドボックスは Linux の `unshare` と `bubblewrap`(`bwrap`)を必要とする(Section 8.2で説明した通り、両者を組み合わせてネットワーク遮断・専用ファイルシステムなどのOSレベル隔離を実現している)。
 どちらかが無い環境では、未許可の実行にフォールバックすることなく **fail-closed**
 (明示的に失敗する)ように作られている。`agent_swebench`はさらにDocker daemonへの
 アクセスも必要とする(`docker_runner.py`がイメージのpull・コンテナ起動を行うため)。
