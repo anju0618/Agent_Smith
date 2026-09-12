@@ -48,7 +48,8 @@ class SweBenchContainer:
         )  # コンテナをバックグラウンドで起動する(tail -f /dev/nullで常駐させる)
 
         self._write_into_container(eval_script, EVAL_SCRIPT_PATH_IN_CONTAINER)  # 評価スクリプトをコンテナ内に書き込む
-        self._write_into_container(tools_file.read_text(), TOOLS_PATH_IN_CONTAINER)  # MCPツールサーバーのソースをコンテナ内に書き込む
+        # MCPツールサーバーのソースをコンテナ内に書き込む
+        self._write_into_container(tools_file.read_text(), TOOLS_PATH_IN_CONTAINER)
 
         self._bootstrap_dependencies()  # コンテナ内でMCPサーバーの依存パッケージをインストールする
 
@@ -96,8 +97,8 @@ class SweBenchContainer:
                 timeout=30,  # 30秒でタイムアウト
                 check=False,  # 非ゼロ終了コードでも例外を投げず、自前で判定する
             )  # コンテナ内でmcpパッケージが既にインポート可能かを確認する
-        except subprocess.TimeoutExpired as exc:  # タイムアウトした場合
-            raise RuntimeError("Timed out checking MCP dependencies in the container") from exc  # 明確なエラーに変換して送出
+        except subprocess.TimeoutExpired as exc:  # タイムアウトした場合、明確なエラーに変換して送出
+            raise RuntimeError("Timed out checking MCP dependencies in the container") from exc
         if check.returncode == 0:  # importが成功した(=既にmcpがインストール済み)なら
             return  # これ以上何もせず終了
         try:
@@ -110,8 +111,8 @@ class SweBenchContainer:
                 timeout=300,  # インストールには時間がかかるため5分のタイムアウト
                 check=False,  # 非ゼロ終了コードでも例外を投げず、自前で判定する
             )  # mcpとpydanticをコンテナ内にpip installする
-        except subprocess.TimeoutExpired as exc:  # インストールがタイムアウトした場合
-            raise RuntimeError("Timed out installing MCP dependencies in the container") from exc  # 明確なエラーに変換して送出
+        except subprocess.TimeoutExpired as exc:  # インストールがタイムアウトした場合、明確なエラーに変換して送出
+            raise RuntimeError("Timed out installing MCP dependencies in the container") from exc
         if install.returncode != 0:  # インストールが失敗した場合
             raise RuntimeError(
                 "Could not install the MCP server's dependencies inside the container "
