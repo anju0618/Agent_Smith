@@ -13,7 +13,7 @@ from typing import List, Optional  # 型ヒント用のListとOptional
 
 import requests  # HTTPリクエスト例外を捕捉するためのrequestsライブラリ
 
-from config import ProviderSpec, resolve_provider  # プロバイダ設定の型と解決関数
+from config import KNOWN_PROVIDERS, ProviderSpec, resolve_provider  # プロバイダ設定の型と解決関数
 from llm.provider import ChatProvider, GenerationResult, UsageStats  # プロバイダのプロトコルと結果・使用量の型
 from llm.providers.gemini import GeminiProvider  # Gemini用の具体的プロバイダ実装
 from llm.providers.openai_compatible import OpenAICompatibleProvider  # OpenAI互換API用の具体的プロバイダ実装
@@ -47,6 +47,7 @@ class _ProviderSlot:
     spec: ProviderSpec  # プロバイダの静的な設定情報
     chat_provider: ChatProvider  # 実際にHTTPリクエストを行う具体的な実装
     api_keys: List[str]  # このプロバイダで利用可能な全APIキーのリスト
+    model_name: str  # このスロットを呼ぶ際に使うモデル名(プロバイダごとに異なりうる)
     next_key_index: int = field(default=0)  # 次にラウンドロビンで使用するキーのインデックス
 
 
@@ -78,8 +79,10 @@ class LLMClient:
             if not keys:  # 1つもキーが見つからなければ
                 continue  # このプロバイダはスキップする(使えないため)
             self._slots.append(
-                _ProviderSlot(spec=spec, chat_provider=_build_chat_provider(spec), api_keys=keys)
-            )  # 対応する具体的プロバイダ実装を構築し、スロットとして登録する
+                _ProviderSlot(
+                    spec=spec, chat_provider=_build_chat_provider(spec), api_keys=keys, model_name=model_name
+                )
+            )  # 対応する具体的プロバイダ実装を構築し、スロットとして登録する(このコンストラクタ経由では全スロットが同じmodel_nameを使う)
 
         if not self._slots:  # 使用可能なプロバイダが1つもなければ
             names = ", ".join(spec.name for spec in provider_specs)  # エラーメッセージ用にプロバイダ名を列挙
@@ -90,8 +93,35 @@ class LLMClient:
 
     @classmethod
     def from_provider_url(cls, model_name: str, provider_url: str, **kwargs: object) -> "LLMClient":
-        # 単一のプロバイダURLからプロバイダ仕様を解決し、それだけを使うLLMClientを生成するショートカット
-        return cls(model_name, [resolve_provider(provider_url)], **kwargs)  # type: ignore[arg-type]
+        """指定された(model_name, provider_url)を最優先で使いつつ、.envに鍵が設定されている
+        他の既知プロバイダ(KNOWN_PROVIDERS)を自動で予備として追加するショートカット。
+
+        Section 4.6.1「複数プロバイダごとに複数APIトークンをサポート」「プロバイダの
+        フォールバックの実装も検討すること」への対応。以前はここが単一プロバイダのspecしか
+        作らず、そのプロバイダ/アカウントの無料枠が尽きると`AllProvidersExhaustedError`で
+        即座に全滅していた(config.pyの複数プロバイダ登録・複数キーローテーションが実際の
+        起動経路からは一切使われていなかった)。予備プロバイダは呼び出し元が指定した
+        model_nameではなく、そのプロバイダ用にBENCHMARK_REPORT.mdで動作確認済みの
+        `fallback_model`を使う(モデル名はプロバイダをまたいで共通ではないため)。
+        """
+        primary = resolve_provider(provider_url)  # 呼び出し元が指定したプロバイダを最優先スロットとして解決
+        client = cls(model_name, [primary], **kwargs)  # type: ignore[arg-type]  # まず最優先プロバイダだけでクライアントを構築
+        for spec in KNOWN_PROVIDERS:  # 既知の全プロバイダを走査し、使える予備を追加する
+            if spec.name == primary.name or spec.fallback_model is None:
+                continue  # 最優先プロバイダ自身、または動作確認済みモデルが無いプロバイダはスキップ
+            keys = spec.collect_api_keys()  # このプロバイダに設定されている鍵を収集
+            if not keys:  # 鍵が1つも無ければ予備として使えない
+                continue
+            # 予備プロバイダ用のスロットを末尾に追加(最優先プロバイダが尽きた後にのみ試される)
+            client._slots.append(
+                _ProviderSlot(
+                    spec=spec,
+                    chat_provider=_build_chat_provider(spec),
+                    api_keys=keys,
+                    model_name=spec.fallback_model,
+                )
+            )
+        return client
 
     def generate(
         self,
@@ -111,13 +141,14 @@ class LLMClient:
         for slot in self._slots:  # 登録されている各プロバイダを優先順に試す
             for _ in range(len(slot.api_keys)):  # そのプロバイダが持つ全キーの数だけループする(全キーを一巡させる)
                 api_key = slot.api_keys[slot.next_key_index]  # 次に使うべきキーを取得
-                slot.next_key_index = (slot.next_key_index + 1) % len(slot.api_keys)  # 次回のためにラウンドロビンでインデックスを進める
+                # 次回のためにラウンドロビンでインデックスを進める
+                slot.next_key_index = (slot.next_key_index + 1) % len(slot.api_keys)
 
                 for attempt in range(self.max_retries_per_key):  # このキーについて、最大リトライ回数まで試行する
                     try:
                         result = slot.chat_provider.chat(
                             messages=messages,
-                            model=self.model_name,
+                            model=slot.model_name,
                             api_key=api_key,
                             stop=stop,
                             max_output_tokens=max_output_tokens,
@@ -126,7 +157,8 @@ class LLMClient:
                         result.retries = retries  # ここまでの失敗回数を結果オブジェクトに記録する
                         self.usage.record(result)  # 使用量集計に今回の成功結果を反映する
                         return result  # 成功したので即座に結果を返す(これ以降のループは実行しない)
-                    except (requests.RequestException, KeyError, IndexError) as exc:  # HTTPエラーやレスポンス形式異常が発生した場合
+                    except (requests.RequestException, KeyError, IndexError) as exc:
+                        # HTTPエラーやレスポンス形式異常が発生した場合
                         last_error = exc  # 直近のエラーとして記録しておく(最終的な例外メッセージ用)
                         retries += 1  # 失敗試行回数をインクリメント
                         self.usage.errors.append(f"{slot.spec.name}: {exc}")  # どのプロバイダで何のエラーが起きたかを記録する

@@ -60,7 +60,8 @@ _UNSAFE_BUILTINS = {
 
 _RESERVED_GLOBAL_NAMES = {"__builtins__", "final_answer"}  # extra_namespaceで上書きしてはいけない予約名
 _FORBIDDEN_PUBLIC_ATTRIBUTES = {"format"}  # 公開属性だが危険なため常に禁止する名前(str.formatなど)
-_FORBIDDEN_MODULE_ATTRIBUTES = {"string": {"Formatter"}}  # モジュールごとに個別禁止する属性(string.Formatterは書式ミニ言語経由の脱出経路になるため)
+# モジュールごとに個別禁止する属性(string.Formatterは書式ミニ言語経由の脱出経路になるため)
+_FORBIDDEN_MODULE_ATTRIBUTES = {"string": {"Formatter"}}
 
 
 class SandboxViolation(Exception):

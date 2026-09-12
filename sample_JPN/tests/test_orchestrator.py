@@ -63,7 +63,8 @@ def test_final_answer_ends_the_loop_successfully() -> None:
     llm_client = _ScriptedLLMClient(
         [
             "Thought: try\nCode:\n```python\nprint(1 + 1)\n```\n<end_code>",  # 1回目: ただのコード実行
-            'Thought: done\nCode:\n```python\nfinal_answer("def f():\\n    return 1")\n```\n<end_code>',  # 2回目: 最終解答
+            # 2回目: 最終解答
+            'Thought: done\nCode:\n```python\nfinal_answer("def f():\\n    return 1")\n```\n<end_code>',
         ]
     )
     orchestrator = _build_orchestrator(llm_client)

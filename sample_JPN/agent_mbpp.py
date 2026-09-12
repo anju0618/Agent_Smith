@@ -13,6 +13,7 @@ from datetime import datetime  # 結果に付与するタイムスタンプ生�
 from pathlib import Path  # ファイルパス操作用
 from typing import Optional  # Optional型注釈のため
 
+from config import DEFAULT_MODEL_NAME, DEFAULT_PROVIDER_URL  # --model-name/--provider-url省略時の既定値
 from llm.client import LLMClient  # LLMプロバイダへの問い合わせを行うクライアント
 from models import MBPPTaskInput, SandboxConfig, SolutionOutput  # タスク入力・サンドボックス設定・出力結果のデータモデル
 from orchestrator import Orchestrator, OrchestratorConfig, ShutdownRequested  # 思考→コード→観測ループの本体と設定、中断例外
@@ -32,7 +33,8 @@ TIMEOUT_SECONDS = 120  # エージェント全体の実行時間の上限(秒)
 
 def build_task_prompt(task: MBPPTaskInput) -> str:
     # MBPPタスクの内容からLLMに渡すユーザープロンプト文字列を組み立てる関数
-    tests_preview = "\n".join(task.test_list) if task.test_list else "(no public tests provided)"  # 公開テスト一覧を改行区切りで表示用に整形(なければその旨を表示)
+    # 公開テスト一覧を改行区切りで表示用に整形(なければその旨を表示)
+    tests_preview = "\n".join(task.test_list) if task.test_list else "(no public tests provided)"
     imports_note = (
         f"\n\nrun_tests() automatically makes these imports available to the assertions "
         f"above, so you don't need to add them yourself just for the tests to run: "
@@ -74,8 +76,11 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Agent Smith - MBPP agent")  # 引数パーサを作成
     parser.add_argument("--task-file", required=True)  # 入力タスクファイルのパス(必須)
     parser.add_argument("--output", required=True)  # 結果出力先ファイルのパス(必須)
-    parser.add_argument("--model-name", required=True)  # 使用するモデル名(必須)
-    parser.add_argument("--provider-url", required=True)  # LLMプロバイダのURL(必須)
+    # exams/exam_mbpp.shは--model-name/--provider-urlを付けずにエージェントを起動できる
+    # 前提で書かれている(フラグは「forwarded to agent」の任意オプション)ため、必須にせず
+    # BENCHMARK_REPORT.mdの結論(第一候補モデル)をデフォルトにしておく。
+    parser.add_argument("--model-name", default=DEFAULT_MODEL_NAME)  # 使用するモデル名(省略可、既定値あり)
+    parser.add_argument("--provider-url", default=DEFAULT_PROVIDER_URL)  # LLMプロバイダのURL(省略可、既定値あり)
     parser.add_argument("--max-iterations", type=int, default=MAX_ITERATIONS)  # 最大反復回数(省略時はデフォルト値)
     args = parser.parse_args()  # 実際にコマンドライン引数を解析
 
@@ -84,7 +89,8 @@ def main() -> None:
         task = MBPPTaskInput.model_validate(task_data)  # pydanticモデルとしてバリデーション・変換
     except Exception as exc:
         # タスクファイルの読み込み・検証に失敗した場合はエラー用の解答を書き出して異常終了する
-        solution = error_solution("unknown", f"Failed to load task file: {type(exc).__name__}: {exc}")  # タスクID不明としてエラー結果を作成
+        # タスクID不明としてエラー結果を作成
+        solution = error_solution("unknown", f"Failed to load task file: {type(exc).__name__}: {exc}")
         Path(args.output).write_text(solution.model_dump_json(indent=2))  # 結果をJSONとして出力ファイルに書き込む
         sys.exit(1)  # 異常終了コードでプロセスを終了
 
@@ -106,8 +112,10 @@ def main() -> None:
         # 必要となるimport(例: math.isclose)があるため、それをmcp_tools_mbpp.pyに
         # 渡してrun_tests()側で自動的に先頭に追加させる(LLMが自力で気づくことに
         # 依存しないようにする、詳細はmcp_tools_mbpp.py参照)。
-        tool_env = {"AGENT_SMITH_TEST_IMPORTS": json.dumps(task.test_imports)}  # テストに必要な追加importを環境変数として渡す準備
-        mcp_proxy = MCPToolProxy(stdio_command=f"{sys.executable} {MCP_TOOLS_SCRIPT}", env=tool_env)  # MCPツールサーバをサブプロセスとして起動しstdio経由で接続
+        # テストに必要な追加importを環境変数として渡す準備
+        tool_env = {"AGENT_SMITH_TEST_IMPORTS": json.dumps(task.test_imports)}
+        # MCPツールサーバをサブプロセスとして起動しstdio経由で接続
+        mcp_proxy = MCPToolProxy(stdio_command=f"{sys.executable} {MCP_TOOLS_SCRIPT}", env=tool_env)
 
         sandbox_config = SandboxConfig(
             authorized_imports=DEFAULT_AUTHORIZED_IMPORTS,  # サンドボックス内で許可するimportの一覧
@@ -119,10 +127,12 @@ def main() -> None:
             max_execution_time_seconds=20,  # サンドボックス全体の実行時間上限(秒)
             max_memory_mb=256,  # サンドボックスに割り当てるメモリ上限(MB)
         )
-        sandbox = Sandbox(sandbox_config, extra_namespace=mcp_proxy.build_namespace())  # サンドボックスを生成し、MCPツールを名前空間に追加する
+        # サンドボックスを生成し、MCPツールを名前空間に追加する
+        sandbox = Sandbox(sandbox_config, extra_namespace=mcp_proxy.build_namespace())
         system_prompt = build_system_prompt("mbpp", mcp_proxy.manual_text())  # MBPP用のシステムプロンプトをツールの説明文付きで生成
 
-        llm_client = LLMClient.from_provider_url(args.model_name, args.provider_url)  # 指定されたモデル・プロバイダURLからLLMクライアントを生成
+        # 指定されたモデル・プロバイダURLからLLMクライアントを生成
+        llm_client = LLMClient.from_provider_url(args.model_name, args.provider_url)
         orchestrator = Orchestrator(
             llm_client,  # 使用するLLMクライアント
             sandbox,  # 使用するサンドボックス
@@ -137,14 +147,15 @@ def main() -> None:
         )  # オーケストレータを生成しループ実行の準備をする
 
         task_prompt = build_task_prompt(task)  # タスク情報からユーザープロンプトを構築
-        solution = orchestrator.run(str(task.task_id), "mbpp", task_prompt)  # Thought->Code->Observationループを実行し結果を取得
+        # Thought->Code->Observationループを実行し結果を取得
+        solution = orchestrator.run(str(task.task_id), "mbpp", task_prompt)
 
     except ShutdownRequested as exc:
         # SIGTERMなどによる中断要求を受けた場合、その旨を記録したエラー解答を作る
         solution = error_solution(str(task.task_id), f"stopped: {exc}")  # 停止理由を含むエラー結果を生成
     except Exception as exc:
-        # 想定外の例外が発生した場合、クラッシュとして記録する
-        solution = error_solution(str(task.task_id), f"Agent crashed: {type(exc).__name__}: {exc}")  # 例外の型とメッセージを含むエラー結果を生成
+        # 想定外の例外が発生した場合、クラッシュとして記録する(例外の型とメッセージを含むエラー結果を生成)
+        solution = error_solution(str(task.task_id), f"Agent crashed: {type(exc).__name__}: {exc}")
     finally:
         if sandbox is not None:
             sandbox.close()  # サンドボックスのリソースを確実に解放する

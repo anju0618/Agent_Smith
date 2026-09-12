@@ -31,8 +31,10 @@ class GeminiProvider:
             if role == "system":  # システムロールのメッセージなら
                 system_instruction = msg["content"]  # systemInstructionとして別扱いで保持する
                 continue  # contentsには追加せず次のメッセージへ
-            gemini_role = "model" if role == "assistant" else "user"  # assistantはGeminiでは"model"、それ以外は全て"user"にマッピング
-            contents.append({"role": gemini_role, "parts": [{"text": msg["content"]}]})  # Gemini形式のcontentsエントリとして追加
+            # assistantはGeminiでは"model"、それ以外は全て"user"にマッピング
+            gemini_role = "model" if role == "assistant" else "user"
+            # Gemini形式のcontentsエントリとして追加
+            contents.append({"role": gemini_role, "parts": [{"text": msg["content"]}]})
         return system_instruction, contents  # システム指示文と会話内容のタプルを返す
 
     def chat(
@@ -53,11 +55,13 @@ class GeminiProvider:
 
         payload: dict = {"contents": contents, "generationConfig": generation_config}  # リクエストボディの基本部分を構築
         if system_instruction:  # システム指示があれば
-            payload["systemInstruction"] = {"parts": [{"text": system_instruction}]}  # Gemini形式のsystemInstructionとして追加する
+            # Gemini形式のsystemInstructionとして追加する
+            payload["systemInstruction"] = {"parts": [{"text": system_instruction}]}
 
         start = time.monotonic()  # リクエスト開始時刻を記録(単調増加クロックを使用)
         try:
-            response = requests.post(url, params={"key": api_key}, json=payload, timeout=timeout)  # APIキーをクエリパラメータとして付与しPOSTする
+            # APIキーをクエリパラメータとして付与しPOSTする
+            response = requests.post(url, params={"key": api_key}, json=payload, timeout=timeout)
             response.raise_for_status()  # HTTPエラーステータスなら例外を送出する
         except requests.RequestException as exc:
             # ここで発生したrequests例外をそのまま伝播させてはならない: requestsとurllib3は
@@ -74,7 +78,8 @@ class GeminiProvider:
             # push protectionによってpushされる直前に検知された - 詳細は
             # BENCHMARK_REPORT.md参照)
             status = getattr(getattr(exc, "response", None), "status_code", None)  # 例外にレスポンスがあればそのステータスコードを取得
-            status_part = f"status={status}" if status is not None else type(exc).__name__  # ステータスコードがあればそれを、なければ例外の型名を使う
+            # ステータスコードがあればそれを、なければ例外の型名を使う
+            status_part = f"status={status}" if status is not None else type(exc).__name__
             raise requests.RequestException(
                 f"Gemini request failed ({status_part}) for url: {url} "
                 "(query parameters, including the API key, redacted)"

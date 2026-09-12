@@ -41,13 +41,15 @@ class OrchestratorConfig:
     max_input_tokens: int  # 累積入力トークン数の上限
     max_output_tokens: int  # 累積出力トークン数の上限
     max_time_seconds: float  # 実行時間の上限(秒)
-    stop_sequences: List[str] = field(default_factory=lambda: ["<end_code>"])  # LLM生成を止める停止シーケンス(デフォルトは"<end_code>")
+    # LLM生成を止める停止シーケンス(デフォルトは"<end_code>")
+    stop_sequences: List[str] = field(default_factory=lambda: ["<end_code>"])
     max_tokens_per_request: int = 1024  # 1回のLLMリクエストあたりの最大出力トークン数
 
 
 def _serialized_message_bytes(messages: List[dict]) -> int:
     # メッセージ列をJSONにシリアライズし、そのUTF-8バイト長を返す(トークン数見積もりの基礎データ)
-    serialized = json.dumps(messages, ensure_ascii=False, separators=(",", ":"))  # 余分な空白なしでJSON文字列化(ASCIIエスケープはしない)
+    # 余分な空白なしでJSON文字列化(ASCIIエスケープはしない)
+    serialized = json.dumps(messages, ensure_ascii=False, separators=(",", ":"))
     return len(serialized.encode("utf-8"))  # UTF-8エンコード後のバイト数を返す
 
 
@@ -122,7 +124,8 @@ class Orchestrator:
                 break  # ループを抜ける
             elapsed = time.monotonic() - start  # ここまでの経過時間を計算
             if elapsed >= self.config.max_time_seconds:
-                error = f"time budget exhausted ({elapsed:.1f}s >= {self.config.max_time_seconds}s)"  # 時間制限超過のエラーメッセージを設定
+                # 時間制限超過のエラーメッセージを設定
+                error = f"time budget exhausted ({elapsed:.1f}s >= {self.config.max_time_seconds}s)"
                 break  # ループを抜ける
             if total_input_tokens >= self.config.max_input_tokens:
                 error = (
@@ -215,7 +218,8 @@ class Orchestrator:
                 break  # ループを抜ける(タスク完了)
 
             messages.append({"role": "assistant", "content": gen.text})  # LLMの応答をアシスタントメッセージとして会話履歴に追加
-            messages.append({"role": "user", "content": f"Observation:\n{observation}"})  # 実行結果(Observation)をユーザーメッセージとして会話履歴に追加
+            # 実行結果(Observation)をユーザーメッセージとして会話履歴に追加
+            messages.append({"role": "user", "content": f"Observation:\n{observation}"})
         else:
             # forループがbreakされずに最後まで回りきった場合(=最大反復回数に到達した場合)の処理
             error = f"max iterations reached ({self.config.max_iterations})"  # 最大反復回数到達のエラーメッセージを設定

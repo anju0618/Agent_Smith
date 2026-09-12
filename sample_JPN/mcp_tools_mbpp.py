@@ -16,7 +16,8 @@ from typing import List  # 型注釈のため
 
 from mcp.server.fastmcp import FastMCP  # MCPサーバを構築するためのフレームワーク
 from models import SandboxConfig  # サンドボックスの設定を表すデータモデル
-from sandbox.executor import DEFAULT_AUTHORIZED_IMPORTS, FinalAnswer, Sandbox  # サンドボックス実行環境・許可インポート一覧・final_answer例外
+# サンドボックス実行環境・許可インポート一覧・final_answer例外
+from sandbox.executor import DEFAULT_AUTHORIZED_IMPORTS, FinalAnswer, Sandbox
 
 mcp = FastMCP("agent-smith-mbpp-tools")  # MBPP用MCPサーバのインスタンスを作成
 
@@ -83,7 +84,8 @@ def run_tests(code: str, test_list: List[str]) -> str:
             sandbox.close()  # サンドボックスのリソースを確実に解放する
 
     if output.startswith("[Timeout]") and "timed out" not in output:
-        output = output.replace("Execution exceeded 10s", "Execution timed out after 10s", 1)  # タイムアウトメッセージの文言をより分かりやすい表現に置き換える
+        # タイムアウトメッセージの文言をより分かりやすい表現に置き換える
+        output = output.replace("Execution exceeded 10s", "Execution timed out after 10s", 1)
     success = marker in output  # 出力にマーカーが含まれていれば全assertionが通過したとみなす
     if success:
         output = output.replace(marker, "").rstrip()  # 成功時は出力からマーカー文字列を除去し、末尾の空白を整える

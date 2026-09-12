@@ -11,7 +11,7 @@ import os  # 環境変数を読むためのosモジュール
 import re  # 正規表現を使うためのreモジュール
 from dataclasses import dataclass  # データクラスを定義するためのdataclassデコレータ
 from pathlib import Path  # ファイルパスをオブジェクトとして扱うためのPath
-from typing import List  # 型ヒント用のList
+from typing import List, Optional  # 型ヒント用のListとOptional
 
 from dotenv import load_dotenv  # .envファイルを読み込むためのdotenvライブラリ
 
@@ -39,6 +39,11 @@ class ProviderSpec:
     base_url: str  # プロバイダのAPIベースURL
     api_key_env_prefix: str  # APIキーを保持する環境変数名のプレフィックス
     kind: str = "openai_compatible"  # プロバイダの種類。"openai_compatible" または "gemini"
+    fallback_model: Optional[str] = None  # このプロバイダを自動フォールバック先として使う際に呼ぶモデル名。
+    # 呼び出し元(CLI)が指定したモデル名は他プロバイダでは存在しないことが多いため、
+    # フォールバック時は各プロバイダごとにBENCHMARK_REPORT.mdで動作確認済みのモデルを使う。
+    # Noneのプロバイダは自動フォールバックの対象にしない(未検証、またはレポート上で
+    # 信頼性が低いと判明したプロバイダ)。
 
     def collect_api_keys(self) -> List[str]:
         """このプロバイダに設定されている全てのAPIキーを収集する。
@@ -64,10 +69,18 @@ class ProviderSpec:
 
 # 既知の無料枠プロバイダ一覧(Section 5.6.1 - あくまで例示であり網羅的ではない)。
 # 追加のプロバイダをサポートするには、ここにProviderSpecのエントリを追加する。
+# fallback_modelはBENCHMARK_REPORT.md(5モデル×3プロバイダの比較)で実際にタスクに
+# 合格した実績があるモデルのみを設定している。groq・fireworksは同レポートで
+# 429/400が続発し信頼できなかったため、自動フォールバック先には含めない
+# (依然としてCLIから明示的に--provider-urlで指定して使うことは可能)。
 KNOWN_PROVIDERS: List[ProviderSpec] = [
-    ProviderSpec("openrouter", "https://openrouter.ai/api/v1", "OPENROUTER_API_KEY", "openai_compatible"),  # OpenRouter
+    ProviderSpec(
+        "openrouter", "https://openrouter.ai/api/v1", "OPENROUTER_API_KEY", "openai_compatible",
+        fallback_model="minimax/minimax-m3:free",
+    ),  # OpenRouter
     ProviderSpec("groq", "https://api.groq.com/openai/v1", "GROQ_API_KEY", "openai_compatible"),  # Groq
-    ProviderSpec("together", "https://api.together.xyz/v1", "TOGETHER_API_KEY", "openai_compatible"),  # Together AI
+    # Together AI
+    ProviderSpec("together", "https://api.together.xyz/v1", "TOGETHER_API_KEY", "openai_compatible"),
     ProviderSpec(
         "fireworks", "https://api.fireworks.ai/inference/v1", "FIREWORKS_API_KEY", "openai_compatible"
     ),  # Fireworks AI
@@ -76,8 +89,16 @@ KNOWN_PROVIDERS: List[ProviderSpec] = [
         "https://generativelanguage.googleapis.com/v1beta",
         "GOOGLE_AI_STUDIO_API_KEY",
         "gemini",
+        fallback_model="gemini-flash-lite-latest",
     ),  # Google AI Studio(Geminiは他と形式が異なるためkind="gemini")
 ]
+
+# デフォルトのモデル/プロバイダ(--model-name / --provider-urlが省略された場合に使う)。
+# BENCHMARK_REPORT.mdの結論で第一候補として採用したモデルと同じ組み合わせ
+# (Section 5参照: exam_*.shはこれらのフラグを付けずにエージェントを起動できる
+# ことを前提にしており、必須引数のままだと未指定時に即座にクラッシュしてしまう)。
+DEFAULT_MODEL_NAME = "gemini-flash-lite-latest"
+DEFAULT_PROVIDER_URL = "https://generativelanguage.googleapis.com/v1beta"
 
 
 def _env_var_from_url(base_url: str) -> str:

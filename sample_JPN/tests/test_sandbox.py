@@ -20,7 +20,8 @@ def _sandbox(
     allowed_directories: Optional[List[str]] = None, authorized_imports: Optional[List[str]] = None
 ) -> Sandbox:
     # テスト用にSandboxインスタンスを組み立てるヘルパー関数
-    imports = authorized_imports if authorized_imports is not None else DEFAULT_AUTHORIZED_IMPORTS  # 未指定ならデフォルトの許可import一覧を使う
+    # 未指定ならデフォルトの許可import一覧を使う
+    imports = authorized_imports if authorized_imports is not None else DEFAULT_AUTHORIZED_IMPORTS
     directories = allowed_directories if allowed_directories is not None else []  # 未指定なら許可ディレクトリなし
     config = SandboxConfig(authorized_imports=imports, allowed_directories=directories)
     return Sandbox(config, apply_process_memory_limit=False)  # テスト中はプロセス全体のメモリ制限を無効化

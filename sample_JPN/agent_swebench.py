@@ -17,6 +17,7 @@ from datetime import datetime  # 結果に付与するタイムスタンプ生�
 from pathlib import Path  # ファイルパス操作用
 from typing import Optional  # Optional型注釈のため
 
+from config import DEFAULT_MODEL_NAME, DEFAULT_PROVIDER_URL  # --model-name/--provider-url省略時の既定値
 from docker_runner import SweBenchContainer  # SWE-bench用Dockerコンテナの起動・管理クラス
 from llm.client import LLMClient  # LLMプロバイダへの問い合わせを行うクライアント
 from models import SandboxConfig, SolutionOutput, SWEBenchTaskInput  # サンドボックス設定・出力結果・タスク入力のデータモデル
@@ -71,8 +72,11 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Agent Smith - SWE-bench agent")  # 引数パーサを作成
     parser.add_argument("--task-file", required=True)  # 入力タスクファイルのパス(必須)
     parser.add_argument("--output", required=True)  # 結果出力先ファイルのパス(必須)
-    parser.add_argument("--model-name", required=True)  # 使用するモデル名(必須)
-    parser.add_argument("--provider-url", required=True)  # LLMプロバイダのURL(必須)
+    # exams/exam_swebench.shは--model-name/--provider-urlを付けずにエージェントを起動できる
+    # 前提で書かれている(フラグは「forwarded to agent」の任意オプション)ため、必須にせず
+    # BENCHMARK_REPORT.mdの結論(第一候補モデル)をデフォルトにしておく。
+    parser.add_argument("--model-name", default=DEFAULT_MODEL_NAME)  # 使用するモデル名(省略可、既定値あり)
+    parser.add_argument("--provider-url", default=DEFAULT_PROVIDER_URL)  # LLMプロバイダのURL(省略可、既定値あり)
     parser.add_argument("--max-iterations", type=int, default=MAX_ITERATIONS)  # 最大反復回数(省略時はデフォルト値)
     args = parser.parse_args()  # 実際にコマンドライン引数を解析
 
@@ -81,7 +85,8 @@ def main() -> None:
         task = SWEBenchTaskInput.model_validate(task_data)  # pydanticモデルとしてバリデーション・変換
     except Exception as exc:
         # タスクファイルの読み込み・検証に失敗した場合はエラー用の解答を書き出して異常終了する
-        solution = error_solution("unknown", f"Failed to load task file: {type(exc).__name__}: {exc}")  # タスクID不明としてエラー結果を作成
+        # タスクID不明としてエラー結果を作成
+        solution = error_solution("unknown", f"Failed to load task file: {type(exc).__name__}: {exc}")
         Path(args.output).write_text(solution.model_dump_json(indent=2))  # 結果をJSONとして出力ファイルに書き込む
         sys.exit(1)  # 異常終了コードでプロセスを終了
 
@@ -101,7 +106,8 @@ def main() -> None:
     try:
         container = SweBenchContainer(task.docker_image)  # タスクに紐づくDockerイメージからコンテナ管理オブジェクトを生成
         SCRATCH_DIR.mkdir(parents=True, exist_ok=True)  # 一時作業ディレクトリを作成(既に存在してもエラーにしない)
-        container.start(eval_script=task.eval_script, tools_file=TOOLS_FILE)  # コンテナを起動し、評価スクリプトとMCPツールファイルを配置する
+        # コンテナを起動し、評価スクリプトとMCPツールファイルを配置する
+        container.start(eval_script=task.eval_script, tools_file=TOOLS_FILE)
         mcp_proxy = MCPToolProxy(stdio_command=container.mcp_stdio_command())  # コンテナ内で動くMCPツールサーバにstdio経由で接続
 
         sandbox_config = SandboxConfig(
@@ -110,10 +116,13 @@ def main() -> None:
             max_execution_time_seconds=60,  # サンドボックス全体の実行時間上限(秒)
             max_memory_mb=512,  # サンドボックスに割り当てるメモリ上限(MB)
         )
-        sandbox = Sandbox(sandbox_config, extra_namespace=mcp_proxy.build_namespace())  # サンドボックスを生成し、MCPツールを名前空間に追加する
-        system_prompt = build_system_prompt("swebench", mcp_proxy.manual_text())  # SWE-bench用のシステムプロンプトをツールの説明文付きで生成
+        # サンドボックスを生成し、MCPツールを名前空間に追加する
+        sandbox = Sandbox(sandbox_config, extra_namespace=mcp_proxy.build_namespace())
+        # SWE-bench用のシステムプロンプトをツールの説明文付きで生成
+        system_prompt = build_system_prompt("swebench", mcp_proxy.manual_text())
 
-        llm_client = LLMClient.from_provider_url(args.model_name, args.provider_url)  # 指定されたモデル・プロバイダURLからLLMクライアントを生成
+        # 指定されたモデル・プロバイダURLからLLMクライアントを生成
+        llm_client = LLMClient.from_provider_url(args.model_name, args.provider_url)
         orchestrator = Orchestrator(
             llm_client,  # 使用するLLMクライアント
             sandbox,  # 使用するサンドボックス
@@ -128,7 +137,8 @@ def main() -> None:
         )  # オーケストレータを生成しループ実行の準備をする
 
         task_prompt = build_task_prompt(task)  # タスク情報からユーザープロンプトを構築
-        solution = orchestrator.run(task.instance_id, "swebench", task_prompt)  # Thought->Code->Observationループを実行し結果を取得
+        # Thought->Code->Observationループを実行し結果を取得
+        solution = orchestrator.run(task.instance_id, "swebench", task_prompt)
 
     except ShutdownRequested as exc:
         # SIGTERMがOrchestrator.run()自身がガードしている区間の外(例えばサンドボックス実行の途中)で
@@ -137,7 +147,8 @@ def main() -> None:
         solution = error_solution(task.instance_id, f"stopped: {exc}")  # 停止理由を含むエラー結果を生成
     except Exception as exc:
         # 想定外の例外が発生した場合、クラッシュとして記録する
-        solution = error_solution(task.instance_id, f"Agent crashed: {type(exc).__name__}: {exc}")  # 例外の型とメッセージを含むエラー結果を生成
+        # 例外の型とメッセージを含むエラー結果を生成
+        solution = error_solution(task.instance_id, f"Agent crashed: {type(exc).__name__}: {exc}")
     finally:
         if sandbox is not None:
             sandbox.close()  # サンドボックスのリソースを確実に解放する

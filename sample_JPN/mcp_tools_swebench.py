@@ -99,7 +99,8 @@ def _matching_files(directory: Path, pattern: str, recursive: bool) -> list:
     _validate_glob_pattern(pattern)  # まずパターン自体の安全性を検証する
     root = _testbed_root()  # リポジトリのルートパスを取得
     try:
-        candidates = list(directory.rglob(pattern) if recursive else directory.glob(pattern))  # recursiveフラグに応じて再帰的/非再帰的にglob検索
+        # recursiveフラグに応じて再帰的/非再帰的にglob検索
+        candidates = list(directory.rglob(pattern) if recursive else directory.glob(pattern))
     except (NotImplementedError, ValueError) as exc:
         raise ValueError(f"invalid glob pattern '{pattern}': {exc}") from exc  # globパターン自体が不正な場合はエラーとして送出
 
@@ -110,7 +111,8 @@ def _matching_files(directory: Path, pattern: str, recursive: bool) -> list:
         except OSError:
             continue  # 解決に失敗した場合(壊れたリンク等)はスキップする
         if not _is_within(root, resolved):
-            raise ValueError(f"glob pattern '{pattern}' matched a path outside {root}")  # ルート外にマッチした場合は安全のため例外を送出
+            # ルート外にマッチした場合は安全のため例外を送出
+            raise ValueError(f"glob pattern '{pattern}' matched a path outside {root}")
         if resolved.is_file() and ".git" not in resolved.parts:
             matches.append(resolved)  # 通常ファイルであり、かつ.gitディレクトリ配下でないもののみ結果に追加
     return matches  # 条件を満たすファイルパスのリストを返す
@@ -144,7 +146,8 @@ def read_file(filepath: str, start_line: int = 1, end_line: Optional[int] = None
     last = end_line if end_line is not None else len(lines)  # end_line未指定なら最終行までを対象とする
     first = max(start_line, 1)  # start_lineが1未満にならないよう補正する
     selected = lines[first - 1: last]  # 1始まりの行番号指定を0始まりのスライスに変換して該当範囲を抽出
-    return _cap_output("\n".join(f"{i}: {line}" for i, line in enumerate(selected, start=first)))  # 各行に行番号を付けて結合し、出力サイズ上限を適用して返す
+    # 各行に行番号を付けて結合し、出力サイズ上限を適用して返す
+    return _cap_output("\n".join(f"{i}: {line}" for i, line in enumerate(selected, start=first)))
 
 
 @mcp.tool()
@@ -186,7 +189,8 @@ def edit_file(filepath: str, old_str: str, new_str: str) -> str:
             ["python3", "-m", "py_compile", str(path)], capture_output=True, text=True
         )  # Pythonファイルであれば、コンパイルチェックで構文エラーが発生していないか検証する
         if result.returncode != 0:
-            return f"[EditSyntaxError] Edit applied, but introduced a syntax error:\n{result.stderr}"  # 構文エラーが検出された場合は編集済みだがエラーがある旨を報告する
+            # 構文エラーが検出された場合は編集済みだがエラーがある旨を報告する
+            return f"[EditSyntaxError] Edit applied, but introduced a syntax error:\n{result.stderr}"
 
     return f"Edit applied to {filepath}"  # 正常に編集が完了したことを示すメッセージを返す
 
@@ -210,10 +214,12 @@ def list_files(directory: str, pattern: str = "*") -> str:
         return f"[Error] directory not found: {directory}"  # ディレクトリが存在しない場合のエラー
 
     try:
-        matches = sorted(str(p) for p in _matching_files(path, pattern, recursive=False))  # 非再帰的にマッチするファイルを検索し、パス文字列としてソートする
+        # 非再帰的にマッチするファイルを検索し、パス文字列としてソートする
+        matches = sorted(str(p) for p in _matching_files(path, pattern, recursive=False))
     except ValueError as exc:
         return f"[Error] {exc}"  # globパターンが不正な場合などはエラーメッセージを返す
-    return _cap_output("\n".join(matches)) if matches else "(no files matched)"  # マッチがあれば一覧を返し、なければその旨のメッセージを返す
+    # マッチがあれば一覧を返し、なければその旨のメッセージを返す
+    return _cap_output("\n".join(matches)) if matches else "(no files matched)"
 
 
 # ---------------------------------------------------------------------------
@@ -272,7 +278,8 @@ def search_function_or_class_definition_in_code(name: str) -> str:
     戻り値:
         search_codeと同じ形式: "/absolute/path.py:<行番号> <行の内容>"。
     """
-    return str(search_code(_DEF_RE_TEMPLATE.format(name=re.escape(name)), "*.py"))  # 定義行にマッチする正規表現を組み立ててsearch_codeに委譲する
+    # 定義行にマッチする正規表現を組み立ててsearch_codeに委譲する
+    return str(search_code(_DEF_RE_TEMPLATE.format(name=re.escape(name)), "*.py"))
 
 
 @mcp.tool()
@@ -298,9 +305,12 @@ def find_references(name: str, filepath: str = "", line: int = 0) -> str:
     except ValueError:
         return results  # 宣言ファイルのパスが不正な場合は除外処理をせずそのまま返す
 
-    declaration_marker = f"{declaration_path}:{line} "  # 宣言箇所の行を特定するための先頭一致文字列を組み立てる
-    filtered = [ln for ln in results.splitlines() if not ln.startswith(declaration_marker)]  # 宣言箇所に一致する行を結果から除外する
-    return "\n".join(filtered) if filtered else "(no matches other than the declaration)"  # 除外後の結果を返す(宣言以外に使用箇所がなければその旨を返す)
+    # 宣言箇所の行を特定するための先頭一致文字列を組み立てる
+    declaration_marker = f"{declaration_path}:{line} "
+    # 宣言箇所に一致する行を結果から除外する
+    filtered = [ln for ln in results.splitlines() if not ln.startswith(declaration_marker)]
+    # 除外後の結果を返す(宣言以外に使用箇所がなければその旨を返す)
+    return "\n".join(filtered) if filtered else "(no matches other than the declaration)"
 
 
 # ---------------------------------------------------------------------------
@@ -321,7 +331,8 @@ def run_command(command: str, workdir: str = "") -> str:
         stdout・stderr・終了コードをまとめた整形済みブロック。
     """
     try:
-        cwd = _resolve_within_testbed(workdir) if workdir else _testbed_root()  # workdirが指定されていればそれを解決し、なければリポジトリルートを使う
+        # workdirが指定されていればそれを解決し、なければリポジトリルートを使う
+        cwd = _resolve_within_testbed(workdir) if workdir else _testbed_root()
     except ValueError as exc:
         return f"[Error] {exc}"  # 作業ディレクトリの指定が不正な場合はエラーメッセージを返す
 
@@ -371,7 +382,8 @@ def run_tests() -> str:
             f"[Error] no evaluation script found at {eval_script}. "
             "Use run_command(...) to invoke the project's own test runner instead."
         )  # 評価スクリプトが存在しない場合、代わりにrun_command()を使うよう案内する
-    return str(run_command(f"bash {shlex.quote(str(eval_script))}"))  # 評価スクリプトをbashで実行するコマンドをrun_command()に委譲する(パスは安全にクォートする)
+    # 評価スクリプトをbashで実行するコマンドをrun_command()に委譲する(パスは安全にクォートする)
+    return str(run_command(f"bash {shlex.quote(str(eval_script))}"))
 
 
 @mcp.tool()
