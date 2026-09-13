@@ -44,6 +44,10 @@ class OrchestratorConfig:
     # LLM生成を止める停止シーケンス(デフォルトは"<end_code>")
     stop_sequences: List[str] = field(default_factory=lambda: ["<end_code>"])
     max_tokens_per_request: int = 1024  # 1回のLLMリクエストあたりの最大出力トークン数
+    # 入力/出力トークンの残り予算がこの割合以下になったら、Observationに
+    # 「早く提出せよ」という警告を差し込む(過去の実行で、正解を見つけたのに
+    # 冗長な思考や再検証で予算を使い切りfinal_answer()を呼べなかった事例があるため)
+    budget_warning_threshold: float = 0.35
 
 
 def _serialized_message_bytes(messages: List[dict]) -> int:
@@ -196,6 +200,22 @@ class Orchestrator:
                 except FinalAnswer as fa:
                     final_answer_raised = fa  # final_answer()呼び出しによる例外を捕捉して保持
                     observation = f"[FinalAnswer submitted] {fa.answer!r}"  # 提出された解答内容をObservationとして記録
+
+            if final_answer_raised is None:
+                # まだ提出していない場合のみ、残り予算を見て早期提出を促す警告を検討する
+                remaining_input_frac = (
+                    self.config.max_input_tokens - total_input_tokens
+                ) / self.config.max_input_tokens  # 入力トークン予算の残り割合
+                remaining_output_frac = (
+                    self.config.max_output_tokens - total_output_tokens
+                ) / self.config.max_output_tokens  # 出力トークン予算の残り割合
+                if min(remaining_input_frac, remaining_output_frac) <= self.config.budget_warning_threshold:
+                    # どちらかの予算が閾値を割ったら、Observationに警告文を追記する
+                    observation += (
+                        "\n\n[BUDGET WARNING] Your token budget is nearly exhausted. "
+                        "If you already have a verified solution, call final_answer(...) "
+                        "in your very next turn - do not run further exploration or verification."
+                    )
 
             steps.append(
                 StepMetrics(
