@@ -71,11 +71,29 @@ def _cap_output(text: str) -> str:
     )
 
 
+# 本番(docker_runner.py参照)ではTESTBED_PATHはコンテナ内で常にこの値そのものに
+# 設定されるため、以下のエイリアス変換は実質no-op。ホスト単体でこのMCPサーバを
+# 起動して検証する場合(exam_sandbox.shのswebench_toolsテスト等)はTESTBED_PATHが
+# 別の実ホストパスを指すが、エージェント/テストコードは変わらず"/testbed"を
+# 絶対パスとして使ってくるため、このエイリアスをルートへ読み替えることで
+# 本番・単体検証のどちらも同じコードで正しく動作させる。
+_TESTBED_PATH_ALIAS = Path("/testbed")
+
+
 def _resolve_within_testbed(filepath: str) -> Path:
     """filepathをTESTBED_PATHを基準に解決し、その外に出ることを拒否する。"""
     root = _testbed_root()  # リポジトリのルートパスを取得
     candidate = Path(filepath)  # 与えられたパス文字列をPathオブジェクト化
-    resolved = candidate if candidate.is_absolute() else root / candidate  # 絶対パスならそのまま、相対パスならルートと結合
+    if candidate.is_absolute():
+        if candidate == _TESTBED_PATH_ALIAS:
+            resolved = root  # "/testbed"そのものはリポジトリルートを指す
+        elif _TESTBED_PATH_ALIAS in candidate.parents:
+            # "/testbed"配下のパスは、そのエイリアス部分を実際のrootに読み替える
+            resolved = root / candidate.relative_to(_TESTBED_PATH_ALIAS)
+        else:
+            resolved = candidate  # それ以外の絶対パスはそのまま扱う(後段でroot外チェックに掛かる)
+    else:
+        resolved = root / candidate  # 相対パスならルートと結合
     resolved = resolved.resolve()  # シンボリックリンクや".."などを解決した実パスに正規化
     if not _is_within(root, resolved):
         raise ValueError(f"'{filepath}' resolves outside the repository root {root}")  # 解決結果がルート外であれば拒否する

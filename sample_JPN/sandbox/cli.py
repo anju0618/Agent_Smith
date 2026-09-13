@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import argparse  # コマンドライン引数のパース用
 import json  # 設定ファイル(JSON)の読み込み用
+import os  # 起動時の環境変数をMCPサブプロセスへ引き継ぐため
+import re  # 空行の後に続く行がelse/elif/except/finallyかどうかの判定用
 import sys  # 標準エラー出力・終了コード制御用
 from pathlib import Path  # 設定ファイルパスの操作用
 from typing import Optional  # 省略可能な型ヒント用
@@ -37,7 +39,11 @@ def _connect_mcp(mcp_stdio: Optional[str], mcp_server: Optional[str]) -> Optiona
     # stdio経由のMCPサーバー起動コマンドが指定されていれば、そちらを優先して接続
     if mcp_stdio:
         print(f"Connecting to MCP server over stdio: {mcp_stdio}")
-        return MCPToolProxy(stdio_command=mcp_stdio)
+        # mcp SDKはenv=Noneだと安全な最小限のデフォルト環境変数しか子プロセスに渡さない
+        # (TESTBED_PATH等のカスタム変数は落ちる)。このCLIは任意のMCPサーバーに接続する
+        # 汎用エントリポイント(仕様書4.2節)なので、起動元プロセスの環境変数をそのまま
+        # 引き継ぐのが期待される動作(exam_sandbox.shのswebench_toolsテストが要求する挙動)。
+        return MCPToolProxy(stdio_command=mcp_stdio, env=dict(os.environ))
     # HTTP経由のMCPサーバーURLが指定されていればそちらに接続
     if mcp_server:
         print(f"Connecting to MCP server over streamable HTTP: {mcp_server}")
@@ -45,41 +51,88 @@ def _connect_mcp(mcp_stdio: Optional[str], mcp_server: Optional[str]) -> Optiona
     return None  # どちらも指定がなければMCP接続なし
 
 
+_CONTINUATION_RE = re.compile(r"^(else|elif|except|finally)\b")  # else/elif/except/finallyで始まる行の検出用
+
+
+def _leading_whitespace(line: str) -> int:
+    # 行の先頭にある空白文字(スペース・タブ)の個数を返す(インデント幅の比較に使う)
+    return len(line) - len(line.lstrip(" \t"))
+
+
+def _run_block(sandbox: Sandbox, code: str) -> None:
+    # 溜まったコードブロックをサンドボックスで実行し、結果(またはfinal_answer)を表示する共通処理
+    if not code.strip():
+        return  # 空・空白のみのコードは何もしない
+    try:
+        result = sandbox.run(code)  # サンドボックス内でコードを実行
+    except FinalAnswer as fa:
+        # final_answer()が呼ばれたら、その回答を表示して次の入力へ(REPLは終了しない)
+        print(f"[final_answer submitted] {fa.answer!r}")
+    else:
+        print(result)  # 実行結果(標準出力またはエラーメッセージ)を表示
+
+
 def repl(sandbox: Sandbox) -> None:
-    """REPL形式のCLIモード(仕様書 4.2節): コードを読み取り、空行で溜まったブロックを実行する。
-    'exit'入力またはEOF(Ctrl+D)できれいに終了する。"""
-    print("Agent Smith interactive sandbox. Blank line runs the block, 'exit' or Ctrl+D quits.")
+    """REPL形式のCLIモード(仕様書 4.2節): コードを1行ずつ読み取り、空行に達したら、
+    その直後(空行が連続していれば、その先)の非空行を1行だけ先読みしてブロックの
+    区切りを判定する。先読みした行が、いま溜めているブロックの先頭行より深く
+    インデントされているか、同じ深さのelse/elif/except/finallyであれば、まだ
+    同じブロックの続きとみなして取り込みを続ける。それ以外であれば、そこでブロックを
+    確定させて実行し、先読みした行は次のブロックの先頭として持ち越す。
+    こうすることで、if/try本体の途中に空行を挟んだインデント済み複数行ブロックも、
+    独立した複数のtry/except等が空行で区切られている場合も、どちらも正しく扱える。
+    'exit'入力またはEOF(Ctrl+D)できれいに終了する(その時点で溜まっている
+    ブロックがあれば、破棄せず実行してから終了する)。"""
+    print(
+        "Agent Smith interactive sandbox. Blank line runs the block (unless it's still open), "
+        "'exit' or Ctrl+D quits."
+    )
+    pending_line: Optional[str] = None  # 先読みの結果、次のブロックの先頭行として持ち越した行
     while True:
         lines: list = []  # 入力された行を溜めるバッファ
-        try:
-            first_line = input(">>> ")  # 最初の行を読み取る(プロンプトは">>> "を模倣)
-        except EOFError:
-            print()  # Ctrl+DでEOFになったら改行してから終了
-            return
-        if first_line.strip() == "exit":  # 'exit'と入力されたらREPLを終了
-            return
-        if first_line != "":
-            lines.append(first_line)  # 空行でなければバッファに追加
-            while True:
+        block_indent = 0  # このブロックの先頭行のインデント幅
+        while True:
+            if pending_line is not None:
+                line, pending_line = pending_line, None  # 持ち越された行があればそれを使う
+            else:
                 try:
-                    line = input("... ")  # 継続行を読み取る(継続プロンプト"... ")
+                    line = input("... " if lines else ">>> ")
                 except EOFError:
-                    print()  # 継続入力中にEOFなら改行して終了
+                    print()  # Ctrl+DでEOFになったら改行する
+                    # それまでに溜まった(不完全かもしれない)ブロックを、破棄せず実行してから終了する
+                    _run_block(sandbox, "\n".join(lines))
                     return
-                if line == "":
-                    break  # 空行が来たらブロックの入力終了とみなす
-                lines.append(line)  # 継続行をバッファに追加
-
-        code = "\n".join(lines)  # バッファ内の行を改行で連結して1つのコード文字列にする
-        if not code.strip():
-            continue  # 空コードなら何もせず次のループへ
-        try:
-            result = sandbox.run(code)  # サンドボックス内でコードを実行
-        except FinalAnswer as fa:
-            # final_answer()が呼ばれたら、その回答を表示して次の入力へ(REPLは終了しない)
-            print(f"[final_answer submitted] {fa.answer!r}")
-            continue
-        print(result)  # 実行結果(標準出力またはエラーメッセージ)を表示
+            if not lines and line.strip() == "exit":  # ブロックの先頭で'exit'と入力されたらREPLを終了
+                return
+            if line.strip() == "":
+                if not lines:
+                    continue  # ブロック開始前の空行は無視して次の入力を待つ
+                # 空行(の連続)の先にある最初の非空行を先読みして、ブロックが続くか判定する
+                blank_run = [line]
+                while True:
+                    try:
+                        peeked = input("... ")
+                    except EOFError:
+                        print()
+                        _run_block(sandbox, "\n".join(lines))
+                        return
+                    if peeked.strip() == "":
+                        blank_run.append(peeked)
+                        continue
+                    break
+                peeked_indent = _leading_whitespace(peeked)
+                if peeked_indent > block_indent or (
+                    peeked_indent == block_indent and _CONTINUATION_RE.match(peeked.strip())
+                ):
+                    lines.extend(blank_run)  # まだ同じブロックの続きなので空行ごと取り込む
+                    lines.append(peeked)
+                    continue
+                pending_line = peeked  # 別ブロックの先頭行なので次のブロックへ持ち越す
+                break  # 現在のブロックをここで確定させて実行へ
+            if not lines:
+                block_indent = _leading_whitespace(line)  # ブロック先頭行のインデント幅を記録
+            lines.append(line)  # 読み取った行をバッファに追加
+        _run_block(sandbox, "\n".join(lines))
 
 
 def main() -> None:
