@@ -16,6 +16,14 @@ Thought -> Code -> Observation loop:
 
 Rules:
 - Put ALL of your reasoning in the Thought section, in plain text.
+- Keep each Thought SHORT - 1 to 3 sentences. Long step-by-step reasoning
+  about edge cases burns your limited token budget without making progress;
+  when you need to check an edge case, write code and run it instead of
+  reasoning about it in prose.
+- EVERY turn must contain exactly one ```python ... ``` code block ending
+  with <end_code> - a turn with no code block makes zero progress and still
+  costs you tokens and an iteration. Never send a turn that is only
+  commentary, questions to yourself, or a plan for what to do next.
 - Put ALL executable code inside exactly one ```python ... ``` block per turn,
   and end that block with <end_code> on its own line. Do not put code anywhere else.
 - Variables you define persist between turns - you do not need to redefine them.
@@ -30,6 +38,12 @@ Rules:
   [Timeout], [MemoryLimitExceeded], or [TruncatedOutput], read the message
   carefully and adjust your next Code block accordingly - never repeat the
   exact same code after an error.
+- This "never repeat the exact same code" rule also applies to ANY failure,
+  not just the tagged sandbox errors above - including a failing test/assertion
+  (e.g. run_tests returning {"success": false}). Sending the identical code
+  again after it already failed wastes a full turn for zero new information;
+  you must change your actual logic, not just re-run it hoping for a
+  different result.
 """
 
 # MBPPベンチマーク向けの「最終解答の出し方」を説明する文字列
@@ -38,10 +52,24 @@ Call final_answer(code) exactly once, where `code` is a string containing the
 complete Python function that solves the task (matching the given function
 signature). Example: final_answer("def add(a, b):\\n    return a + b")
 
+Put every test case you can think of - including tricky edge cases like an
+empty string, a length-1 input, or duplicate values - into test_list on your
+FIRST call to run_tests, rather than testing one case, seeing it pass, and
+only adding more cases in a later turn. A bug that only shows up on an edge
+case is far cheaper to catch in the same run_tests call than in a follow-up
+turn you may not have the budget left for.
+
 As soon as run_tests(...) reports {"success": true}, call final_answer with
 that exact code immediately in your NEXT turn - do not re-verify a solution
 that already passed, and do not keep exploring alternatives. Every extra turn
 spends part of your limited token and iteration budget.
+
+FORBIDDEN pattern (do not do this): run_tests(...) returns {"success": true},
+and your next Thought is something like "Let's make sure it handles other
+edge cases before submitting" or "let's double check with another test case" -
+followed by yet more run_tests calls. That pattern alone has caused past runs
+to run out of token budget before ever calling final_answer, despite already
+having a correct solution. If the public tests passed, you are done - submit.
 """
 
 # SWE-benchベンチマーク向けの「最終解答の出し方」を説明する文字列
@@ -49,6 +77,15 @@ _SWEBENCH_FINAL_ANSWER = """\
 Call final_answer(get_patch()) exactly once, once you have verified your fix
 with run_tests(). get_patch() returns the unified git diff of every change you
 made to the repository - do not hand-write the patch yourself.
+
+Budget discipline: you have a hard limit on iterations. Spend at most the
+first third of your budget locating the relevant code (search_* / read_file).
+By the halfway point you should have already made an edit and run run_tests()
+at least once - if you are still only reading files and have not written any
+code by then, stop reading and make your best-guess edit now. Past runs have
+exhausted their entire iteration budget exploring the codebase without ever
+writing a single edit or calling run_tests(), which guarantees failure -
+an imperfect submitted patch beats no patch.
 """
 
 # MBPP向けの、Thought/Code/Observationループの具体例を示す文字列
