@@ -142,7 +142,13 @@ def main() -> None:
                 max_input_tokens=MAX_INPUT_TOKENS,  # 入力トークン数上限
                 max_output_tokens=MAX_OUTPUT_TOKENS,  # 出力トークン数上限
                 max_time_seconds=TIMEOUT_SECONDS - 10,  # 全体タイムアウトから後片付け余裕分の10秒を引いた値
-                max_tokens_per_request=400,  # 1リクエストあたりの最大出力トークン数
+                # 400だと、複数行のtest_listを引数にrun_tests()を呼ぶような、
+                # やや長めの正当な応答(例: shell_sort等の実装+テスト呼び出し)が
+                # 生成途中で打ち切られ、閉じられていない文字列リテラルによる
+                # SyntaxErrorで手番を無駄にすることが実運用で確認されたため、
+                # 打ち切りを避けられる程度に余裕を持たせる(累積上限1500に対して
+                # 数回分の再試行余地はまだ十分残る)。
+                max_tokens_per_request=800,  # 1リクエストあたりの最大出力トークン数
             ),
         )  # オーケストレータを生成しループ実行の準備をする
 

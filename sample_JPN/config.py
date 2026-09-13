@@ -69,16 +69,26 @@ class ProviderSpec:
 
 # 既知の無料枠プロバイダ一覧(Section 5.6.1 - あくまで例示であり網羅的ではない)。
 # 追加のプロバイダをサポートするには、ここにProviderSpecのエントリを追加する。
-# fallback_modelはBENCHMARK_REPORT.md(5モデル×3プロバイダの比較)で実際にタスクに
-# 合格した実績があるモデルのみを設定している。groq・fireworksは同レポートで
-# 429/400が続発し信頼できなかったため、自動フォールバック先には含めない
-# (依然としてCLIから明示的に--provider-urlで指定して使うことは可能)。
+# fallback_modelは実際に(BENCHMARK_REPORT.mdでの評価、または直接のAPI疎通確認で)
+# 動作確認済みのモデルのみを設定している。fireworksは過去のレポートで429/400が
+# 続発し信頼できなかったため自動フォールバック先には含めない(依然として
+# CLIから明示的に--provider-urlで指定して使うことは可能)。groqは過去のレポート
+# 時点では不安定だったが、SWE-bench examでの実障害調査時に再検証したところ
+# 安定して応答したため、フォールバック候補として復帰させている。
 KNOWN_PROVIDERS: List[ProviderSpec] = [
     ProviderSpec(
         "openrouter", "https://openrouter.ai/api/v1", "OPENROUTER_API_KEY", "openai_compatible",
-        fallback_model="minimax/minimax-m3:free",
+        # 以前はfallback_model="minimax/minimax-m3:free"だったが、OpenRouterがこの
+        # スロットを無料枠から外し有料専用にしたため常時404で全滅していた
+        # (実SWE-bench examで確認・再現済み)。OpenRouterの無料モデル一覧は
+        # 随時入れ替わるため、フォールバックはここが常に生きているかを
+        # 定期的に確認する必要がある。
+        fallback_model="nvidia/nemotron-3-super-120b-a12b:free",
     ),  # OpenRouter
-    ProviderSpec("groq", "https://api.groq.com/openai/v1", "GROQ_API_KEY", "openai_compatible"),  # Groq
+    ProviderSpec(
+        "groq", "https://api.groq.com/openai/v1", "GROQ_API_KEY", "openai_compatible",
+        fallback_model="openai/gpt-oss-120b",
+    ),  # Groq
     # Together AI
     ProviderSpec("together", "https://api.together.xyz/v1", "TOGETHER_API_KEY", "openai_compatible"),
     ProviderSpec(
