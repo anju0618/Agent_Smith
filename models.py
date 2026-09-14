@@ -1,15 +1,16 @@
-# ABOUTME: Student-facing Pydantic models for the moulinette evaluation contract.
-# ABOUTME: Students copy this file into their project — it defines the JSON schema the moulinette expects.
+
+
 from datetime import datetime
 from typing import List, Optional
+
 from pydantic import BaseModel, Field
 
 
 class StepMetrics(BaseModel):
     """Metrics for a single agent step.
 
-    Each step corresponds to one LLM generate → sandbox execute cycle.
-    All fields are required for evaluation — empty strings are acceptable
+    Each step corresponds to one LLM generate -> sandbox execute cycle.
+    All fields are required for evaluation - empty strings are acceptable
     for steps where a field doesn't apply (e.g., no sandbox execution).
     """
     step: int = Field(..., description="1-indexed iteration number")
@@ -26,7 +27,7 @@ class StepMetrics(BaseModel):
 
 
 class SolutionOutput(BaseModel):
-    """Output from student solution — required format for evaluation.
+    """Output from student solution - required format for evaluation.
 
     This is the JSON structure your agent must produce and write to solution.json.
     The moulinette validates this against task correctness and metrics limits.
@@ -40,7 +41,7 @@ class SolutionOutput(BaseModel):
     total_input_tokens: int = Field(..., description="Sum of input_tokens across all steps")
     total_output_tokens: int = Field(..., description="Sum of output_tokens across all steps")
     total_time_seconds: float = Field(..., description="Wall-clock time from agent start to finish")
-    steps: List[StepMetrics] = Field(default_factory=list, description="Per-step metrics — one entry per agent iteration")
+    steps: List[StepMetrics] = Field(default_factory=list, description="Per-step metrics - one entry per agent iteration")
     system_prompt: str = Field(default="", description="Full system prompt sent to the LLM (for provenance checking)")
     error: Optional[str] = Field(default=None, description="Error message if the agent failed (None if successful)")
     timestamp: str = Field(default_factory=lambda: datetime.now().isoformat(), description="ISO 8601 timestamp of when the solution was produced")
@@ -56,10 +57,11 @@ class SandboxConfig(BaseModel):
     allowed_directories: List[str] = Field(default_factory=list, description="List of filesystem paths the sandbox can access (e.g., ['/testbed', '/tmp/agent'])")
     max_execution_time_seconds: int = Field(default=30, description="Maximum wall-clock time for a single sandbox execution before timeout")
     max_memory_mb: int = Field(default=512, description="Maximum memory in megabytes for sandbox execution")
+    max_output_chars: int = Field(default=20_000, description="Maximum characters of sandbox stdout returned per execution before truncation (project-internal, not required by the moulinette)")
 
 
 class MBPPTaskInput(BaseModel):
-    """Input for an MBPP task — provided by the moulinette.
+    """Input for an MBPP task - provided by the moulinette.
 
     Your agent receives this as the task definition to solve.
     """
@@ -71,12 +73,12 @@ class MBPPTaskInput(BaseModel):
 
 
 class SWEBenchTaskInput(BaseModel):
-    """Input for a SWE-bench task — provided by the moulinette.
+    """Input for a SWE-bench task - provided by the moulinette.
 
     Your agent receives this and must produce a git patch that fixes the issue.
     """
     instance_id: str = Field(..., description="SWE-bench instance identifier (e.g., 'sympy__sympy-23534')")
-    problem_statement: str = Field(..., description="The GitHub issue description — what needs to be fixed")
+    problem_statement: str = Field(..., description="The GitHub issue description - what needs to be fixed")
     docker_image: str = Field(..., description="Full Docker image name to pull (e.g., 'swebench/sweb.eval.x86_64.sympy_1776_sympy-23534:latest')")
     eval_script: str = Field(..., description="Bash script to run inside the container to evaluate the patch")
     hints_text: str = Field(default="", description="Optional hints about the issue (may be empty)")

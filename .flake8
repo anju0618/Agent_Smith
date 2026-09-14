@@ -1,4 +1,3 @@
 [flake8]
-max-line-length = 100
-# models.py is distributed by the moulinette (student-facing contract), not our code.
-extend-exclude = .venv,moulinette,models.py
+max-line-length = 110
+extend-exclude = .venv,models.py

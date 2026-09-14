@@ -1,14 +1,16 @@
 [project]
 name = "agent-smith"
 version = "0.1.0"
-description = "Autonomous code agent framework for MBPP and SWE-bench"
+description = "Agent Smith agentic coding framework (MBPP + SWE-bench)"
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = "==3.10.*"
 
 dependencies = [
     "pydantic>=2.13.5",
     "python-dotenv>=1.2.3",
     "requests>=2.34.2",
+    "mcp>=1.2.0,<2",
+    "docker>=7.1.0",
 ]
 
 [dependency-groups]
@@ -30,7 +32,4 @@ module-name = "sandbox"
 module-root = ""
 
 [tool.pytest.ini_options]
-norecursedirs = [
-    "moulinette",
-    ".venv",
-]
+testpaths = ["tests"]
