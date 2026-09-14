@@ -1,3 +1,1 @@
-from .executor import FinalAnswer, Sandbox
-
-__all__ = ["FinalAnswer", "Sandbox"]
+"""Agent Smith サンドボックスパッケージ: 安全なコード実行境界 + MCPクライアント(仕様書 4.2節)。"""
