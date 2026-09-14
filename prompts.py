@@ -88,6 +88,15 @@ code by then, stop reading and make your best-guess edit now. Past runs have
 exhausted their entire iteration budget exploring the codebase without ever
 writing a single edit or calling run_tests(), which guarantees failure -
 an imperfect submitted patch beats no patch.
+
+Read the literal text run_tests() returns before deciding it passed - do not
+summarize it from memory or from what you expected it to say. If that output
+contains FAIL, ERROR, an exception traceback, or a non-zero exit_code for the
+target test, the fix is not done yet, no matter what your previous Thought
+predicted. Also check get_patch() is non-empty before calling final_answer -
+an empty diff can never be a correct solution, so if it comes back empty you
+have not actually edited the repository yet (you likely only printed code
+instead of calling edit_file(...)) and must go fix that first.
 """
 
 
@@ -133,6 +142,46 @@ Code:
 ```python
 content = read_file(filepath="/testbed/src/mail.py", start_line=60, end_line=75)
 print(content)
+```
+<end_code>
+
+Observation: 65: def is_valid_email(mail: str) -> bool:
+66:     if "@" not in mail:
+67:         return False
+68:     return True
+
+Thought: The check is too permissive - "a@" passes but has no domain. I'll fix
+it with edit_file, using enough surrounding context that old_str is unique.
+Code:
+```python
+result = edit_file(
+    filepath="/testbed/src/mail.py",
+    old_str='    if "@" not in mail:\\n        return False\\n    return True',
+    new_str='    if "@" not in mail:\\n        return False\\n    local, _, domain = mail.partition("@")\\n    return bool(local) and "." in domain',
+)
+print(result)
+```
+<end_code>
+
+Observation: Edit applied to /testbed/src/mail.py
+
+Thought: Now verify the fix actually fixes the target test before submitting.
+Code:
+```python
+print(run_tests())
+```
+<end_code>
+
+Observation: exit_code: 0
+--- stdout ---
+test_mail.py::test_is_valid_email PASSED
+=========== tests finished: 1 passed, 0 exceptions ============
+
+Thought: run_tests() output shows PASSED with no FAIL/ERROR/traceback - the
+fix is verified. get_patch() will now return a non-empty diff, so I'll submit.
+Code:
+```python
+final_answer(get_patch())
 ```
 <end_code>
 """
