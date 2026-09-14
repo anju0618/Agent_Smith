@@ -8,6 +8,7 @@ Section 4.1: LLMごとに学習されているツール呼び出しの慣習が�
 """
 from __future__ import annotations
 
+import ast
 import json
 import re
 from dataclasses import dataclass
@@ -30,6 +31,36 @@ _JSON_TOOLCALL_RE = re.compile(r"<tool_call>\s*(\{.*?\})\s*</tool_call>", re.DOT
 
 
 _REACT_RE = re.compile(r"Action:\s*(\S+)\s*\nAction Input:\s*(\{.*?\}|\S.*)", re.DOTALL)
+
+
+_MISSING_PARENS_CALL_RE = re.compile(
+    r"^(?P<name>[A-Za-z_][A-Za-z0-9_]*)\s+"
+    r"(?P<arg>'''(?:.|\n)*?'''|\"\"\"(?:.|\n)*?\"\"\"|'(?:[^'\\]|\\.)*'|\"(?:[^\"\\]|\\.)*\")\s*$",
+    re.DOTALL,
+)
+
+
+def _repair_missing_call_parens(code: str) -> Optional[str]:
+    """`final_answer '''...'''`のように、関数呼び出しの丸括弧を丸ごと忘れた
+    コードを`final_answer('''...''')`へ書き直す。
+
+    `<identifier> <文字列リテラル>`という並びは、それ単体の文としてはPythonの
+    文法上どうやっても有効になり得ない(丸括弧なしにこの形で構文的に妥当な
+    Python文は存在しない)ため、これを検出したら常に修復して構わない -
+    既に妥当なコードを誤って壊す余地がない。実例: `run_tests(...)`で既に
+    正解だと確認済みの解答が、`final_answer(code)`ではなく`final_answer code`
+    という書き方のせいでSyntaxErrorになり、そのままMBPPの小さいトークン予算を
+    使い切って不合格になったケースがあった。
+    """
+    match = _MISSING_PARENS_CALL_RE.match(code.strip())
+    if not match:
+        return None
+    repaired = f"{match.group('name')}({match.group('arg')})"
+    try:
+        ast.parse(repaired)
+    except SyntaxError:
+        return None
+    return repaired
 
 
 @dataclass
@@ -124,7 +155,17 @@ def extract_code(llm_output: str) -> ExtractionResult:
 
     match = _PYTHON_FENCE_RE.search(llm_output)
     if match:
-        return ExtractionResult(code=match.group(1).strip(), note="")
+        code = match.group(1).strip()
+        repaired = _repair_missing_call_parens(code)
+        if repaired is not None:
+            return ExtractionResult(
+                code=repaired,
+                note=(
+                    "[FormatConverted] The call was missing its parentheses "
+                    f"(`{code.splitlines()[0]}` has no `(...)`); added them before execution."
+                ),
+            )
+        return ExtractionResult(code=code, note="")
 
 
     unclosed = _UNCLOSED_FENCE_RE.search(llm_output)
@@ -163,6 +204,22 @@ def extract_code(llm_output: str) -> ExtractionResult:
                 "used the first generic fenced block instead."
             ),
         )
+
+
+    stripped = llm_output.strip()
+    if stripped:
+        try:
+            ast.parse(stripped)
+        except SyntaxError:
+            pass
+        else:
+            return ExtractionResult(
+                code=stripped,
+                note=(
+                    "[FormatConverted] No code fence at all was found, but the entire "
+                    "response is valid Python on its own; ran it directly."
+                ),
+            )
 
 
     return ExtractionResult(
