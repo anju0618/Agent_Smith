@@ -111,8 +111,33 @@ KNOWN_PROVIDERS: List[ProviderSpec] = [
 ]
 
 
-DEFAULT_MODEL_NAME = "gemini-flash-lite-latest"
-DEFAULT_PROVIDER_URL = "https://generativelanguage.googleapis.com/v1beta"
+def _cloudflare_default_provider_url() -> Optional[str]:
+    """設定済みのCLOUDFLARE_ACCOUNT_IDから、Workers AIのbase URLを組み立てる。
+
+    アカウントIDはユーザー固有の識別子であり、ソースコードに直接ハードコード
+    すべきではない(config.py自身の設計思想: 認証情報・識別子は環境変数から)。
+    そのため文字列リテラルとしては埋め込まず、環境変数が設定されている場合に
+    限って動的に組み立てる。未設定の環境ではNoneを返し、呼び出し元は
+    Google AI Studioへフォールバックする。
+    """
+    account_id = os.environ.get("CLOUDFLARE_ACCOUNT_ID")
+    if not account_id:
+        return None
+    return f"https://api.cloudflare.com/client/v4/accounts/{account_id}/ai/v1"
+
+
+_CLOUDFLARE_URL = _cloudflare_default_provider_url()
+
+if _CLOUDFLARE_URL and os.environ.get("CLOUDFLARE_API_KEY"):
+    # BENCHMARK_REPORT.mdの計測結果(12モデル×6プロバイダ、独立検証済み)で
+    # 総合成績1位タイ・かつSWE-bench合格1件あたりのトークン消費が他モデルの
+    # 4~6分の1と圧倒的に効率が良かったモデル。CLOUDFLARE_ACCOUNT_IDが
+    # 設定されている環境でのみ既定値として使う。
+    DEFAULT_MODEL_NAME = "@cf/meta/llama-3.3-70b-instruct-fp8-fast"
+    DEFAULT_PROVIDER_URL = _CLOUDFLARE_URL
+else:
+    DEFAULT_MODEL_NAME = "gemini-flash-lite-latest"
+    DEFAULT_PROVIDER_URL = "https://generativelanguage.googleapis.com/v1beta"
 
 
 def _env_var_from_url(base_url: str) -> str:
