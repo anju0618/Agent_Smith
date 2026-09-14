@@ -483,15 +483,22 @@ class Sandbox:
                 signal.signal(signal.SIGALRM, previous_handler)
 
     def _truncate(self, text: str) -> str:
-
+        """先頭だけを残すと、長い出力の末尾に出るテスト結果や例外が消えてしまう
+        (例: SWE-benchのeval.shはgit diffなどの前置きノイズの後、末尾で
+        ようやくpytestのPASSED/FAILEDを出す)。末尾を手厚く残しつつ先頭にも
+        少し文脈を残す。
+        """
         limit = self.config.max_output_chars
         if len(text) <= limit:
             return text
         omitted = len(text) - limit
+        head = limit // 4
+        tail = limit - head
         return (
-            text[:limit]
-            + f"\n[TruncatedOutput] {omitted} additional characters were cut off "
-            f"(output limit: {limit} chars)."
+            text[:head]
+            + f"\n[TruncatedOutput] {omitted} chars omitted - kept head+tail; the "
+            f"tail usually holds the test result/traceback (output limit: {limit} chars).\n"
+            + text[-tail:]
         )
 
     def close(self) -> None:

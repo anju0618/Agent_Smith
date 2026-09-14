@@ -60,14 +60,26 @@ def _cap_output(text: str) -> str:
     壊されてしまう - 本当に「最小限の修正」であるパッチは現実的には十分小さいはずであり、
     途中経過を確認するために出力する場合でも、サンドボックス自体のstdout切り詰め
     (sandbox/executor.pyの[TruncatedOutput])によって既に制限されている。
+
+    先頭だけを残す単純な切り詰めは行わない: run_tests()が呼び出すeval.shは
+    `git status`/`git show`/`git diff <base_commit>`のような大量のノイズを最初に
+    出力してから、末尾でようやくpytestのPASSED/FAILEDや例外トレースバックを出す
+    構成になっているため、先頭だけ残すと肝心のテスト結果が毎回消えてしまう
+    (実例: scikit-learn__scikit-learn-13439ではdockerイメージ内のファイル権限が
+    git記録と食い違い、`git diff`だけで上限を使い切ってpytestの出力が完全に
+    見えなくなった)。末尾を手厚く残しつつ先頭にも少し余地を残すことで、冒頭の
+    文脈と末尾の結果の両方が見えるようにする。
     """
     if len(text) <= TOOL_OUTPUT_LIMIT_CHARS:
         return text
     omitted = len(text) - TOOL_OUTPUT_LIMIT_CHARS
+    head_chars = TOOL_OUTPUT_LIMIT_CHARS // 4
+    tail_chars = TOOL_OUTPUT_LIMIT_CHARS - head_chars
     return (
-        text[:TOOL_OUTPUT_LIMIT_CHARS]
-        + f"\n[TruncatedToolOutput] {omitted} additional characters were cut off "
-        f"(tool output limit: {TOOL_OUTPUT_LIMIT_CHARS} chars)."
+        text[:head_chars]
+        + f"\n[TruncatedToolOutput] {omitted} chars omitted - kept head+tail; the "
+        "tail usually holds the test result/traceback.\n"
+        + text[-tail_chars:]
     )
 
 
