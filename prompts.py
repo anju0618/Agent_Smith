@@ -50,7 +50,9 @@ Rules:
 _MBPP_FINAL_ANSWER = """\
 Call final_answer(code) exactly once, where `code` is a string containing the
 complete Python function that solves the task (matching the given function
-signature). Example: final_answer("def add(a, b):\\n    return a + b")
+signature). Write `code` as a triple-quoted string. Example:
+final_answer('''def add(a, b):
+    return a + b''')
 
 Put every test case you can think of - including tricky edge cases like an
 empty string, a length-1 input, or duplicate values - into test_list on your
@@ -95,7 +97,8 @@ Example turn:
 Thought: I'll write the function and check it against the public tests before submitting.
 Code:
 ```python
-code = "def add(a, b):\\n    return a + b"
+code = '''def add(a, b):
+    return a + b'''
 print(run_tests(code=code, test_list=["assert add(2, 3) == 5", "assert add(-1, 1) == 0"]))
 ```
 <end_code>
@@ -105,7 +108,8 @@ Observation: {"success": true, "output": ""}
 Thought: All public tests passed. I'm confident in this solution.
 Code:
 ```python
-final_answer("def add(a, b):\\n    return a + b")
+final_answer('''def add(a, b):
+    return a + b''')
 ```
 <end_code>
 """
