@@ -87,6 +87,27 @@ KNOWN_PROVIDERS: List[ProviderSpec] = [
         "gemini",
         fallback_model="gemini-flash-lite-latest",
     ),
+    ProviderSpec(
+        "cohere",
+        "https://api.cohere.ai/compatibility/v1",
+        "COHERE_API_KEY",
+        "openai_compatible",
+        fallback_model="command-r7b-12-2024",
+    ),
+    ProviderSpec(
+        "cloudflare",
+        f"https://api.cloudflare.com/client/v4/accounts/{os.environ.get('CLOUDFLARE_ACCOUNT_ID', '')}/ai/v1",
+        "CLOUDFLARE_API_KEY",
+        "openai_compatible",
+        fallback_model="@cf/meta/llama-3.3-70b-instruct-fp8-fast",
+    ),
+    ProviderSpec(
+        "huggingface",
+        "https://router.huggingface.co/v1",
+        "HUGGINGFACE_API_KEY",
+        "openai_compatible",
+        fallback_model="meta-llama/Llama-3.1-8B-Instruct",
+    ),
 ]
 
 
