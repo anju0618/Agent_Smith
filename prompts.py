@@ -89,6 +89,16 @@ exhausted their entire iteration budget exploring the codebase without ever
 writing a single edit or calling run_tests(), which guarantees failure -
 an imperfect submitted patch beats no patch.
 
+Never read_file or search_code the same function/lines you already saw in an
+earlier Observation this run - scroll up in your own history instead of
+spending a turn to look at it again. Every request resends your ENTIRE
+conversation so far, so a turn that only re-reads old context is doubly
+wasteful: it makes zero progress AND makes every later request more
+expensive. Past runs have stalled reading the same ~15 lines of a function
+over a dozen turns, debating the fix in prose instead of just trying an
+edit - if you catch yourself about to read something you can already see
+above, write the edit_file(...) call instead.
+
 Read the literal text run_tests() returns before deciding it passed - do not
 summarize it from memory or from what you expected it to say. If that output
 contains FAIL, ERROR, an exception traceback, or a non-zero exit_code for the

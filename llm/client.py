@@ -19,6 +19,22 @@ from llm.providers.gemini import GeminiProvider
 from llm.providers.openai_compatible import OpenAICompatibleProvider
 
 
+class _EmptyGenerationError(RuntimeError):
+    """generate()内部だけで使う、200 OKだが本文が空だった応答を再試行させるための印。
+
+    観測された実例(Gemini, `finishReason: MALFORMED_FUNCTION_CALL`): システム
+    プロンプト中のツールのdocstringが関数呼び出しのように見えるため、モデルが
+    ネイティブのfunction callを試みて失敗し、`candidatesTokenCount`は0でない
+    (課金・カウント対象のトークンを実際に生成した)のに、可視テキストのpartが
+    一切返らないことがある。これをそのままオーケストレータに返すと、
+    `[NoCodeBlock]`という進展のないObservationのために丸ごと1イテレーションと
+    会話履歴の肥大化を消費してしまう(実際にMBPPタスクでこれが2ターン連続発生し、
+    予算切れで失敗の原因になった)。レート制限などの既存の例外ベースの再試行と
+    同じフローに乗せることで、この分は同じLLMリクエストの中で吸収し、
+    エージェント自身のイテレーション予算を消費させない。
+    """
+
+
 class AllProvidersExhaustedError(RuntimeError):
     """1回のgenerate()呼び出しで、設定された全てのAPIキー/プロバイダが失敗した場合に送出される。
 
@@ -154,10 +170,15 @@ class LLMClient:
                             max_output_tokens=max_output_tokens,
                             timeout=self.request_timeout,
                         )
+                        if not result.text.strip():
+                            raise _EmptyGenerationError(
+                                f"{slot.spec.name}/{slot.model_name} returned an empty "
+                                f"completion (output_tokens={result.output_tokens})"
+                            )
                         result.retries = retries
                         self.usage.record(result)
                         return result
-                    except (requests.RequestException, KeyError, IndexError) as exc:
+                    except (requests.RequestException, KeyError, IndexError, _EmptyGenerationError) as exc:
 
                         last_error = exc
                         retries += 1
