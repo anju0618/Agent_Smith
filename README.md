@@ -1,6 +1,32 @@
 *This project has been created as part of the 42 curriculum by \<amakino\>, \<takawaka\>.*
 
+<div align="center">
+
 # Agent Smith
+
+```
+⠀⠀⠀⠀⠀⠀⣀⣤⣴⣶⣶⣦⣤⡀⠀⠀⠀⠀⠀⠀⠀
+⠀⠀⠀⢀⣴⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣦⣄⠀⠀⠀
+⠀⠀⢀⣾⣿⣿⣿⠿⣿⣿⣿⣿⣿⣿⠿⣿⣿⣿⣷⡀⠀
+⠀⠀⢸⣿⣿⠋⠀⠀⠸⠿⠿⠿⠿⠇⠀⠀⠙⢿⣿⡇⠀
+⠀⠀⢸⣿⠇⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠘⣿⡇⠀
+⠀⠀⢸⣿⠠⣤⣄⣀⠀⠀⠀⠀⠀⠀⣀⣠⣤⠀⣿⡇⠀
+⠀⠀⣸⣿⣠⣴⣿⣿⣿⣷⣄⣠⣾⣿⣿⣿⣦⣄⣿⣇⠀
+⣠⣼⣿⣿⢹⣿⣿⣿⣿⡿⠉⠉⢿⣿⣿⣿⣿⡇⣿⣿⡇
+⣿⣿⣿⣿⠀⠈⠉⠁⠀⠀⠀⠀⠀⠀⠉⠉⠁⠀⣿⣿⠇
+⢸⡇⢹⣿⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⣿⡏⠀
+⢸⡇⢸⣿⠀⠀⠀⠀⢠⣤⣶⣶⣦⡄⠀⠀⠀⠀⣿⡇⠀
+⢸⡇⠘⢿⣷⣄⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⣠⣾⡿⠃⠀
+⢸⣇⠀⠈⢻⣿⣷⣤⡀⠀⠀⠀⠀⢀⣴⣾⣿⡏⠀⠀⠀
+⠀⠻⢷⣦⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⡄⠀⠀
+⠀⠀⠀⠸⠿⠿⠿⠿⠿⠏⠀⠀⠙⠿⠿⠿⠿⠿⠇⠀⠀
+```
+
+> *"Human beings are a disease, a cancer of this planet. You're a plague and we are the cure."*
+>
+> — Agent Smith, *The Matrix*
+
+</div>
 
 ## Description
 
@@ -23,6 +49,66 @@ Needs Linux `unshare`+`bubblewrap`; missing them fails the sandbox closed,
 never falls back to an in-process runner. Task files come from moulinette
 (`moulinette_eval dump mbpp/swebench`). `solution.json` is always written,
 even on failure.
+
+## Running the exam scripts & moulinette
+
+`exams.zip`/`moulinette.zip` (already sitting next to this repo, one
+directory up) unzip into the layout the exam scripts expect: this repo is
+the "student" project, and `exams/`/`moulinette/` are **sibling**
+directories, not subfolders of this repo. Keep it that way — the
+anti-cheat check greps everything under `--student-path` recursively, so
+extracting `moulinette/` *inside* this repo makes it flag moulinette's own
+code as if it were yours.
+
+```sh
+# one-time setup, run from the parent directory of this repo
+cd ..
+unzip -n moulinette.zip && unzip -n exams.zip
+cd moulinette && uv sync && cd ../Agent_Smith
+cp .env.example .env   # fill in real API keys
+```
+
+Layout after that:
+
+```
+42cadet/
+├── Agent_Smith/   (this repo == "student")
+├── exams/         (unzipped exams.zip)
+└── moulinette/    (unzipped moulinette.zip)
+```
+
+### Exam scripts (run from inside this repo)
+
+```sh
+../exams/exam_sandbox.sh   --student-path . --moulinette-path ../moulinette --env-file .env   # ~2 min
+../exams/exam_anticheat.sh --student-path .                                                    # ~10 sec
+../exams/exam_mbpp.sh      --student-path . --moulinette-path ../moulinette --env-file .env   # ~5 min
+../exams/exam_swebench.sh  --student-path . --moulinette-path ../moulinette --env-file .env   # ~45 min, needs Docker running
+```
+
+Results land in `../evaluations/<sandbox|mbpp|swebench>/<timestamp>/`.
+See `../exams/exam_scripts_instructions.md` for what each script checks and
+how to interpret a failure.
+
+### Moulinette directly (dump / run-agent / validate / display)
+
+```sh
+cd ../moulinette
+uv run moulinette_eval dump mbpp --task-id 42 --output ../Agent_Smith/cache/mbpp_task.json
+cd ../Agent_Smith
+uv run python -m agent_mbpp --task-file cache/mbpp_task.json --output cache/mbpp_solution.json
+cd ../moulinette
+uv run moulinette_eval validate mbpp ../Agent_Smith/cache/mbpp_task.json ../Agent_Smith/cache/mbpp_solution.json
+uv run moulinette_eval display ../Agent_Smith/cache/mbpp_solution.json
+```
+
+Or the one-shot wrapper (dump → run-agent → validate for a single task):
+
+```sh
+cd ../moulinette
+./quickstart.sh mbpp     --student-path ../Agent_Smith --model-name "qwen/qwen3.8-27b" --provider-url "https://api.groq.com/openai/v1"
+./quickstart.sh swebench --student-path ../Agent_Smith --model-name "minimax/minimax-m3:free" --provider-url "https://openrouter.ai/api/v1"
+```
 
 ## System architecture
 
@@ -97,6 +183,13 @@ Observation)を回して課題を解く自律エージェントです。MBPP(短
 
 - **使い方**: `uv sync` で依存関係を入れ、`.env` にAPIキーを設定。
   `uv run sandbox` で対話型サンドボックスを試せます。
+- **exam / moulinette の動かし方**: `moulinette.zip`/`exams.zip` はこのリポジトリの
+  一つ上の階層に展開し(`exams/`・`moulinette/`をこのリポジトリの**兄弟**ディレクト
+  リにする。中に入れるとanti-cheatチェックがmoulinette自身のコードを誤検知する)、
+  `cd ../moulinette && uv sync` を実行。採点スクリプトは
+  `../exams/exam_sandbox.sh --student-path . --moulinette-path ../moulinette --env-file .env`
+  のようにこのリポジトリ直下から呼び出す(詳細コマンドは上の英語セクション
+  "Running the exam scripts & moulinette" を参照)。
 - **アーキテクチャ**: Orchestrator(`orchestrator.py`)がLLM呼び出し→コード抽出
   →サンドボックス実行→観察結果のフィードバックを繰り返します。ツール呼び出しの
   フォーマット違い(XML/JSON/ReAct等)は`code_extraction.py`が吸収し、サンドボッ

@@ -56,6 +56,13 @@ def _serialized_message_bytes(messages: List[dict]) -> int:
     return len(serialized.encode("utf-8"))
 
 
+_ESTIMATED_BYTES_PER_TOKEN = 3
+"""英語主体のプロンプト/コードのUTF-8バイト長をトークン数に変換する際の目安。
+実際のトークナイザは概ね1トークンあたり3~4バイト(英語散文やコード)なので、
+3を使えばまだ余裕を残しつつ、1バイト=1トークン(4倍近い過大評価)より遥かに
+現実的な見積もりになる。"""
+
+
 def _conservative_input_token_bound(
     current_message_bytes: int,
     previous_message_bytes: Optional[int],
@@ -63,17 +70,18 @@ def _conservative_input_token_bound(
 ) -> int:
     """次回のチャット入力に対する、プロバイダに依存しない安全側の上限トークン数を返す。
 
-    対応しているプロバイダはバイト列またはUnicodeテキストからトークン化を行うため、
-    UTF-8バイト長に小さな余裕(エンベロープ分)を足したものが最初のリクエストを
-    安全に見積もる上限となる。それ以降のリクエストでは、プロバイダが返した直前の
-    正確なトークン数を再利用し、新たに増えたバイト1つにつき最大1トークンを加算する。
-    これにより、変化していないプロンプト部分に毎回バイト単位の最悪見積もりを
-    適用することなく、安全側の見積もりを維持できる。
+    実際のトークン数がまだ分からない最初のリクエストでは、UTF-8バイト長を
+    `_ESTIMATED_BYTES_PER_TOKEN`で割った値に余裕(エンベロープ分)を足したものを
+    見積もりとして使う(1バイト=1トークン扱いだと英語テキストで3~4倍も過大評価し、
+    実際にはトークン予算に十分余裕があるタスクまで即座に失敗させてしまう)。
+    それ以降のリクエストでは、プロバイダが返した直前の正確なトークン数を再利用し、
+    新たに増えたバイト分だけ同じ比率でトークンを加算する。これにより、変化していない
+    プロンプト部分に毎回見積もりを適用することなく、安全側の見積もりを維持できる。
     """
     if previous_message_bytes is None or previous_input_tokens is None:
-        return current_message_bytes + 32
+        return current_message_bytes // _ESTIMATED_BYTES_PER_TOKEN + 32
     added_bytes = max(0, current_message_bytes - previous_message_bytes)
-    return previous_input_tokens + added_bytes + 16
+    return previous_input_tokens + added_bytes // _ESTIMATED_BYTES_PER_TOKEN + 16
 
 
 class Orchestrator:
