@@ -45,12 +45,10 @@ class OrchestratorConfig:
     stop_sequences: List[str] = field(default_factory=lambda: ["<end_code>"])
     max_tokens_per_request: int = 1024
 
-
     budget_warning_threshold: float = 0.35
 
 
 def _serialized_message_bytes(messages: List[dict]) -> int:
-
 
     serialized = json.dumps(messages, ensure_ascii=False, separators=(",", ":"))
     return len(serialized.encode("utf-8"))
@@ -205,8 +203,24 @@ class Orchestrator:
                         f"{extraction.note}\n{sandbox_output}" if extraction.note else sandbox_output
                     )
                 except FinalAnswer as fa:
-                    final_answer_raised = fa
-                    observation = f"[FinalAnswer submitted] {fa.answer!r}"
+                    answer_text = "" if fa.answer is None else str(fa.answer)
+                    if answer_text.strip():
+                        final_answer_raised = fa
+                        observation = f"[FinalAnswer submitted] {fa.answer!r}"
+                    else:
+                        # 実運用で観測された失敗パターン(例: sympy-14711)への対処:
+                        # モデルがedit_file()で実際には何も変更しないまま
+                        # final_answer(get_patch())を呼び、空文字列を提出することがある。
+                        # 空の提出は絶対に正解になり得ない(MBPP・SWE-bench双方とも)ため、
+                        # ここでラウンドを即終了させず却下し、残っている反復予算の中で
+                        # 実際の変更を行うよう再度促す。
+                        observation = (
+                            "[FinalAnswer rejected] Empty submission - this can never be "
+                            "a correct solution. Make an actual change first (edit_file(...) "
+                            "for SWE-bench, or write out the function body for MBPP), verify "
+                            "it with run_tests(), then call final_answer(...) again with the "
+                            "real result."
+                        )
 
             if final_answer_raised is None:
 

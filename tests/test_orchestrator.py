@@ -80,6 +80,24 @@ def test_final_answer_ends_the_loop_successfully() -> None:
     assert result.total_output_tokens == 20
 
 
+def test_empty_final_answer_is_rejected_and_loop_continues() -> None:
+
+    llm_client = _ScriptedLLMClient(
+        [
+            'Thought: done\nCode:\n```python\nfinal_answer("")\n```\n<end_code>',
+            'Thought: retry\nCode:\n```python\nfinal_answer("def f():\\n    return 1")\n```\n<end_code>',
+        ]
+    )
+    orchestrator = _build_orchestrator(llm_client)
+    result = orchestrator.run("1", "swebench", "solve this task")
+
+    assert result.success is True
+    assert result.solution == "def f():\n    return 1"
+    assert result.iterations == 2
+    assert "[FinalAnswer rejected]" in result.steps[0].sandbox_output
+    assert "[FinalAnswer submitted]" in result.steps[1].sandbox_output
+
+
 def test_max_iterations_reached_without_final_answer() -> None:
 
     llm_client = _ScriptedLLMClient(
@@ -141,7 +159,6 @@ class _ShutdownOnSecondCallLLMClient:
 
 def test_shutdown_requested_during_llm_call_preserves_partial_steps() -> None:
 
-
     llm_client = _ShutdownOnSecondCallLLMClient(
         "Thought: x\nCode:\n```python\nprint(1)\n```\n<end_code>"
     )
@@ -156,7 +173,6 @@ def test_shutdown_requested_during_llm_call_preserves_partial_steps() -> None:
 
 
 def test_request_stop_raises_shutdown_requested_immediately() -> None:
-
 
     orchestrator = _build_orchestrator(_ScriptedLLMClient([]))
 
@@ -246,7 +262,6 @@ class _OutputLimitCapturingLLMClient:
 
 
 def test_output_request_is_clamped_to_remaining_hard_limit() -> None:
-
 
     llm_client = _OutputLimitCapturingLLMClient()
     orchestrator = _build_orchestrator(

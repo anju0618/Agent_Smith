@@ -256,6 +256,28 @@ on unrelated exploration. The one clear outlier was `cohere/command-r7b-12-2024`
 on `django-11066`, first touching the right file at step 17 of 20 (it still
 scraped a pass, but with almost no margin).
 
+**Partial progress** (step at which `run_tests()`'s reported failure count
+first drops below its first-observed value within the same run): only
+measurable where the eval script's raw output survived the output-truncation
+cap (§5.1) long enough to still contain a parseable summary line. Of the 48
+SWE-bench runs, 22 had at least one `run_tests()` call whose summary was
+still intact after truncation — almost all of them `django-11066`, whose
+unittest summary (`Ran N tests` / `FAILED (failures=X)`) is short enough to
+survive; `sympy-14711`/`scikit-learn-13439`/`xarray-4629` all run pytest,
+whose verbose per-test summary line sits deep enough in the output that
+truncation usually removes it even when the patch itself is fine (a real
+limitation of this analysis, not evidence about the models). Of the 22
+parseable runs, 20 already showed 0 failures on the very first `run_tests()`
+call — consistent with the exploration-efficiency finding above: a model that
+ends up passing tends to only call `run_tests()` once it already believes the
+fix is right, so there is rarely a multi-step "failures gradually decrease"
+trajectory to observe. Of the 2 runs with a non-zero baseline:
+`groq/qwen3.8-27b` on `django-11066` genuinely improved, from 1 failure at
+step 4 to 0 by step 7; `openrouter/gemma-4-31b-it` on the same task called
+`run_tests()` exactly once (1 failure of 4 tests, step 5) and never again —
+it never made a second attempt, matching this model's 0/4 verified SWE-bench
+record.
+
 **Submission discipline** (idle steps between the last passing `run_tests()`
 observation and `final_answer()`): overwhelmingly disciplined — the mode is
 **1 idle step** (call `run_tests()`, see it pass, submit next turn) across
