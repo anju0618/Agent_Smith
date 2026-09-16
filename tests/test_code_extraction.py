@@ -21,6 +21,23 @@ def test_unclosed_python_fence_is_salvaged() -> None:
     assert "[MalformedCodeBlock]" in result.note
 
 
+def test_closed_fence_missing_call_parens_is_repaired() -> None:
+
+    text = "Code:\n```python\nfinal_answer '''def add(a, b):\n    return a + b'''\n```\n<end_code>"
+    result = extract_code(text)
+    assert result.code == "final_answer('''def add(a, b):\n    return a + b''')"
+    assert "[FormatConverted]" in result.note
+
+
+def test_unclosed_fence_missing_call_parens_is_repaired() -> None:
+
+    text = "Code:\n```python\nfinal_answer '''def add(a, b):\n    return a + b'''\n"
+    result = extract_code(text)
+    assert result.code == "final_answer('''def add(a, b):\n    return a + b''')"
+    assert "[FormatConverted]" in result.note
+    assert "never closed" in result.note
+
+
 def test_xml_invoke_is_converted() -> None:
 
     text = (

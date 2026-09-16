@@ -169,8 +169,20 @@ def extract_code(llm_output: str) -> ExtractionResult:
 
     unclosed = _UNCLOSED_FENCE_RE.search(llm_output)
     if unclosed:
+        code = unclosed.group(1).strip()
+        repaired = _repair_missing_call_parens(code)
+        if repaired is not None:
+            return ExtractionResult(
+                code=repaired,
+                note=(
+                    "[FormatConverted] The call was missing its parentheses "
+                    f"(`{code.splitlines()[0]}` has no `(...)`); added them before execution. "
+                    "(The ```python fence was also never closed with ``` or <end_code>; the "
+                    "rest of the response was used as the code anyway.)"
+                ),
+            )
         return ExtractionResult(
-            code=unclosed.group(1).strip(),
+            code=code,
             note=(
                 "[MalformedCodeBlock] The ```python fence was never closed with ``` or "
                 "<end_code>; the rest of the response was used as the code anyway."
