@@ -40,7 +40,6 @@ def _connect_mcp(mcp_stdio: Optional[str], mcp_server: Optional[str]) -> Optiona
     if mcp_stdio:
         print(f"Connecting to MCP server over stdio: {mcp_stdio}")
 
-
         return MCPToolProxy(stdio_command=mcp_stdio, env=dict(os.environ))
 
     if mcp_server:

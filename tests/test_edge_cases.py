@@ -19,7 +19,6 @@ def test_extraction_handles_empty_and_whitespace_only_output() -> None:
 
 def test_extraction_rejects_malformed_alternate_formats() -> None:
 
-
     assert extract_code("<tool_call>{bad}</tool_call>").code is None
 
     result = extract_code('Action: search_code\nAction Input: {"bad"}')
@@ -39,13 +38,11 @@ def test_extraction_preserves_json_null_boolean_and_numbers() -> None:
 
 def test_provider_url_normalization_and_environment_name() -> None:
 
-
     assert resolve_provider("https://api.groq.com/openai/v1/").name == "groq"
     assert _env_var_from_url("https://example.com:8443/api") == "EXAMPLE_COM_8443_API_KEY"
 
 
 def test_provider_key_collection_stops_at_first_missing_key(monkeypatch: pytest.MonkeyPatch) -> None:
-
 
     monkeypatch.setenv("EDGE_KEY", "one")
     monkeypatch.setenv("EDGE_KEY_3", "three")
@@ -53,7 +50,6 @@ def test_provider_key_collection_stops_at_first_missing_key(monkeypatch: pytest.
 
 
 def test_sandbox_empty_code_and_missing_name_are_explicit() -> None:
-
 
     sandbox = Sandbox(
         SandboxConfig(authorized_imports=[], allowed_directories=[]),
@@ -81,7 +77,6 @@ def test_models_reject_missing_required_fields() -> None:
 
 
 def test_models_round_trip_unicode_and_empty_optional_fields() -> None:
-
 
     task = MBPPTaskInput.model_validate(
         {

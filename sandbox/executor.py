@@ -106,7 +106,6 @@ _SAFE_DUNDER_ATTRS = {
 
 def _is_forbidden_attribute(name: object) -> bool:
 
-
     return (
         isinstance(name, str)
         and (
@@ -165,7 +164,6 @@ def check_imports(tree: ast.AST, authorized: list) -> None:
             if node.module is None or not _is_authorized(node.module, authorized):
                 raise SandboxViolation(f"import of '{node.module}' is not permitted")
 
-
             if any(alias.name == "*" for alias in node.names):
                 raise SandboxViolation("star imports are not permitted")
 
@@ -190,7 +188,6 @@ class _RestrictedModule(ModuleType):
 
         super().__init__(module.__name__, module.__doc__)
 
-
         object.__setattr__(self, "_restricted_module", module)
         object.__setattr__(self, "_authorized_modules", authorized)
         object.__setattr__(self, "_wrap_module", wrap_module)
@@ -206,7 +203,6 @@ class _RestrictedModule(ModuleType):
 
         module = object.__getattribute__(self, "_restricted_module")
 
-
         if module.__name__ == "operator" and name in {"attrgetter", "methodcaller"}:
             raise SandboxViolation(f"operator.{name} is not permitted")
 
@@ -215,7 +211,6 @@ class _RestrictedModule(ModuleType):
 
         value = getattr(module, name)
         if isinstance(value, ModuleType):
-
 
             authorized = object.__getattribute__(self, "_authorized_modules")
             if not _is_authorized(value.__name__, authorized):
@@ -236,12 +231,10 @@ class _RestrictedModule(ModuleType):
 
 def _make_restricted_import(authorized: list) -> Callable[..., ModuleType]:
 
-
     real_import = builtins.__import__
     proxy_cache: Dict[str, ModuleType] = {}
 
     def wrap_module(module: ModuleType) -> ModuleType:
-
 
         cached = proxy_cache.get(module.__name__)
         if cached is not None:
@@ -258,7 +251,6 @@ def _make_restricted_import(authorized: list) -> Callable[..., ModuleType]:
         level: int = 0,
     ) -> ModuleType:
 
-
         if not _is_authorized(name, authorized):
             raise SandboxViolation(f"import of '{name}' is not permitted")
         module = real_import(name, globals, locals, fromlist, level)
@@ -269,14 +261,12 @@ def _make_restricted_import(authorized: list) -> Callable[..., ModuleType]:
 
 def _make_restricted_open(allowed_directories: list) -> Callable[..., Any]:
 
-
     real_open = builtins.open
 
     resolved_allowed = [os.path.realpath(d) for d in allowed_directories]
 
     def restricted_open(file: Any, mode: str = "r", *args: Any, **kwargs: Any) -> Any:
         if isinstance(file, (str, bytes, os.PathLike)):
-
 
             target = os.path.realpath(os.fspath(file))
 
@@ -292,7 +282,6 @@ def _make_restricted_open(allowed_directories: list) -> Callable[..., Any]:
 
 def _make_restricted_getattr() -> Callable[..., Any]:
 
-
     real_getattr = builtins.getattr
 
     def restricted_getattr(obj: Any, name: Any, *default: Any) -> Any:
@@ -304,7 +293,6 @@ def _make_restricted_getattr() -> Callable[..., Any]:
 
 
 def _make_restricted_setattr() -> Callable[..., Any]:
-
 
     real_setattr = builtins.setattr
 
@@ -324,7 +312,6 @@ def final_answer(answer: Any) -> None:
 
 
 def _alarm_handler(signum: int, frame: Any) -> None:
-
 
     raise SandboxTimeoutError()
 
@@ -363,7 +350,6 @@ class Sandbox:
             )
             return
 
-
         if apply_process_memory_limit:
             self._apply_memory_limit()
         self.namespace = self._build_namespace(extra)
@@ -391,11 +377,9 @@ class Sandbox:
 
     def _build_namespace(self, extra_namespace: Dict[str, Callable]) -> dict:
 
-
         collisions = sorted(_RESERVED_GLOBAL_NAMES & extra_namespace.keys())
         if collisions:
             raise ValueError(f"extra_namespace contains reserved name(s): {', '.join(collisions)}")
-
 
         restricted_builtins = {
             name: value for name, value in vars(builtins).items() if name not in _UNSAFE_BUILTINS
@@ -405,7 +389,6 @@ class Sandbox:
         restricted_builtins["open"] = _make_restricted_open(self.config.allowed_directories)
         restricted_builtins["getattr"] = _make_restricted_getattr()
         restricted_builtins["setattr"] = _make_restricted_setattr()
-
 
         namespace: dict = {"__builtins__": restricted_builtins, "final_answer": final_answer}
         namespace.update(extra_namespace)
@@ -507,7 +490,6 @@ class Sandbox:
             self._isolated_process.close()
 
     def __del__(self) -> None:
-
 
         try:
             self.close()

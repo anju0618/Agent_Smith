@@ -25,7 +25,6 @@ class _FakeResponse:
 
     def raise_for_status(self) -> None:
 
-
         error = requests.HTTPError(f"{self.status_code} Client Error: {self.reason} for url: {self.url}")
         error.response = self  # type: ignore[assignment]
         raise error
@@ -47,7 +46,6 @@ def test_http_error_message_never_contains_the_api_key(monkeypatch: pytest.Monke
 
     monkeypatch.setattr("llm.providers.gemini.requests.post", fake_post)
     provider = GeminiProvider("https://generativelanguage.googleapis.com/v1beta")
-
 
     with pytest.raises(requests.RequestException) as exc_info:
         provider.chat(
@@ -77,7 +75,6 @@ def test_connection_error_message_never_contains_the_api_key(monkeypatch: pytest
     monkeypatch.setattr("llm.providers.gemini.requests.post", fake_post)
     provider = GeminiProvider("https://generativelanguage.googleapis.com/v1beta")
 
-
     with pytest.raises(requests.RequestException) as exc_info:
         provider.chat(
             messages=[{"role": "user", "content": "hi"}],
@@ -92,7 +89,6 @@ def test_connection_error_message_never_contains_the_api_key(monkeypatch: pytest
 
 
 def test_successful_call_still_works(monkeypatch: pytest.MonkeyPatch) -> None:
-
 
     class _OkResponse(_FakeResponse):
         def raise_for_status(self) -> None:

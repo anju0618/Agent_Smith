@@ -64,7 +64,6 @@ class IsolatedSandboxProcess:
         self._selector = selectors.DefaultSelector()
         self._selector.register(process.stdout, selectors.EVENT_READ)
 
-
         self._send(
             {
                 "type": "init",
@@ -86,7 +85,6 @@ class IsolatedSandboxProcess:
             raise RuntimeError(f"isolated sandbox worker failed to initialize: {detail}")
 
     def _build_command(self, config: Any) -> list[str]:
-
 
         if sys.platform != "linux":
 
@@ -110,7 +108,6 @@ class IsolatedSandboxProcess:
         if not site_packages:
             raise RuntimeError("isolated sandbox could not find the project's site-packages")
         if Path("/usr") not in python_path.parents:
-
 
             raise RuntimeError("isolated sandbox requires a Python interpreter under /usr")
 
@@ -160,14 +157,12 @@ class IsolatedSandboxProcess:
             ]
         )
 
-
         python_path_entries = ["/agent", "/agent/site-packages"]
         for index, path in enumerate(site_packages[1:], start=1):
 
             target = f"/agent/site-packages-{index}"
             command.extend(["--dir", target, "--ro-bind", str(path), target])
             python_path_entries.append(target)
-
 
         mounted_targets = {
             Path("/agent"),
@@ -186,7 +181,6 @@ class IsolatedSandboxProcess:
             self._validate_allowed_target(mount_target)
             self._add_directory_mounts(command, mount_target, mounted_targets)
             if mount_target.is_dir():
-
 
                 command.extend(["--bind", str(mount_target), str(mount_target)])
 
@@ -222,7 +216,6 @@ class IsolatedSandboxProcess:
 
     def _worker_config(self, config: Any) -> Dict[str, Any]:
 
-
         config_data = cast(Dict[str, Any], config.model_dump(mode="json"))
         config_data["allowed_directories"] = [
             str(self._resolve_allowed_directory(directory))
@@ -232,7 +225,6 @@ class IsolatedSandboxProcess:
 
     @staticmethod
     def _site_packages() -> list[Path]:
-
 
         paths: list[Path] = []
         for entry in sys.path:
@@ -248,7 +240,6 @@ class IsolatedSandboxProcess:
 
     @staticmethod
     def _validate_allowed_target(target: Path) -> None:
-
 
         protected = {
             Path("/"),
@@ -273,7 +264,6 @@ class IsolatedSandboxProcess:
     def _add_directory_mounts(
         command: list[str], target: Path, mounted_targets: set[Path]
     ) -> None:
-
 
         current = Path("/")
         for part in target.parts[1:]:
@@ -307,7 +297,6 @@ class IsolatedSandboxProcess:
         return message
 
     def run(self, code: str) -> str:
-
 
         if self._closed:
             return "[IsolatedSandboxError] sandbox worker is closed"
@@ -363,7 +352,6 @@ class IsolatedSandboxProcess:
                 return str(message.get("output", ""))
             if message_type == "final_answer":
 
-
                 from sandbox.executor import FinalAnswer
 
                 raise FinalAnswer(message.get("answer"))
@@ -378,7 +366,6 @@ class IsolatedSandboxProcess:
     def _invoke_tool(
         self, name: Any, args: Any, kwargs: Any, timeout: float
     ) -> Tuple[bool, Any, bool]:
-
 
         if not isinstance(name, str):
             return False, "invalid MCP tool name", False
@@ -413,7 +400,6 @@ class IsolatedSandboxProcess:
         return True, result, False
 
     def _terminate_process(self) -> None:
-
 
         process = self._process
         if process is None or process.poll() is not None:

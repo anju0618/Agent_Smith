@@ -167,7 +167,11 @@ Code:
 result = edit_file(
     filepath="/testbed/src/mail.py",
     old_str='    if "@" not in mail:\\n        return False\\n    return True',
-    new_str='    if "@" not in mail:\\n        return False\\n    local, _, domain = mail.partition("@")\\n    return bool(local) and "." in domain',
+    new_str=(
+        '    if "@" not in mail:\\n        return False\\n'
+        '    local, _, domain = mail.partition("@")\\n'
+        '    return bool(local) and "." in domain'
+    ),
 )
 print(result)
 ```
@@ -217,7 +221,6 @@ def build_system_prompt(benchmark: str, sandbox_manual: str, include_example: bo
         final_answer_doc, example = _SWEBENCH_FINAL_ANSWER, _SWEBENCH_EXAMPLE
     else:
         raise ValueError(f"Unknown benchmark: {benchmark}")
-
 
     prompt = (
         f"{FRAMEWORK_EXPLANATION}\n"

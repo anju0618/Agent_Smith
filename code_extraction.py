@@ -167,7 +167,6 @@ def extract_code(llm_output: str) -> ExtractionResult:
             )
         return ExtractionResult(code=code, note="")
 
-
     unclosed = _UNCLOSED_FENCE_RE.search(llm_output)
     if unclosed:
         return ExtractionResult(
@@ -177,7 +176,6 @@ def extract_code(llm_output: str) -> ExtractionResult:
                 "<end_code>; the rest of the response was used as the code anyway."
             ),
         )
-
 
     for extractor, format_name in (
         (_extract_xml_invoke, "XML <invoke> tool call"),
@@ -194,7 +192,6 @@ def extract_code(llm_output: str) -> ExtractionResult:
                 ),
             )
 
-
     generic = _GENERIC_FENCE_RE.search(llm_output)
     if generic:
         return ExtractionResult(
@@ -204,7 +201,6 @@ def extract_code(llm_output: str) -> ExtractionResult:
                 "used the first generic fenced block instead."
             ),
         )
-
 
     stripped = llm_output.strip()
     if stripped:
@@ -220,7 +216,6 @@ def extract_code(llm_output: str) -> ExtractionResult:
                     "response is valid Python on its own; ran it directly."
                 ),
             )
-
 
     return ExtractionResult(
         code=None,

@@ -6,7 +6,6 @@ from code_extraction import extract_code
 
 def test_closed_python_fence() -> None:
 
-
     text = "Thought: easy\nCode:\n```python\nprint(1 + 1)\n```\n<end_code>"
     result = extract_code(text)
     assert result.code == "print(1 + 1)"
@@ -23,7 +22,6 @@ def test_unclosed_python_fence_is_salvaged() -> None:
 
 
 def test_xml_invoke_is_converted() -> None:
-
 
     text = (
         'Code:\n<invoke name="read_file">'
@@ -50,7 +48,6 @@ def test_json_tool_call_is_converted() -> None:
 
 def test_json_tool_call_preserves_string_argument_types() -> None:
 
-
     text = (
         '<tool_call>{"name": "search_code", '
         '"arguments": {"pattern": "123", "file_pattern": "false"}}</tool_call>'
@@ -70,14 +67,12 @@ def test_react_format_is_converted() -> None:
 
 def test_react_format_preserves_json_string_argument_types() -> None:
 
-
     text = 'Action: search_code\nAction Input: {"pattern": "null"}'
     result = extract_code(text)
     assert result.code == "result = search_code(pattern='null')\nprint(result)"
 
 
 def test_no_code_block_found() -> None:
-
 
     text = "I think the answer is 42, but let me think more."
     result = extract_code(text)

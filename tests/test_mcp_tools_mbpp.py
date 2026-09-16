@@ -38,7 +38,6 @@ def test_run_tests_all_pass() -> None:
 
 def test_run_tests_failure_reports_output() -> None:
 
-
     code = "def add(a, b):\n    return a - b\n"
     result = json.loads(run_tests(code, ["assert add(2, 3) == 5"]))
     assert result["success"] is False
@@ -61,7 +60,6 @@ def test_run_tests_infinite_loop_times_out() -> None:
 
 
 def test_run_tests_rejects_unauthorized_host_import() -> None:
-
 
     code = "import os\ndef cwd():\n    return os.getcwd()\n"
     result = json.loads(run_tests(code, ["assert cwd()"]))

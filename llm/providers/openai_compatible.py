@@ -39,7 +39,6 @@ class OpenAICompatibleProvider:
         if stop:
             payload["stop"] = stop
 
-
         headers = {
             "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json",
@@ -54,7 +53,6 @@ class OpenAICompatibleProvider:
         choice = data["choices"][0]
         text = choice["message"].get("content") or ""
         usage = data.get("usage", {})
-
 
         return GenerationResult(
             text=text,

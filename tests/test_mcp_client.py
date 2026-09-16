@@ -76,7 +76,6 @@ def test_manual_text_lists_discovered_tools(proxy: MCPToolProxy) -> None:
 
 def test_connection_timeout_stops_background_loop(monkeypatch: pytest.MonkeyPatch) -> None:
 
-
     @asynccontextmanager
     async def hanging_client(params: object) -> AsyncIterator[Tuple[object, object]]:
 
@@ -86,10 +85,8 @@ def test_connection_timeout_stops_background_loop(monkeypatch: pytest.MonkeyPatc
     monkeypatch.setattr("sandbox.mcp_client.stdio_client", hanging_client)
     existing_threads = {thread.ident for thread in threading.enumerate()}
 
-
     with pytest.raises(TimeoutError, match="MCP connection timed out"):
         MCPToolProxy(stdio_command="unused", connect_timeout=0.05)
-
 
     leaked_threads = [
         thread

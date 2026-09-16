@@ -33,7 +33,6 @@ TIMEOUT_SECONDS = 120
 
 def build_task_prompt(task: MBPPTaskInput) -> str:
 
-
     tests_preview = "\n".join(task.test_list) if task.test_list else "(no public tests provided)"
     imports_note = (
         f"\n\nrun_tests() automatically makes these imports available to the assertions "
@@ -77,7 +76,6 @@ def main() -> None:
     parser.add_argument("--task-file", required=True)
     parser.add_argument("--output", required=True)
 
-
     parser.add_argument("--model-name", default=DEFAULT_MODEL_NAME)
     parser.add_argument("--provider-url", default=DEFAULT_PROVIDER_URL)
     parser.add_argument("--max-iterations", type=int, default=MAX_ITERATIONS)
@@ -87,7 +85,6 @@ def main() -> None:
         task_data = json.loads(Path(args.task_file).read_text())
         task = MBPPTaskInput.model_validate(task_data)
     except Exception as exc:
-
 
         solution = error_solution("unknown", f"Failed to load task file: {type(exc).__name__}: {exc}")
         Path(args.output).write_text(solution.model_dump_json(indent=2))
@@ -108,7 +105,6 @@ def main() -> None:
     try:
         SCRATCH_DIR.mkdir(parents=True, exist_ok=True)
 
-
         tool_env = {"AGENT_SMITH_TEST_IMPORTS": json.dumps(task.test_imports)}
 
         mcp_proxy = MCPToolProxy(stdio_command=f"{sys.executable} {MCP_TOOLS_SCRIPT}", env=tool_env)
@@ -124,7 +120,6 @@ def main() -> None:
 
         sandbox = Sandbox(sandbox_config, extra_namespace=mcp_proxy.build_namespace())
         system_prompt = build_system_prompt("mbpp", mcp_proxy.manual_text())
-
 
         llm_client = LLMClient.from_provider_url(args.model_name, args.provider_url)
         orchestrator = Orchestrator(

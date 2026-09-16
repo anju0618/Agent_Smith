@@ -65,7 +65,6 @@ class GeminiProvider:
             response.raise_for_status()
         except requests.RequestException as exc:
 
-
             status = getattr(getattr(exc, "response", None), "status_code", None)
 
             status_part = f"status={status}" if status is not None else type(exc).__name__
@@ -81,7 +80,6 @@ class GeminiProvider:
         text = "".join(part.get("text", "") for part in parts)
 
         usage = data.get("usageMetadata", {})
-
 
         return GenerationResult(
             text=text,

@@ -186,7 +186,6 @@ class LLMClient:
                         if attempt < self.max_retries_per_key - 1:
                             time.sleep(self.backoff_seconds * (attempt + 1))
 
-
         self.usage.total_requests += retries
         self.usage.total_retries += retries
         raise AllProvidersExhaustedError(

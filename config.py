@@ -41,7 +41,6 @@ class ProviderSpec:
     kind: str = "openai_compatible"
     fallback_model: Optional[str] = None
 
-
     def collect_api_keys(self) -> List[str]:
         """このプロバイダに設定されている全てのAPIキーを収集する。
 

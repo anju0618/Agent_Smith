@@ -20,7 +20,6 @@ def _sandbox(
     allowed_directories: Optional[List[str]] = None, authorized_imports: Optional[List[str]] = None
 ) -> Sandbox:
 
-
     imports = authorized_imports if authorized_imports is not None else DEFAULT_AUTHORIZED_IMPORTS
     directories = allowed_directories if allowed_directories is not None else []
     config = SandboxConfig(authorized_imports=imports, allowed_directories=directories)
@@ -60,7 +59,6 @@ def test_dynamic_import_bypass_is_blocked() -> None:
 
 def test_private_module_reference_escape_is_blocked() -> None:
 
-
     sandbox = _sandbox(authorized_imports=DEFAULT_AUTHORIZED_IMPORTS)
     output = sandbox.run("import random\nprint(random._os.listdir('/'))")
     assert "[SandboxViolation]" in output
@@ -68,7 +66,6 @@ def test_private_module_reference_escape_is_blocked() -> None:
 
 
 def test_public_unauthorized_nested_module_is_blocked() -> None:
-
 
     sandbox = _sandbox(authorized_imports=DEFAULT_AUTHORIZED_IMPORTS)
     output = sandbox.run("import typing\nprint(typing.sys.modules)")
@@ -87,7 +84,6 @@ def test_operator_attrgetter_private_attribute_bypass_is_blocked() -> None:
 
 
 def test_vars_builtin_and_star_import_are_blocked() -> None:
-
 
     sandbox = _sandbox(authorized_imports=DEFAULT_AUTHORIZED_IMPORTS)
     assert "NameError" in sandbox.run("print(vars(object))")
@@ -140,7 +136,6 @@ def test_formatter_field_escape_is_blocked() -> None:
 
 
 def test_isolated_worker_cannot_see_host_root_files() -> None:
-
 
     sandbox = _sandbox(authorized_imports=["os", "posixpath"])
     try:
@@ -212,7 +207,6 @@ def test_common_dunders_still_work_for_legitimate_code() -> None:
 
 def test_reserved_namespace_names_cannot_override_sandbox_controls() -> None:
 
-
     config = SandboxConfig(authorized_imports=[], allowed_directories=[])
     with pytest.raises(ValueError, match="final_answer"):
         Sandbox(
@@ -224,7 +218,6 @@ def test_reserved_namespace_names_cannot_override_sandbox_controls() -> None:
 
 def test_variables_persist_between_calls() -> None:
 
-
     sandbox = _sandbox()
     sandbox.run("x = 41")
     output = sandbox.run("print(x + 1)")
@@ -232,7 +225,6 @@ def test_variables_persist_between_calls() -> None:
 
 
 def test_final_answer_raises_and_carries_value() -> None:
-
 
     sandbox = _sandbox()
     try:
@@ -274,7 +266,6 @@ def test_filesystem_restriction_allows_configured_directory(tmp_path: Path) -> N
 
 def test_relative_allowed_directory_is_mounted(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
 
-
     monkeypatch.chdir(tmp_path.parent)
     sandbox = _sandbox(allowed_directories=[tmp_path.name])
     target = str(tmp_path / "relative.txt")
@@ -302,7 +293,6 @@ def test_timeout_interrupts_infinite_loop() -> None:
 
 def test_memory_limit_is_enforced() -> None:
     """pytest実行プロセス自体に影響しないよう、サブプロセスの中で実行する。"""
-
 
     script = textwrap.dedent(
         """

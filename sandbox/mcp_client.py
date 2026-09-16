@@ -74,7 +74,6 @@ class MCPToolProxy:
             ready = self._connection_ready.wait(timeout=connect_timeout)
         except BaseException:
 
-
             self._stop_owner(graceful=False)
             raise
 
@@ -90,7 +89,6 @@ class MCPToolProxy:
 
     def _run_event_loop(self) -> None:
 
-
         asyncio.set_event_loop(self._loop)
         self._owner_task = self._loop.create_task(
             self._connection_owner(*self._connection_args)
@@ -105,7 +103,6 @@ class MCPToolProxy:
         except BaseException as exc:
             if not self._connection_ready.is_set():
 
-
                 self._connection_error = exc
                 self._connection_ready.set()
         finally:
@@ -113,7 +110,6 @@ class MCPToolProxy:
             self._loop.stop()
 
     def _run(self, coro: Any, timeout: Optional[float] = None) -> Any:
-
 
         future = asyncio.run_coroutine_threadsafe(coro, self._loop)
         try:
@@ -157,14 +153,12 @@ class MCPToolProxy:
                             streamablehttp_client(http_url)
                         )
 
-
                     self.session = await exit_stack.enter_async_context(ClientSession(read, write))
                     await self.session.initialize()
                     result = await self.session.list_tools()
                     self.tools = list(result.tools)
                     self._connection_ready.set()
                     while not self._close_requested.is_set():
-
 
                         await asyncio.sleep(0.05)
             except BaseException as exc:
@@ -181,11 +175,9 @@ class MCPToolProxy:
             self.session = None
             if not self._connection_ready.is_set():
 
-
                 self._connection_ready.set()
 
     def _stop_owner(self, graceful: bool) -> None:
-
 
         if graceful:
             self._close_requested.set()

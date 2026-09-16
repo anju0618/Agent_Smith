@@ -319,7 +319,6 @@ def find_references(name: str, filepath: str = "", line: int = 0) -> str:
     except ValueError:
         return results
 
-
     declaration_marker = f"{declaration_path}:{line} "
 
     filtered = [ln for ln in results.splitlines() if not ln.startswith(declaration_marker)]

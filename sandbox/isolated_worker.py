@@ -17,7 +17,6 @@ from sandbox.executor import FinalAnswer, Sandbox
 
 def _send(output: Any, message: Dict[str, Any]) -> None:
 
-
     output.write(json.dumps(message, separators=(",", ":"), default=str) + "\n")
     output.flush()
 
@@ -35,7 +34,6 @@ def _read(input_stream: Any) -> Dict[str, Any]:
 
 
 class _ToolBridge:
-
 
     def __init__(self, name: str, input_stream: Any, output: Any) -> None:
         self._name = name
@@ -77,7 +75,6 @@ def main() -> int:
             name: cast(Callable[..., Any], _ToolBridge(name, protocol_input, protocol_output))
             for name in tool_names
         }
-
 
         sandbox = Sandbox(
             config,

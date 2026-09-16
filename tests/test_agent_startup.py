@@ -17,7 +17,6 @@ def _run_cli(
     output_file: Path,
 ) -> None:
 
-
     monkeypatch.setattr(
         sys,
         "argv",
@@ -39,7 +38,6 @@ def test_swebench_docker_initialization_failure_writes_error_solution(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
 
-
     task_file = tmp_path / "task.json"
     output_file = tmp_path / "solution.json"
     task_file.write_text(
@@ -58,16 +56,13 @@ def test_swebench_docker_initialization_failure_writes_error_solution(
         def __init__(self, docker_image: str) -> None:
             raise RuntimeError("docker unavailable")
 
-
     monkeypatch.setattr(agent_swebench, "SweBenchContainer", FailingContainer)
 
     monkeypatch.setattr(agent_swebench.signal, "signal", lambda signum, handler: None)
 
     _run_cli(monkeypatch, "agent_swebench", task_file, output_file)
 
-
     agent_swebench.main()
-
 
     result = json.loads(output_file.read_text())
     assert result["success"] is False
@@ -77,7 +72,6 @@ def test_swebench_docker_initialization_failure_writes_error_solution(
 def test_swebench_sigterm_before_orchestrator_still_stops_cleanly(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-
 
     task_file = tmp_path / "task.json"
     output_file = tmp_path / "solution.json"
@@ -116,7 +110,6 @@ def test_swebench_sigterm_before_orchestrator_still_stops_cleanly(
 def test_mbpp_sigterm_before_orchestrator_still_stops_cleanly(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-
 
     task_file = tmp_path / "task.json"
     output_file = tmp_path / "solution.json"

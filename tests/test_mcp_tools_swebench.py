@@ -130,7 +130,6 @@ def test_run_tests_uses_default_evaluation_script(
 
 def test_docker_runner_places_evaluation_script_under_testbed() -> None:
 
-
     from docker_runner import EVAL_SCRIPT_PATH_IN_CONTAINER, TESTBED_PATH_IN_CONTAINER
 
     assert EVAL_SCRIPT_PATH_IN_CONTAINER == f"{TESTBED_PATH_IN_CONTAINER}/eval.sh"
@@ -150,7 +149,6 @@ def test_find_references_includes_call_site(fake_repo: Path) -> None:
 
 
 def test_find_references_excludes_declaration_when_location_given(fake_repo: Path) -> None:
-
 
     output = tools.find_references("is_valid_email", str(fake_repo / "mail.py"), 1)
     lines = output.splitlines()

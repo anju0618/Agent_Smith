@@ -73,7 +73,6 @@ def main() -> None:
     parser.add_argument("--task-file", required=True)
     parser.add_argument("--output", required=True)
 
-
     parser.add_argument("--model-name", default=DEFAULT_MODEL_NAME)
     parser.add_argument("--provider-url", default=DEFAULT_PROVIDER_URL)
     parser.add_argument("--max-iterations", type=int, default=MAX_ITERATIONS)
@@ -83,7 +82,6 @@ def main() -> None:
         task_data = json.loads(Path(args.task_file).read_text())
         task = SWEBenchTaskInput.model_validate(task_data)
     except Exception as exc:
-
 
         solution = error_solution("unknown", f"Failed to load task file: {type(exc).__name__}: {exc}")
         Path(args.output).write_text(solution.model_dump_json(indent=2))
@@ -120,7 +118,6 @@ def main() -> None:
 
         system_prompt = build_system_prompt("swebench", mcp_proxy.manual_text())
 
-
         llm_client = LLMClient.from_provider_url(args.model_name, args.provider_url)
         orchestrator = Orchestrator(
             llm_client,
@@ -141,10 +138,8 @@ def main() -> None:
 
     except ShutdownRequested as exc:
 
-
         solution = error_solution(task.instance_id, f"stopped: {exc}")
     except Exception as exc:
-
 
         solution = error_solution(task.instance_id, f"Agent crashed: {type(exc).__name__}: {exc}")
     finally:
