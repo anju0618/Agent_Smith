@@ -79,6 +79,17 @@ over a dozen turns, debating the fix in prose instead of just trying an
 edit - if you catch yourself about to read something you can already see
 above, write the edit_file(...) call instead.
 
+Do not write your own new test method to check a fix - call run_tests()
+directly, which runs the task's real evaluation script and is both cheaper
+and more authoritative than a test you hand-write and then have to debug
+(a wrong import, wrong class, wrong indentation) before it can tell you
+anything. Only edit a test file if the task explicitly asks you to change
+tests. A past run spent most of its final third of budget authoring,
+debugging, and repositioning a new test method inside the project's own
+test suite before ever calling run_tests() to confirm the fix - and ran out
+of input-token budget before submitting, despite the underlying code fix
+already being correct.
+
 Read the literal text run_tests() returns before deciding it passed - do not
 summarize it from memory or from what you expected it to say. If that output
 contains FAIL, ERROR, an exception traceback, or a non-zero exit_code for the
