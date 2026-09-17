@@ -107,6 +107,13 @@ KNOWN_PROVIDERS: List[ProviderSpec] = [
         "openai_compatible",
         fallback_model="meta-llama/Llama-3.1-8B-Instruct",
     ),
+    ProviderSpec(
+        "mistral",
+        "https://api.mistral.ai/v1",
+        "MISTRAL_API_KEY",
+        "openai_compatible",
+        fallback_model="mistral-small-latest",
+    ),
 ]
 
 
