@@ -144,15 +144,15 @@ def _matching_files(directory: Path, pattern: str, recursive: bool) -> list:
 
 @mcp.tool()
 def read_file(filepath: str, start_line: int = 1, end_line: Optional[int] = None) -> str:
-    """ファイルの内容を、cat -nのように行番号付きで読み取る。
+    """Read a file's contents with line numbers, like `cat -n`.
 
-    引数:
-        filepath: ファイルへのパス(絶対パス、またはリポジトリルートからの相対パス)。
-        start_line: 読み取りを開始する行(1始まり、この行を含む)。
-        end_line: 読み取りを終了する行(1始まり、この行を含む)。省略時はファイル末尾まで読む。
+    Args:
+        filepath: Path to the file (absolute, or relative to the repo root).
+        start_line: First line to read (1-indexed, inclusive).
+        end_line: Last line to read (1-indexed, inclusive). Defaults to EOF.
 
-    戻り値:
-        ファイルの各行に対応する"<行番号>: <行の内容>"という形式の文字列。
+    Returns:
+        One "<line number>: <line content>" string per line.
     """
     try:
         path = _resolve_within_testbed(filepath)
@@ -171,17 +171,16 @@ def read_file(filepath: str, start_line: int = 1, end_line: Optional[int] = None
 
 @mcp.tool()
 def edit_file(filepath: str, old_str: str, new_str: str) -> str:
-    """ファイル内の完全一致する文字列を新しい文字列に置き換える。
+    """Replace an exact-match string in a file with a new string.
 
-    引数:
-        filepath: 編集対象ファイルへのパス。
-        old_str: 検索対象の正確なテキスト(ファイル内にちょうど1回だけ出現する必要がある)。
-        new_str: 置き換え後のテキスト。
+    Args:
+        filepath: Path to the file to edit.
+        old_str: Exact text to find (must occur exactly once in the file).
+        new_str: Replacement text.
 
-    戻り値:
-        処理結果を示すメッセージ。編集によってPythonの構文エラーが発生した場合は、
-        黙って適用するのではなく明示的にその旨を報告する(セクション4.1が求める
-        「edit introduced a syntax error」フィードバックの必須要件)。
+    Returns:
+        A status message. If the edit introduces a Python syntax error, that
+        is reported explicitly instead of being applied silently.
     """
     try:
         path = _resolve_within_testbed(filepath)
@@ -216,14 +215,14 @@ def edit_file(filepath: str, old_str: str, new_str: str) -> str:
 
 @mcp.tool()
 def list_files(directory: str, pattern: str = "*") -> str:
-    """指定ディレクトリ内で、globパターンに一致するファイルを一覧表示する。
+    """List files in a directory matching a glob pattern.
 
-    デフォルトでは非再帰的(例えば"*.py"は直下の子ファイルのみを対象とする)。
-    再帰的に検索する場合はpatternの先頭に"**/"を付ける(例: "**/*.py")。
+    Non-recursive by default (e.g. "*.py" only matches direct children).
+    Prefix pattern with "**/" to search recursively (e.g. "**/*.py").
 
-    引数:
-        directory: 一覧表示するディレクトリ(絶対パス、またはリポジトリルートからの相対パス)。
-        pattern: ファイル名を絞り込むためのglobパターン(例: "*.py", "**/*.py")。
+    Args:
+        directory: Directory to list (absolute, or relative to the repo root).
+        pattern: Glob pattern to filter filenames (e.g. "*.py", "**/*.py").
     """
     try:
         path = _resolve_within_testbed(directory)
@@ -248,14 +247,14 @@ def _iter_matching_files(root: Path, file_pattern: str) -> list:
 
 @mcp.tool()
 def search_code(pattern: str, file_pattern: str = "*.py") -> str:
-    """コードベース全体に対するgrepライクな正規表現検索。
+    """grep-like regex search across the whole codebase.
 
-    引数:
-        pattern: 検索対象の正規表現。
-        file_pattern: 検索対象とするファイルを絞り込むglobパターン(デフォルトは"*.py")。
+    Args:
+        pattern: Regular expression to search for.
+        file_pattern: Glob pattern restricting which files to search (default "*.py").
 
-    戻り値:
-        "/absolute/path.py:<行番号> <行の内容>"という形式の行の並び。
+    Returns:
+        Lines of the form "/absolute/path.py:<line number> <line content>".
     """
     root = _testbed_root()
     try:
@@ -284,13 +283,13 @@ _DEF_RE_TEMPLATE = r"^\s*(?:async\s+def|def|class)\s+{name}\b"
 
 @mcp.tool()
 def search_function_or_class_definition_in_code(name: str) -> str:
-    """関数またはクラスがどこで定義されているかを探す。
+    """Find where a function or class is defined.
 
-    引数:
-        name: 探したい関数またはクラスの名前。
+    Args:
+        name: Name of the function or class to find.
 
-    戻り値:
-        search_codeと同じ形式: "/absolute/path.py:<行番号> <行の内容>"。
+    Returns:
+        Same format as search_code: "/absolute/path.py:<line number> <line content>".
     """
 
     return str(search_code(_DEF_RE_TEMPLATE.format(name=re.escape(name)), "*.py"))
@@ -298,17 +297,18 @@ def search_function_or_class_definition_in_code(name: str) -> str:
 
 @mcp.tool()
 def find_references(name: str, filepath: str = "", line: int = 0) -> str:
-    """コードベース全体から、ある関数・クラス名のすべての使用箇所を探す。
+    """Find every usage of a function/class name across the codebase.
 
-    引数:
-        name: 検索対象のシンボル名。
-        filepath: `name`が定義されているファイルへの任意指定パス。lineと合わせて
-            指定した場合、宣言そのものは「使用」ではないため結果から除外される。
-        line: 定義箇所の1始まりの行番号(任意指定、filepathとセットで使用)。
+    Args:
+        name: Symbol name to search for.
+        filepath: Optional path to the file where `name` is defined. Combined
+            with line, the declaration itself is excluded from the results
+            since it is not a "usage".
+        line: Optional 1-indexed line of the definition (used with filepath).
 
-    戻り値:
-        search_codeと同じ形式: 1行1使用箇所。filepath/lineで宣言箇所が
-        特定できた場合はそれを除外する。
+    Returns:
+        Same format as search_code: one usage per line. Excludes the
+        declaration line when filepath/line identify it.
     """
     results = str(search_code(rf"\b{re.escape(name)}\b", "*.py"))
     if not filepath or not line or results.startswith("[Error]") or results == "(no matches)":
@@ -328,15 +328,15 @@ def find_references(name: str, filepath: str = "", line: int = 0) -> str:
 
 @mcp.tool()
 def run_command(command: str, workdir: str = "") -> str:
-    """指定した作業ディレクトリでシェルコマンドを実行する。
+    """Run a shell command in the given working directory.
 
-    引数:
-        command: 実行するシェルコマンド。
-        workdir: 作業ディレクトリ(絶対パス、またはリポジトリルートからの相対パス。
-            省略時はリポジトリルート)。
+    Args:
+        command: Shell command to run.
+        workdir: Working directory (absolute, or relative to the repo root;
+            defaults to the repo root).
 
-    戻り値:
-        stdout・stderr・終了コードをまとめた整形済みブロック。
+    Returns:
+        A formatted block combining stdout, stderr, and exit code.
     """
     try:
 
@@ -375,11 +375,11 @@ def run_command(command: str, workdir: str = "") -> str:
 
 @mcp.tool()
 def run_tests() -> str:
-    """タスクの評価スクリプトを実行する。
+    """Run the task's evaluation script.
 
-    戻り値:
-        評価スクリプトの標準出力・標準エラーを結合した出力。このコンテキストで
-        評価スクリプトが利用できない場合は、その旨を説明するエラーを返す。
+    Returns:
+        The evaluation script's combined stdout/stderr. Returns an
+        explanatory error if no evaluation script is available here.
     """
     try:
         eval_script = _eval_script_path()
@@ -396,12 +396,12 @@ def run_tests() -> str:
 
 @mcp.tool()
 def get_patch() -> str:
-    """これまでにリポジトリに加えられた全ての変更をまとめたunified git diffを取得する。
+    """Get a unified git diff of every change made to the repository so far.
 
-    戻り値:
-        `git -c core.fileMode=false diff`の出力(セクション4.4)。意図的に
-        _cap_outputを通していない - 本物のパッチを切り詰めることがなぜより悪いのかは
-        その関数のdocstringを参照。
+    Returns:
+        The output of `git -c core.fileMode=false diff`. Intentionally not
+        passed through _cap_output - see that function's docstring for why
+        truncating a real patch would be worse.
     """
     root = _testbed_root()
     result = subprocess.run(

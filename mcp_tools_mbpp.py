@@ -41,17 +41,17 @@ def _test_imports() -> List[str]:
 
 @mcp.tool()
 def run_tests(code: str, test_list: List[str]) -> str:
-    """MBPPの候補解答を、与えられたテストのassertionに対して実行する。
+    """Run a candidate MBPP solution against the given test assertions.
 
-    引数:
-        code: 候補となるPythonの解答(完全な関数定義)。
-        test_list: `code`に対して実行するassertion文字列のリスト。
+    Args:
+        code: Candidate Python solution (a complete function definition).
+        test_list: Assertion strings to run against `code`.
 
-    戻り値:
-        JSON文字列 {"success": bool, "output": str} - successは全てのassertionが
-        通った場合のみTrueになる。候補コードはエージェント自身が使うものと同じ、
-        OSレベルで隔離されたハード化済みサンドボックス内で実行されるため、
-        MCPサーバが動くホストのファイルシステムやネットワークにはアクセスできない。
+    Returns:
+        JSON string {"success": bool, "output": str} - success is True only
+        if every assertion passed. Runs in the same OS-isolated hardened
+        sandbox the agent itself uses, with no access to this host's
+        filesystem or network.
     """
     imports_prefix = "\n".join(_test_imports())
     marker = f"__AGENT_SMITH_MBPP_PASS_{secrets.token_hex(16)}__"
